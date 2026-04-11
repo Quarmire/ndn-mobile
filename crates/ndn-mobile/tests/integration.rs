@@ -29,9 +29,11 @@ async fn test_in_process_roundtrip() {
     let name = prefix.clone();
     tokio::spawn(async move {
         producer
-            .serve(move |_interest| {
+            .serve(move |_interest, responder| {
                 let wire = DataBuilder::new(name.clone(), b"hello ndn").build();
-                async move { Some(wire) }
+                async move {
+                    responder.respond_bytes(wire).await.ok();
+                }
             })
             .await
             .ok();
@@ -80,9 +82,11 @@ async fn test_suspend_resume_keeps_appface_alive() {
     let name = prefix.clone();
     tokio::spawn(async move {
         producer
-            .serve(move |_interest| {
+            .serve(move |_interest, responder| {
                 let wire = DataBuilder::new(name.clone(), b"alive").build();
-                async move { Some(wire) }
+                async move {
+                    responder.respond_bytes(wire).await.ok();
+                }
             })
             .await
             .ok();
