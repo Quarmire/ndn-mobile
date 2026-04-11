@@ -102,7 +102,7 @@ pub use engine::{MobileEngine, MobileEngineBuilder};
 // Re-export consumer/producer and core packet types for convenience.
 pub use ndn_app::{AppError, Consumer, Producer};
 pub use ndn_discovery::DiscoveryProfile;
-pub use ndn_face_local::AppHandle;
+pub use ndn_faces::local::InProcHandle;
 pub use ndn_packet::{Data, Interest, Name};
 pub use ndn_security::SecurityProfile;
 pub use ndn_transport::FaceId;

@@ -6,11 +6,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ndn_app::{Consumer, Producer};
-use ndn_discovery::udp_nd::UdpNeighborDiscovery;
+use ndn_discovery::UdpNeighborDiscovery;
 use ndn_discovery::{DiscoveryConfig, DiscoveryProfile};
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, ShutdownHandle};
-use ndn_face_local::{AppFace, AppHandle};
-use ndn_face_net::{MulticastUdpFace, UdpFace};
+use ndn_faces::local::{InProcFace, InProcHandle};
+use ndn_faces::net::{MulticastUdpFace, UdpFace};
 use ndn_packet::Name;
 use ndn_security::SecurityProfile;
 use ndn_transport::{FaceId, FacePersistency};
@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 /// Embedded NDN forwarder for mobile apps.
 ///
 /// `MobileEngine` runs the forwarder in-process alongside the application.
-/// It uses [`AppFace`] for app↔forwarder communication (zero IPC overhead)
+/// It uses [`InProcFace`] for app↔forwarder communication (zero IPC overhead)
 /// and standard UDP/TCP faces for network connectivity.
 ///
 /// # Quick start
@@ -43,7 +43,7 @@ pub struct MobileEngine {
     shutdown: ShutdownHandle,
     /// Parent cancel token for all network faces (multicast + unicast).
     /// Cancelling this token suspends all network I/O while keeping the
-    /// engine, FIB, PIT, CS, and AppFace alive.
+    /// engine, FIB, PIT, CS, and InProcFace alive.
     network_cancel: CancellationToken,
     /// Stored multicast interface for [`resume_network_faces`](Self::resume_network_faces).
     multicast_iface: Option<Ipv4Addr>,
@@ -175,10 +175,10 @@ impl MobileEngineBuilder {
 
     /// Build the engine.
     ///
-    /// Returns a `(MobileEngine, AppHandle)` pair. The [`AppHandle`] is the
+    /// Returns a `(MobileEngine, InProcHandle)` pair. The [`InProcHandle`] is the
     /// default application face — pass it to [`Consumer::from_handle`] or
     /// create a [`Producer`] via [`MobileEngine::register_producer`].
-    pub async fn build(self) -> Result<(MobileEngine, AppHandle), anyhow::Error> {
+    pub async fn build(self) -> Result<(MobileEngine, InProcHandle), anyhow::Error> {
         let config = EngineConfig {
             cs_capacity_bytes: self.cs_capacity_mb * 1024 * 1024,
             pipeline_threads: self.pipeline_threads,
@@ -189,11 +189,11 @@ impl MobileEngineBuilder {
         // FaceTable counter, ensuring no two faces share the same ID.
         let mut builder = EngineBuilder::new(config).security_profile(self.security_profile);
 
-        // Allocate the primary AppFace ID through the builder's counter.
+        // Allocate the primary InProcFace ID through the builder's counter.
         // Must happen before alloc_face_id() calls for multicast/unicast so
-        // that AppFace always holds FaceId(1) and the table stays consistent.
+        // that InProcFace always holds FaceId(1) and the table stays consistent.
         let app_face_id = builder.alloc_face_id();
-        let (app_face, app_handle) = AppFace::new(app_face_id, 256);
+        let (app_face, app_handle) = InProcFace::new(app_face_id, 256);
         builder = builder.face(app_face);
 
         // Persistent CS (fjall feature).
@@ -232,7 +232,7 @@ impl MobileEngineBuilder {
         let (engine, shutdown) = builder.build().await?;
 
         // Create a parent cancel token for all network faces.
-        // Cancelling it suspends all network I/O without touching AppFace.
+        // Cancelling it suspends all network I/O without touching InProcFace.
         let network_cancel = shutdown.cancel_token().child_token();
 
         // Add multicast face.
@@ -292,9 +292,9 @@ impl MobileEngine {
     /// Use this when multiple independent app components need their own NDN
     /// faces.  The returned [`FaceId`] can be passed to
     /// [`add_route`](Self::add_route) to install FIB entries for that face.
-    pub fn new_app_handle(&self) -> (FaceId, AppHandle) {
+    pub fn new_app_handle(&self) -> (FaceId, InProcHandle) {
         let face_id = self.engine.faces().alloc_id();
-        let (face, handle) = AppFace::new(face_id, 256);
+        let (face, handle) = InProcFace::new(face_id, 256);
         let cancel = self.shutdown.cancel_token().child_token();
         self.engine.add_face(face, cancel);
         (face_id, handle)
@@ -302,7 +302,7 @@ impl MobileEngine {
 
     /// Register a producer prefix in the FIB and return a ready [`Producer`].
     ///
-    /// Allocates a new AppFace for the producer and installs a FIB route so
+    /// Allocates a new InProcFace for the producer and installs a FIB route so
     /// that Interests arriving on any network face are forwarded to it.
     ///
     /// ```no_run
@@ -325,8 +325,8 @@ impl MobileEngine {
         Producer::from_handle(handle, prefix)
     }
 
-    /// Create a [`Consumer`] on the given AppHandle.
-    pub fn consumer(&self, handle: AppHandle) -> Consumer {
+    /// Create a [`Consumer`] on the given InProcHandle.
+    pub fn consumer(&self, handle: InProcHandle) -> Consumer {
         Consumer::from_handle(handle)
     }
 
@@ -342,7 +342,7 @@ impl MobileEngine {
     /// Suspend all network faces (UDP multicast, unicast peers, Bluetooth).
     ///
     /// Cancels the shared network cancel token, which stops all recv/send
-    /// tasks for non-AppFace faces.  The engine, FIB, PIT, CS, and AppFace
+    /// tasks for non-InProcFace faces.  The engine, FIB, PIT, CS, and InProcFace
     /// remain fully active — in-process communication continues uninterrupted.
     ///
     /// Call this from the platform lifecycle callback when the app moves to

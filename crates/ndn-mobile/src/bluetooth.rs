@@ -1,7 +1,7 @@
 //! Bluetooth NDN face — generic over any async byte-stream.
 //!
 //! [`BluetoothFace`] uses COBS (Consistent Overhead Byte Stuffing) framing,
-//! the same codec as [`SerialFace`](ndn_face_serial::SerialFace).  COBS is
+//! the same codec as [`SerialFace`](ndn_faces::serial::SerialFace).  COBS is
 //! the right choice for Bluetooth because:
 //!
 //! - RFCOMM and L2CAP are both stream-oriented — they carry bytes, not packets
@@ -54,7 +54,7 @@
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use ndn_face_serial::cobs::CobsCodec;
+use ndn_faces::serial::cobs::CobsCodec;
 use ndn_transport::{FaceId, FaceKind, StreamFace};
 
 /// NDN face over a Bluetooth byte stream.

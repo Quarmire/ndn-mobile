@@ -21,14 +21,12 @@ fjall = ["ndn-store/fjall"]
 [dependencies]
 ndn-engine      = { workspace = true }
 ndn-app         = { workspace = true }
-ndn-discovery   = { workspace = true }
-ndn-face-net    = { workspace = true }
-ndn-face-local  = { workspace = true }
-ndn-face-serial = { workspace = true }
+ndn-discovery   = { workspace = true, features = ["udp-hello"] }
 ndn-packet      = { workspace = true, features = ["std"] }
 ndn-security    = { workspace = true }
 ndn-store       = { workspace = true }
 ndn-transport   = { workspace = true }
+ndn-faces     = { workspace = true }
 tokio           = { workspace = true, features = ["sync", "time", "rt", "macros"] }
 tokio-util      = { workspace = true, features = ["codec"] }
 tracing         = { workspace = true }
