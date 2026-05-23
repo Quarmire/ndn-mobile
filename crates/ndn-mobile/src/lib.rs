@@ -34,7 +34,7 @@ pub use tun::{IpFlow, TunConfig, TunHandle, parse_ip_flow, spawn_tunnel};
 
 pub use ndn_app::{AppError, Consumer, Producer};
 pub use ndn_discovery::DiscoveryProfile;
-pub use ndn_faces::local::InProcHandle;
+pub use ndn_face_native::local::InProcHandle;
 pub use ndn_packet::{Data, Interest, Name};
 pub use ndn_security::SecurityProfile;
 pub use ndn_transport::FaceId;

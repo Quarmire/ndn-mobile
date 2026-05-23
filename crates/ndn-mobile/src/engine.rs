@@ -8,9 +8,9 @@ use ndn_app::{Consumer, Producer};
 use ndn_discovery::{DiscoveryConfig, DiscoveryProfile, NeighborProbeProtocol};
 use ndn_discovery_core::DiscoveryProtocol;
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, RoutingProtocol, ShutdownHandle};
-use ndn_faces::local::{InProcFace, InProcHandle, IpcListener};
-use ndn_faces::net::{MulticastUdpFace, UdpFace, WebSocketFace, tcp_face_connect};
-use ndn_faces::serial::serial_face_open;
+use ndn_face_native::local::{InProcFace, InProcHandle, IpcListener};
+use ndn_face_native::net::{MulticastUdpFace, UdpFace, WebSocketFace, tcp_face_connect};
+use ndn_face_native::serial::serial_face_open;
 use ndn_packet::Name;
 use ndn_security::SecurityProfile;
 use ndn_transport::{FaceId, FaceKind, FacePersistency};
@@ -135,7 +135,7 @@ impl MobileEngineBuilder {
 
     /// Connect a persistent WebSocket face to `url` (`ws://` or `wss://`).
     /// The carrier-NAT- and firewall-friendly way to reach a gateway over
-    /// cellular. `wss://` requires the `websocket-tls` feature on `ndn-faces`.
+    /// cellular. `wss://` requires the `websocket-tls` feature on `ndn-face-native`.
     pub fn with_websocket_peer(mut self, url: impl Into<String>) -> Self {
         self.ws_peers.push(url.into());
         self
