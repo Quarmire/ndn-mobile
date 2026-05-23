@@ -1,0 +1,67 @@
+[package]
+name = "ndn-mobile"
+description = "Embedded NDN forwarder for Android and iOS/iPadOS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Mobile platforms (Android / iOS) always use the embedded engine pattern:
+# the forwarder runs in-process via AppFace.  Sandbox-incompatible faces (raw
+# Ethernet / WFB via ndn-face-l2, and POSIX-SHM) are excluded.  Available:
+# UDP multicast + unicast, TCP, WebSocket(S), serial (USB-OTG/accessory),
+# Unix-socket IPC listener (the cross-process app/UI seam), and Bluetooth via a
+# platform-supplied stream wrapped with CobsCodec.
+
+[package.metadata.scope]
+classification = "extension"
+
+[features]
+## Enable the persistent on-disk content store (FjallCs).
+## Required for `MobileEngineBuilder::with_persistent_cs()`.
+## Enables iOS App Group content-store sharing when the native code supplies
+## the App Group container path.
+fjall = ["ndn-store/fjall"]
+## NFD-compatible management dispatcher (`/localhost/nfd/<module>/<verb>`).
+## Required for `MobileEngineBuilder::with_management()`. Off by default to
+## keep the minimal mobile build lean; the VPN/dashboard UI enables it.
+management = ["dep:ndn-mgmt", "dep:ndn-config"]
+## In-process named-function compute (`ComputeFace` + `ComputeRegistry`).
+## Required for `MobileEngineBuilder::with_compute()`. The sandboxed
+## wasmtime/JIT executor is NOT pulled in (forbidden on iOS): only native
+## Rust handlers run.
+compute = ["dep:ndn-compute"]
+## Per-face/prefix Interest+Data rate limiting (token buckets). Required for
+## `MobileEngineBuilder::with_rate_limit()`. Relay/exit defense; pair with
+## `management` to manage policies at runtime.
+ratelimit = ["dep:ndn-ratelimit"]
+## EXPERIMENTAL (draft crate): FEC / network-coding policy. Required for
+## `MobileEngineBuilder::with_fec()`. The runtime policy surface is exposed
+## through the management dispatcher, so `fec` is only useful with `management`.
+fec = ["dep:ndn-coding"]
+## VPN datapath face (`TunFace`): bridges the OS tun device to the engine.
+## Required for `MobileEngineBuilder::with_tun()`. The IP↔NDN translation is a
+## caller-supplied `TunEncap` policy (the carry model). No extra deps.
+tun = []
+
+[dependencies]
+ndn-engine      = { workspace = true }
+ndn-app         = { workspace = true }
+ndn-discovery   = { workspace = true, features = ["udp-hello"] }
+ndn-discovery-core = { workspace = true }
+ndn-packet      = { workspace = true, features = ["std"] }
+ndn-security    = { workspace = true }
+ndn-store       = { workspace = true }
+ndn-transport   = { workspace = true }
+ndn-faces     = { workspace = true, features = ["serial"] }
+ndn-mgmt        = { workspace = true, optional = true }
+ndn-config      = { workspace = true, optional = true }
+# wasm-exec (wasmtime/JIT) is opt-in on ndn-compute and stays off here — iOS forbids JIT.
+ndn-compute     = { workspace = true, optional = true }
+ndn-ratelimit   = { workspace = true, optional = true }
+ndn-coding      = { workspace = true, optional = true }
+bytes           = { workspace = true, features = ["std"] }
+tokio           = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tokio-util      = { workspace = true, features = ["codec"] }
+tracing         = { workspace = true }
+anyhow          = { workspace = true }
+thiserror       = { workspace = true }
