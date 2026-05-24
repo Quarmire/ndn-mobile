@@ -28,7 +28,7 @@ pub mod engine;
 pub mod tun;
 
 pub use bluetooth::bluetooth_face_from_parts;
-pub use engine::{MobileEngine, MobileEngineBuilder};
+pub use engine::{MobileEngine, MobileEngineBuilder, MobileStrategy, PeerRef};
 #[cfg(feature = "tun")]
 pub use tun::{IpFlow, TunConfig, TunHandle, parse_ip_flow, spawn_tunnel};
 

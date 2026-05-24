@@ -13,6 +13,7 @@ use ndn_face_native::net::{MulticastUdpFace, UdpFace, WebSocketFace, tcp_face_co
 use ndn_face_native::serial::serial_face_open;
 use ndn_packet::Name;
 use ndn_security::SecurityProfile;
+use ndn_strategy::{BestRouteStrategy, MulticastStrategy};
 use ndn_transport::{FaceId, FaceKind, FacePersistency};
 use tokio_util::sync::CancellationToken;
 
@@ -20,6 +21,108 @@ use tokio_util::sync::CancellationToken;
 use ndn_compute::{ComputeFace, ComputeRegistry};
 #[cfg(feature = "tun")]
 use crate::tun::{TunConfig, TunHandle, spawn_tunnel};
+
+/// Forwarding strategy installed at the engine root. Chosen via
+/// [`MobileEngineBuilder::with_strategy`]; the engine keeps the
+/// `/localhost/nfd/strategy-choice` table so per-prefix overrides still work,
+/// this only sets the root default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MobileStrategy {
+    /// Single lowest-cost nexthop — the standard forwarder behavior, and the
+    /// right default for a leaf/VPN endpoint with one gateway.
+    #[default]
+    BestRoute,
+    /// Flood to every viable nexthop. Useful on ad-hoc / mesh links where the
+    /// best path is unknown and redundancy beats efficiency.
+    Multicast,
+    /// Cross-layer (RSSI / signal-aware) forwarding. Requires the `cclf`
+    /// feature; falls back to a build error otherwise.
+    #[cfg(feature = "cclf")]
+    Cclf,
+}
+
+/// How to (re)build a network face after suspend — retained so
+/// [`MobileEngine::resume_network_faces`] can rebuild every peer, not just
+/// multicast.
+#[derive(Clone, Debug)]
+enum PeerSpec {
+    UdpUnicast(SocketAddr),
+    Tcp(SocketAddr),
+    WebSocket(String),
+    Serial(String, u32),
+}
+
+impl PeerSpec {
+    /// Human-readable URI for logs and [`PeerRef::uri`].
+    fn uri(&self) -> String {
+        match self {
+            PeerSpec::UdpUnicast(a) => format!("udp4://{a}"),
+            PeerSpec::Tcp(a) => format!("tcp4://{a}"),
+            PeerSpec::WebSocket(u) => u.clone(),
+            PeerSpec::Serial(p, b) => format!("serial://{p}?baud={b}"),
+        }
+    }
+}
+
+/// An opaque handle to a configured network peer, returned by
+/// [`MobileEngine::peers`]. It carries the peer's stable face id internally but
+/// does **not** expose it — apps register routes toward a peer via
+/// [`MobileEngine::route_to_peer`], never by naming a raw face id
+/// (cf. the app↔router connection model).
+#[derive(Clone, Debug)]
+pub struct PeerRef {
+    id: FaceId,
+    uri: String,
+}
+
+impl PeerRef {
+    /// The peer's URI (e.g. `tcp4://10.0.0.1:6363`, a `ws(s)://` URL), suitable
+    /// for display and for matching the peer the caller configured.
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+}
+
+/// (Re)build the network face described by `spec` at the stable `id` and mount
+/// it on `engine` as a `Persistent` face. Shared by initial build and
+/// `resume_network_faces` so a peer comes back with the same id (its FIB routes
+/// — `Persistent` faces are retained on suspend — stay valid).
+async fn build_peer_face(
+    engine: &ForwarderEngine,
+    id: FaceId,
+    spec: &PeerSpec,
+    cancel: CancellationToken,
+) {
+    match spec {
+        PeerSpec::UdpUnicast(peer) => {
+            let local: SocketAddr = "0.0.0.0:0".parse().unwrap();
+            match UdpFace::bind(local, *peer, id).await {
+                Ok(face) => {
+                    engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent)
+                }
+                Err(e) => tracing::warn!(%peer, error = %e, "UDP unicast face setup failed"),
+            }
+        }
+        PeerSpec::Tcp(peer) => match tcp_face_connect(id, *peer).await {
+            Ok(face) => {
+                engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent)
+            }
+            Err(e) => tracing::warn!(%peer, error = %e, "TCP face setup failed"),
+        },
+        PeerSpec::WebSocket(url) => match WebSocketFace::connect(id, url).await {
+            Ok(face) => {
+                engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent)
+            }
+            Err(e) => tracing::warn!(%url, error = %e, "WebSocket face setup failed"),
+        },
+        PeerSpec::Serial(port, baud) => match serial_face_open(id, port, *baud) {
+            Ok(face) => {
+                engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent)
+            }
+            Err(e) => tracing::warn!(%port, baud, error = %e, "serial face setup failed"),
+        },
+    }
+}
 
 /// In-process forwarder paired with an [`InProcFace`] for app traffic and
 /// optional UDP multicast/unicast for the network side.
@@ -32,6 +135,10 @@ pub struct MobileEngine {
     multicast_iface: Option<Ipv4Addr>,
     /// Stable across suspend/resume so existing FIB entries survive.
     multicast_face_id: FaceId,
+    /// Unicast/TCP/WebSocket/serial peers with their stable face ids. Retained
+    /// so `resume_network_faces` rebuilds every one (not just multicast) with
+    /// the same id, and so `route_to_peer` can resolve a [`PeerRef`].
+    network_peers: Vec<(FaceId, PeerSpec)>,
     /// Shared registry for in-process compute handlers; `None` unless
     /// `with_compute` was called. Register handlers via [`MobileEngine::compute_registry`].
     #[cfg(feature = "compute")]
@@ -55,6 +162,7 @@ pub struct MobileEngineBuilder {
     routing_protocols: Vec<Arc<dyn RoutingProtocol>>,
     discovery_protocol: Option<Arc<dyn DiscoveryProtocol>>,
     node_name: Option<Name>,
+    strategy: MobileStrategy,
     pipeline_threads: usize,
     #[cfg_attr(not(feature = "management"), allow(dead_code))]
     enable_management: bool,
@@ -84,6 +192,7 @@ impl Default for MobileEngineBuilder {
             routing_protocols: Vec::new(),
             discovery_protocol: None,
             node_name: None,
+            strategy: MobileStrategy::default(),
             pipeline_threads: 1,
             enable_management: false,
             #[cfg(feature = "compute")]
@@ -113,6 +222,14 @@ impl MobileEngineBuilder {
     /// Single-thread default keeps wake-ups (and battery drain) low.
     pub fn pipeline_threads(mut self, n: usize) -> Self {
         self.pipeline_threads = n.max(1);
+        self
+    }
+
+    /// Choose the root forwarding strategy (default [`MobileStrategy::BestRoute`]).
+    /// A single-gateway leaf wants `BestRoute`; a mesh node may prefer
+    /// `Multicast` or (with the `cclf` feature) `Cclf`.
+    pub fn with_strategy(mut self, strategy: MobileStrategy) -> Self {
+        self.strategy = strategy;
         self
     }
 
@@ -255,6 +372,12 @@ impl MobileEngineBuilder {
         // Use the builder's counter for every face ID so the FaceTable stays
         // consistent. Allocate the InProcFace ID first so it lands as FaceId(1).
         let mut builder = EngineBuilder::new(config).security_profile(self.security_profile);
+        builder = match self.strategy {
+            MobileStrategy::BestRoute => builder.strategy(BestRouteStrategy::new()),
+            MobileStrategy::Multicast => builder.strategy(MulticastStrategy::new()),
+            #[cfg(feature = "cclf")]
+            MobileStrategy::Cclf => builder.strategy(ndn_strategy_cclf::native::CclfStrategy::new()),
+        };
         let app_face_id = builder.alloc_face_id();
         let (app_face, app_handle) = InProcFace::new(app_face_id, 256);
         builder = builder.face(app_face);
@@ -340,57 +463,24 @@ impl MobileEngineBuilder {
             }
         }
 
+        // Reserve a stable face id per peer and mount it. The (id, spec) pairs
+        // are retained on `MobileEngine` so `resume_network_faces` rebuilds
+        // every peer with the same id and `route_to_peer` can resolve a peer.
+        let mut network_peers: Vec<(FaceId, PeerSpec)> = Vec::new();
         for peer in self.unicast_peers {
-            let face_id = engine.faces().alloc_id();
-            let local: SocketAddr = "0.0.0.0:0".parse().unwrap();
-            match UdpFace::bind(local, peer, face_id).await {
-                Ok(face) => {
-                    engine.add_face_with_persistency(
-                        face,
-                        network_cancel.child_token(),
-                        FacePersistency::Persistent,
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(%peer, error = %e, "UDP unicast face setup failed");
-                }
-            }
+            network_peers.push((engine.faces().alloc_id(), PeerSpec::UdpUnicast(peer)));
         }
-
         for peer in self.tcp_peers {
-            let face_id = engine.faces().alloc_id();
-            match tcp_face_connect(face_id, peer).await {
-                Ok(face) => engine.add_face_with_persistency(
-                    face,
-                    network_cancel.child_token(),
-                    FacePersistency::Persistent,
-                ),
-                Err(e) => tracing::warn!(%peer, error = %e, "TCP face setup failed"),
-            }
+            network_peers.push((engine.faces().alloc_id(), PeerSpec::Tcp(peer)));
         }
-
         for url in self.ws_peers {
-            let face_id = engine.faces().alloc_id();
-            match WebSocketFace::connect(face_id, &url).await {
-                Ok(face) => engine.add_face_with_persistency(
-                    face,
-                    network_cancel.child_token(),
-                    FacePersistency::Persistent,
-                ),
-                Err(e) => tracing::warn!(%url, error = %e, "WebSocket face setup failed"),
-            }
+            network_peers.push((engine.faces().alloc_id(), PeerSpec::WebSocket(url)));
         }
-
         for (port, baud) in self.serial_ports {
-            let face_id = engine.faces().alloc_id();
-            match serial_face_open(face_id, &port, baud) {
-                Ok(face) => engine.add_face_with_persistency(
-                    face,
-                    network_cancel.child_token(),
-                    FacePersistency::Persistent,
-                ),
-                Err(e) => tracing::warn!(%port, baud, error = %e, "serial face setup failed"),
-            }
+            network_peers.push((engine.faces().alloc_id(), PeerSpec::Serial(port, baud)));
+        }
+        for (id, spec) in &network_peers {
+            build_peer_face(&engine, *id, spec, network_cancel.child_token()).await;
         }
 
         // In-process compute face: dispatch Interests under `prefix` to the
@@ -505,6 +595,7 @@ impl MobileEngineBuilder {
                 network_cancel,
                 multicast_iface: self.multicast_iface,
                 multicast_face_id: multicast_face_id.unwrap_or(FaceId(0)),
+                network_peers,
                 #[cfg(feature = "compute")]
                 compute_registry,
                 #[cfg(feature = "tun")]
@@ -547,10 +638,14 @@ impl MobileEngine {
         self.engine.fib().add_nexthop(prefix, face_id, cost);
     }
 
-    /// Cancels every network face; in-process traffic continues. Call from
-    /// `applicationDidEnterBackground` / `onPause`. Unicast peers and
-    /// Bluetooth faces must be re-added via [`Self::engine`] +
-    /// [`Self::network_cancel_token`] after resume.
+    /// Cancels every network face (multicast, unicast, TCP, WebSocket, serial);
+    /// in-process traffic and the IPC listener continue. Call from
+    /// `applicationDidEnterBackground` / `onPause`. The configured peer faces
+    /// are `Persistent`, so they (and their FIB routes) are retained — call
+    /// [`Self::resume_network_faces`] to rebuild them on `onResume`.
+    /// Platform-supplied faces (e.g. Bluetooth) added against
+    /// [`Self::network_cancel_token`] suspend with them but must be re-added by
+    /// the caller after resume.
     pub fn suspend_network_faces(&mut self) {
         tracing::debug!("suspending network faces");
         self.network_cancel.cancel();
@@ -558,9 +653,11 @@ impl MobileEngine {
         self.network_cancel = self.shutdown.cancel_token().child_token();
     }
 
-    /// Recreates the multicast face with its original `FaceId` so FIB
-    /// entries stay valid across suspend/resume. Call from
-    /// `applicationWillEnterForeground` / `onResume`.
+    /// Rebuilds every configured network face — multicast and all unicast / TCP
+    /// / WebSocket / serial peers — with its original `FaceId`, so FIB entries
+    /// (including routes installed via [`Self::route_to_peer`]) stay valid
+    /// across suspend/resume. Call from `applicationWillEnterForeground` /
+    /// `onResume`.
     pub async fn resume_network_faces(&mut self) {
         tracing::debug!("resuming network faces");
         if let Some(iface) = self.multicast_iface {
@@ -575,6 +672,35 @@ impl MobileEngine {
                 }
             }
         }
+        for (id, spec) in &self.network_peers {
+            build_peer_face(&self.engine, *id, spec, self.network_cancel.child_token()).await;
+            tracing::debug!(face_id = %id, uri = %spec.uri(), "network peer resumed");
+        }
+    }
+
+    /// The configured network peers (unicast / TCP / WebSocket / serial), each
+    /// an opaque [`PeerRef`]. Use with [`Self::route_to_peer`] to register a
+    /// prefix toward a specific peer. Multicast is managed by discovery and is
+    /// not listed here.
+    pub fn peers(&self) -> Vec<PeerRef> {
+        self.network_peers
+            .iter()
+            .map(|(id, spec)| PeerRef {
+                id: *id,
+                uri: spec.uri(),
+            })
+            .collect()
+    }
+
+    /// Register a FIB route for `prefix` toward `peer`, so Interests under
+    /// `prefix` forward out that peer's face. The ergonomic, raw-face-id-free
+    /// way to point traffic at a gateway: `route_to_peer("/ndn", &peer, 0)`.
+    /// The route is installed at the peer's stable face id, so it survives
+    /// suspend/resume.
+    pub fn route_to_peer(&self, prefix: impl Into<Name>, peer: &PeerRef, cost: u32) {
+        self.engine
+            .fib()
+            .add_nexthop(&prefix.into(), peer.id, cost);
     }
 
     pub fn engine(&self) -> &ForwarderEngine {

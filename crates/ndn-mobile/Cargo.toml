@@ -42,10 +42,16 @@ fec = ["dep:ndn-coding"]
 ## Required for `MobileEngineBuilder::with_tun()`. The IP↔NDN translation is a
 ## caller-supplied `TunEncap` policy (the carry model). No extra deps.
 tun = []
+## Cross-layer (RSSI / signal-aware) forwarding strategy. Required for
+## `MobileStrategy::Cclf`. Pulls the `ndn-strategy-cclf` native adapter and its
+## signals machinery; `BestRoute`/`Multicast` need no extra deps.
+cclf = ["dep:ndn-strategy-cclf"]
 
 [dependencies]
 ndn-engine      = { workspace = true }
 ndn-app         = { workspace = true }
+ndn-strategy    = { workspace = true }
+ndn-strategy-cclf = { workspace = true, optional = true, features = ["native"] }
 ndn-discovery   = { workspace = true, features = ["udp-hello"] }
 ndn-discovery-core = { workspace = true }
 ndn-packet      = { workspace = true, features = ["std"] }
