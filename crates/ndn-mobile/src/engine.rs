@@ -176,6 +176,15 @@ pub struct MobileEngineBuilder {
         Arc<ndn_security::Validator>,
         Arc<dyn ndn_security::Signer>,
     )>,
+    /// Host-owned log ring for the `/localhost/nfd/log` module. The binary
+    /// owns tracing init, so it supplies this; libraries never install it.
+    #[cfg(feature = "management")]
+    log_inspector: Option<Arc<ndn_mgmt::LogInspector>>,
+    /// Read-only `/localhost/nfd/compute/list` backend (e.g. a
+    /// `ComputeService::mgmt_backend()`). Distinct from `with_compute`'s
+    /// in-process `ComputeRegistry`, which carries no introspection metadata.
+    #[cfg(feature = "management")]
+    compute_mgmt_backend: Option<Arc<dyn ndn_mgmt::ComputeMgmtBackend>>,
     #[cfg(feature = "compute")]
     compute_prefix: Option<Name>,
     #[cfg(feature = "ratelimit")]
@@ -207,6 +216,10 @@ impl Default for MobileEngineBuilder {
             enable_management: false,
             #[cfg(feature = "management")]
             secured_mgmt: None,
+            #[cfg(feature = "management")]
+            log_inspector: None,
+            #[cfg(feature = "management")]
+            compute_mgmt_backend: None,
             #[cfg(feature = "compute")]
             compute_prefix: None,
             #[cfg(feature = "ratelimit")]
@@ -317,6 +330,29 @@ impl MobileEngineBuilder {
     ) -> Self {
         self.enable_management = true;
         self.secured_mgmt = Some((command_validator, command_response_signer));
+        self
+    }
+
+    /// Supply the host-owned log ring backing `/localhost/nfd/log`. The
+    /// embedding app installs the tracing layer (libraries never do) and passes
+    /// the resulting [`LogInspector`](ndn_mgmt::LogInspector) here. Requires the
+    /// `management` feature.
+    #[cfg(feature = "management")]
+    pub fn with_log_inspector(mut self, inspector: Arc<ndn_mgmt::LogInspector>) -> Self {
+        self.log_inspector = Some(inspector);
+        self
+    }
+
+    /// Wire a read-only compute-introspection backend behind
+    /// `/localhost/nfd/compute/list` (e.g. from a `ComputeService`). Without
+    /// this the `compute` mgmt module reports "not wired". Requires the
+    /// `management` feature.
+    #[cfg(feature = "management")]
+    pub fn with_compute_mgmt_backend(
+        mut self,
+        backend: Arc<dyn ndn_mgmt::ComputeMgmtBackend>,
+    ) -> Self {
+        self.compute_mgmt_backend = Some(backend);
         self
     }
 
@@ -465,7 +501,10 @@ impl MobileEngineBuilder {
         };
 
         // Discovery: a custom service-discovery protocol wins over the
-        // built-in Hello probe.
+        // built-in Hello probe. When the built-in probe runs, expose a snapshot
+        // of its config for `/localhost/nfd` query.
+        #[cfg(feature = "management")]
+        let mut discovery_cfg_snapshot: Option<Arc<std::sync::RwLock<DiscoveryConfig>>> = None;
         if let Some(proto) = self.discovery_protocol {
             builder.register_discovery(proto);
         } else if let Some(ref node_name) = self.node_name {
@@ -475,6 +514,10 @@ impl MobileEngineBuilder {
                 cfg.hello_interval_base,
                 cfg.liveness_miss_count as u8,
             );
+            #[cfg(feature = "management")]
+            {
+                discovery_cfg_snapshot = Some(Arc::new(std::sync::RwLock::new(cfg)));
+            }
             builder.register_discovery(Arc::new(discovery));
         }
 
@@ -627,17 +670,17 @@ impl MobileEngineBuilder {
             };
 
             let handles = ndn_mgmt::MgmtHandles {
-                discovery_cfg: None,
+                discovery_cfg: discovery_cfg_snapshot,
                 security_is_ephemeral,
                 command_validator,
                 localhop_command_validator: None,
                 require_signed_commands,
                 command_replay_cache,
                 command_response_signer,
-                log_inspector: None,
+                log_inspector: self.log_inspector,
                 coding_handler,
                 rate_limit_handler,
-                compute_handler: None,
+                compute_handler: self.compute_mgmt_backend,
                 webtransport_status_handler: None,
                 ble_handler: None,
                 approval_handler: None,

@@ -84,4 +84,5 @@ thiserror       = { workspace = true }
 ndn-config   = { workspace = true }
 ndn-packet   = { workspace = true, features = ["std"] }
 ndn-security = { workspace = true }
+ndn-mgmt     = { workspace = true }
 bytes        = { workspace = true, features = ["std"] }
