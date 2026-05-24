@@ -50,6 +50,8 @@ enum PeerSpec {
     Tcp(SocketAddr),
     WebSocket(String),
     Serial(String, u32),
+    #[cfg(feature = "webtransport")]
+    WebTransport(String, ndn_transport::ClientTls),
 }
 
 impl PeerSpec {
@@ -60,6 +62,8 @@ impl PeerSpec {
             PeerSpec::Tcp(a) => format!("tcp4://{a}"),
             PeerSpec::WebSocket(u) => u.clone(),
             PeerSpec::Serial(p, b) => format!("serial://{p}?baud={b}"),
+            #[cfg(feature = "webtransport")]
+            PeerSpec::WebTransport(u, _) => u.clone(),
         }
     }
 }
@@ -121,6 +125,15 @@ async fn build_peer_face(
             }
             Err(e) => tracing::warn!(%port, baud, error = %e, "serial face setup failed"),
         },
+        #[cfg(feature = "webtransport")]
+        PeerSpec::WebTransport(url, tls) => {
+            match ndn_face_webtransport::WebTransportFace::connect(id, url, tls.clone()).await {
+                Ok(face) => {
+                    engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent)
+                }
+                Err(e) => tracing::warn!(%url, error = %e, "WebTransport face setup failed"),
+            }
+        }
     }
 }
 
@@ -158,6 +171,8 @@ pub struct MobileEngineBuilder {
     tcp_peers: Vec<SocketAddr>,
     ws_peers: Vec<String>,
     serial_ports: Vec<(String, u32)>,
+    #[cfg(feature = "webtransport")]
+    webtransport_peers: Vec<(String, ndn_transport::ClientTls)>,
     ipc_listen_path: Option<String>,
     routing_protocols: Vec<Arc<dyn RoutingProtocol>>,
     discovery_protocol: Option<Arc<dyn DiscoveryProtocol>>,
@@ -207,6 +222,8 @@ impl Default for MobileEngineBuilder {
             tcp_peers: Vec::new(),
             ws_peers: Vec::new(),
             serial_ports: Vec::new(),
+            #[cfg(feature = "webtransport")]
+            webtransport_peers: Vec::new(),
             ipc_listen_path: None,
             routing_protocols: Vec::new(),
             discovery_protocol: None,
@@ -287,6 +304,25 @@ impl MobileEngineBuilder {
     /// COBS-framed.
     pub fn with_serial(mut self, port: impl Into<String>, baud: u32) -> Self {
         self.serial_ports.push((port.into(), baud));
+        self
+    }
+
+    /// Dial a WebTransport (QUIC/HTTP3) face to a gateway at `url`
+    /// (`https://host:port[/path]`). The NAT/firewall-friendliest cellular
+    /// path: HTTP3 traverses CGNAT like HTTPS. `tls` is
+    /// [`ClientTls::CertHashes`] to pin a self-signed gateway leaf, or
+    /// [`ClientTls::WebPki`] for an ACME/publicly-trusted one — TLS
+    /// authenticates the *link*; NDN trust is layered on signed Data. Like the
+    /// other peers it gets a stable face id and is rebuilt on resume. Requires
+    /// the `webtransport` feature (native only). Per the connection model, route
+    /// toward it with [`MobileEngine::route_to_peer`], not a raw face id.
+    #[cfg(feature = "webtransport")]
+    pub fn with_webtransport_peer(
+        mut self,
+        url: impl Into<String>,
+        tls: ndn_transport::ClientTls,
+    ) -> Self {
+        self.webtransport_peers.push((url.into(), tls));
         self
     }
 
@@ -555,6 +591,10 @@ impl MobileEngineBuilder {
         }
         for (port, baud) in self.serial_ports {
             network_peers.push((engine.faces().alloc_id(), PeerSpec::Serial(port, baud)));
+        }
+        #[cfg(feature = "webtransport")]
+        for (url, tls) in self.webtransport_peers {
+            network_peers.push((engine.faces().alloc_id(), PeerSpec::WebTransport(url, tls)));
         }
         for (id, spec) in &network_peers {
             build_peer_face(&engine, *id, spec, network_cancel.child_token()).await;

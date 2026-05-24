@@ -50,6 +50,11 @@ cclf = ["dep:ndn-strategy-cclf"]
 ## identity export/import (`EnrolledIdentity::to_safebag` /
 ## `MobileEngine::load_identity`). Pulls ndn-cert + ndn-safebag + serde_json.
 enroll = ["dep:ndn-cert", "dep:ndn-safebag", "dep:serde_json", "dep:getrandom"]
+## WebTransport (QUIC/HTTP3) dial-out face (`with_webtransport_peer`) — the
+## NAT-friendliest way to reach a gateway over cellular. NATIVE ONLY: pulls the
+## wtransport/quinn stack; do not enable on wasm32 (the browser uses
+## ndn-face-webtransport-wasm instead). See `feedback_consider_wasm`.
+webtransport = ["dep:ndn-face-webtransport"]
 
 [dependencies]
 ndn-engine      = { workspace = true }
@@ -58,6 +63,7 @@ ndn-strategy    = { workspace = true }
 ndn-strategy-cclf = { workspace = true, optional = true, features = ["native"] }
 ndn-cert        = { workspace = true, optional = true }
 ndn-safebag     = { workspace = true, optional = true }
+ndn-face-webtransport = { workspace = true, optional = true }
 serde_json      = { workspace = true, optional = true }
 getrandom       = { workspace = true, optional = true }
 ndn-discovery   = { workspace = true, features = ["udp-hello"] }
@@ -85,4 +91,6 @@ ndn-config   = { workspace = true }
 ndn-packet   = { workspace = true, features = ["std"] }
 ndn-security = { workspace = true }
 ndn-mgmt     = { workspace = true }
+ndn-face-webtransport = { workspace = true }
+ndn-transport = { workspace = true }
 bytes        = { workspace = true, features = ["std"] }

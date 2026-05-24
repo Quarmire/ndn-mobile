@@ -42,4 +42,7 @@ pub use ndn_face_native::local::InProcHandle;
 pub use ndn_packet::{Data, Interest, Name};
 pub use ndn_security::SecurityProfile;
 pub use ndn_transport::FaceId;
+/// Re-exported for [`MobileEngineBuilder::with_webtransport_peer`].
+#[cfg(feature = "webtransport")]
+pub use ndn_transport::ClientTls;
 pub use tokio_util::sync::CancellationToken;
