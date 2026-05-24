@@ -46,12 +46,20 @@ tun = []
 ## `MobileStrategy::Cclf`. Pulls the `ndn-strategy-cclf` native adapter and its
 ## signals machinery; `BestRoute`/`Multicast` need no extra deps.
 cclf = ["dep:ndn-strategy-cclf"]
+## NDNCERT 0.3 identity enrollment (`MobileEngine::enroll_pin`) plus SafeBag
+## identity export/import (`EnrolledIdentity::to_safebag` /
+## `MobileEngine::load_identity`). Pulls ndn-cert + ndn-safebag + serde_json.
+enroll = ["dep:ndn-cert", "dep:ndn-safebag", "dep:serde_json", "dep:getrandom"]
 
 [dependencies]
 ndn-engine      = { workspace = true }
 ndn-app         = { workspace = true }
 ndn-strategy    = { workspace = true }
 ndn-strategy-cclf = { workspace = true, optional = true, features = ["native"] }
+ndn-cert        = { workspace = true, optional = true }
+ndn-safebag     = { workspace = true, optional = true }
+serde_json      = { workspace = true, optional = true }
+getrandom       = { workspace = true, optional = true }
 ndn-discovery   = { workspace = true, features = ["udp-hello"] }
 ndn-discovery-core = { workspace = true }
 ndn-packet      = { workspace = true, features = ["std"] }
