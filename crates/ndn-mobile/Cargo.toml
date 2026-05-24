@@ -79,3 +79,9 @@ tokio-util      = { workspace = true, features = ["codec"] }
 tracing         = { workspace = true }
 anyhow          = { workspace = true }
 thiserror       = { workspace = true }
+
+[dev-dependencies]
+ndn-config   = { workspace = true }
+ndn-packet   = { workspace = true, features = ["std"] }
+ndn-security = { workspace = true }
+bytes        = { workspace = true, features = ["std"] }

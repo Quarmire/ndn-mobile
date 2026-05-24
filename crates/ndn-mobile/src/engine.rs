@@ -166,6 +166,16 @@ pub struct MobileEngineBuilder {
     pipeline_threads: usize,
     #[cfg_attr(not(feature = "management"), allow(dead_code))]
     enable_management: bool,
+    /// `Some` once `with_management_secured` is called: the validator that
+    /// authenticates signed command Interests and the signer for control
+    /// responses. When set, command auth + anti-replay + a locked-down
+    /// runtime policy are installed; when `None`, management is mounted open
+    /// (suitable only for a trusted local IPC face).
+    #[cfg(feature = "management")]
+    secured_mgmt: Option<(
+        Arc<ndn_security::Validator>,
+        Arc<dyn ndn_security::Signer>,
+    )>,
     #[cfg(feature = "compute")]
     compute_prefix: Option<Name>,
     #[cfg(feature = "ratelimit")]
@@ -195,6 +205,8 @@ impl Default for MobileEngineBuilder {
             strategy: MobileStrategy::default(),
             pipeline_threads: 1,
             enable_management: false,
+            #[cfg(feature = "management")]
+            secured_mgmt: None,
             #[cfg(feature = "compute")]
             compute_prefix: None,
             #[cfg(feature = "ratelimit")]
@@ -283,6 +295,28 @@ impl MobileEngineBuilder {
     #[cfg(feature = "management")]
     pub fn with_management(mut self) -> Self {
         self.enable_management = true;
+        self
+    }
+
+    /// Mount the management dispatcher with **command authentication**:
+    /// `command_validator` verifies signed command Interests against its trust
+    /// schema, `command_response_signer` signs control responses, signed
+    /// commands are required, and an anti-replay `SignatureTime` cache plus a
+    /// locked-down runtime policy are installed. This is the secure default for
+    /// any engine exposed to a UI/VPN client.
+    ///
+    /// The identity typically comes from [`enrollment`](crate::enroll): persist
+    /// the [`EnrolledIdentity`](crate::enroll::EnrolledIdentity) as a SafeBag on
+    /// first run, then on later runs `load_identity` it and build a `Validator`
+    /// anchored on the CA, passing both here. Requires the `management` feature.
+    #[cfg(feature = "management")]
+    pub fn with_management_secured(
+        mut self,
+        command_validator: Arc<ndn_security::Validator>,
+        command_response_signer: Arc<dyn ndn_security::Signer>,
+    ) -> Self {
+        self.enable_management = true;
+        self.secured_mgmt = Some((command_validator, command_response_signer));
         self
     }
 
@@ -559,14 +593,47 @@ impl MobileEngineBuilder {
             #[cfg(not(feature = "fec"))]
             let coding_handler: Option<Arc<dyn ndn_mgmt::CodingHandler>> = None;
 
+            // Secured vs open management. When `with_management_secured` was
+            // used, require signed commands, verify them against the supplied
+            // validator, sign responses, install anti-replay, and lock the
+            // runtime policy. Otherwise mount open (trusted local face only).
+            let (
+                command_validator,
+                command_response_signer,
+                require_signed_commands,
+                command_replay_cache,
+                runtime_policy,
+                security_is_ephemeral,
+            ) = match self.secured_mgmt {
+                Some((validator, signer)) => (
+                    Some(validator),
+                    Some(signer),
+                    true,
+                    Some(Arc::new(std::sync::Mutex::new(
+                        std::collections::HashMap::new(),
+                    ))),
+                    Some(Arc::new(std::sync::RwLock::new(
+                        ndn_mgmt::MgmtAccessPolicy {
+                            ephemeral_allowed: false,
+                            localhop_disabled: true,
+                            replay_window_secs: 120,
+                            require_signed_commands: true,
+                            validator_anchor: None,
+                        },
+                    ))),
+                    false,
+                ),
+                None => (None, None, false, None, None, true),
+            };
+
             let handles = ndn_mgmt::MgmtHandles {
                 discovery_cfg: None,
-                security_is_ephemeral: true,
-                command_validator: None,
+                security_is_ephemeral,
+                command_validator,
                 localhop_command_validator: None,
-                require_signed_commands: false,
-                command_replay_cache: None,
-                command_response_signer: None,
+                require_signed_commands,
+                command_replay_cache,
+                command_response_signer,
                 log_inspector: None,
                 coding_handler,
                 rate_limit_handler,
@@ -574,7 +641,7 @@ impl MobileEngineBuilder {
                 webtransport_status_handler: None,
                 ble_handler: None,
                 approval_handler: None,
-                runtime_policy: None,
+                runtime_policy,
             };
             let fut = ndn_mgmt::mount_management(
                 &engine,
