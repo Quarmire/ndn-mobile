@@ -59,6 +59,10 @@ webtransport = ["dep:ndn-face-webtransport"]
 ## `/localhost/nfd/observability` (`with_observability`). Battery-conscious
 ## retention default; the app's tracing layer owns the sampling rate.
 observability = ["dep:ndn-observability"]
+## Wi-Fi Aware (NAN) connectionless coordination face (`with_wifi_aware`) — the
+## AP-less named-radio bearer. The platform supplies the `NanBackend` (Android
+## WifiAwareManager via JNI); pub/sub discovery installs routes.
+wifi-aware = ["dep:ndn-face-wifi-aware"]
 
 [dependencies]
 ndn-engine      = { workspace = true }
@@ -68,6 +72,7 @@ ndn-strategy-cclf = { workspace = true, optional = true, features = ["native"] }
 ndn-cert        = { workspace = true, optional = true }
 ndn-safebag     = { workspace = true, optional = true }
 ndn-face-webtransport = { workspace = true, optional = true }
+ndn-face-wifi-aware = { workspace = true, optional = true }
 ndn-observability = { workspace = true, optional = true }
 serde_json      = { workspace = true, optional = true }
 getrandom       = { workspace = true, optional = true }

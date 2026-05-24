@@ -48,4 +48,7 @@ pub use ndn_transport::ClientTls;
 /// Re-exported for [`MobileEngineBuilder::with_observability_config`].
 #[cfg(feature = "observability")]
 pub use ndn_observability::{SpanPublisher, SpanRetention};
+/// Re-exported for [`MobileEngineBuilder::with_wifi_aware`].
+#[cfg(feature = "wifi-aware")]
+pub use ndn_face_wifi_aware::{NanBackend, NanServiceName};
 pub use tokio_util::sync::CancellationToken;

@@ -148,6 +148,15 @@ fn mobile_low_retention() -> ndn_observability::SpanRetention {
     }
 }
 
+/// Wi-Fi Aware (NAN) configuration: the platform radio backend plus the
+/// service↔prefix discovery bindings to install.
+#[cfg(feature = "wifi-aware")]
+struct WifiAwareCfg {
+    backend: Arc<dyn ndn_face_wifi_aware::NanBackend>,
+    discover: Vec<(ndn_face_wifi_aware::NanServiceName, Name)>,
+    advertise: Vec<ndn_face_wifi_aware::NanServiceName>,
+}
+
 /// In-process forwarder paired with an [`InProcFace`] for app traffic and
 /// optional UDP multicast/unicast for the network side.
 pub struct MobileEngine {
@@ -170,6 +179,10 @@ pub struct MobileEngine {
     /// Span publisher serving OTLP Data; `None` unless `with_observability`.
     #[cfg(feature = "observability")]
     observability: Option<Arc<ndn_observability::SpanPublisher>>,
+    /// NAN coordination face (stable id + platform backend), rebuilt on resume.
+    /// `None` unless `with_wifi_aware`.
+    #[cfg(feature = "wifi-aware")]
+    wifi_aware: Option<(FaceId, Arc<dyn ndn_face_wifi_aware::NanBackend>)>,
     /// Platform side of the VPN datapath face; `None` unless `with_tun` was
     /// called. Drive it from the native tun pump via [`MobileEngine::tun_handle`].
     #[cfg(feature = "tun")]
@@ -214,6 +227,9 @@ pub struct MobileEngineBuilder {
     /// in-process `ComputeRegistry`, which carries no introspection metadata.
     #[cfg(feature = "management")]
     compute_mgmt_backend: Option<Arc<dyn ndn_mgmt::ComputeMgmtBackend>>,
+    /// `Some` once `with_wifi_aware` is called: the NAN coordination bearer.
+    #[cfg(feature = "wifi-aware")]
+    wifi_aware: Option<WifiAwareCfg>,
     /// `Some((prefix, retention))` once `with_observability[_config]` is called:
     /// install a span publisher serving OTLP Data at `prefix`.
     #[cfg(feature = "observability")]
@@ -257,6 +273,8 @@ impl Default for MobileEngineBuilder {
             compute_mgmt_backend: None,
             #[cfg(feature = "observability")]
             observability: None,
+            #[cfg(feature = "wifi-aware")]
+            wifi_aware: None,
             #[cfg(feature = "compute")]
             compute_prefix: None,
             #[cfg(feature = "ratelimit")]
@@ -446,6 +464,53 @@ impl MobileEngineBuilder {
         self
     }
 
+    /// Mount a Wi-Fi Aware (NAN) connectionless coordination face over the
+    /// platform-supplied `backend` (Android `WifiAwareManager` via JNI). The
+    /// AP-less, association-less named-radio bearer; carries NDN over NAN
+    /// follow-up messages and suspends/resumes with the other network faces.
+    /// Pair with [`Self::wifi_aware_discover`] / [`Self::wifi_aware_advertise`]
+    /// for pub/sub route installation. Requires the `wifi-aware` feature.
+    #[cfg(feature = "wifi-aware")]
+    pub fn with_wifi_aware(mut self, backend: Arc<dyn ndn_face_wifi_aware::NanBackend>) -> Self {
+        self.wifi_aware = Some(WifiAwareCfg {
+            backend,
+            discover: Vec::new(),
+            advertise: Vec::new(),
+        });
+        self
+    }
+
+    /// Subscribe to NAN service `service` and install a route for `prefix`
+    /// toward the NAN coordination face when a peer advertising it appears.
+    /// No-op unless [`Self::with_wifi_aware`] was called. Registering any
+    /// `discover`/`advertise` binding installs a `NanDiscovery` as the engine's
+    /// discovery protocol (takes precedence over the built-in Hello probe; an
+    /// explicit [`Self::with_discovery_protocol`] still wins).
+    #[cfg(feature = "wifi-aware")]
+    pub fn wifi_aware_discover(
+        mut self,
+        service: impl Into<ndn_face_wifi_aware::NanServiceName>,
+        prefix: impl Into<Name>,
+    ) -> Self {
+        if let Some(cfg) = self.wifi_aware.as_mut() {
+            cfg.discover.push((service.into(), prefix.into()));
+        }
+        self
+    }
+
+    /// Advertise NAN service `service` so peers discover this node. No-op unless
+    /// [`Self::with_wifi_aware`] was called.
+    #[cfg(feature = "wifi-aware")]
+    pub fn wifi_aware_advertise(
+        mut self,
+        service: impl Into<ndn_face_wifi_aware::NanServiceName>,
+    ) -> Self {
+        if let Some(cfg) = self.wifi_aware.as_mut() {
+            cfg.advertise.push(service.into());
+        }
+        self
+    }
+
     /// Use a custom service-discovery / autoconfig protocol (e.g.
     /// `ServiceDiscoveryProtocol`) instead of the built-in Hello probe.
     /// Mutually exclusive with [`Self::with_discovery`]; the custom protocol
@@ -550,6 +615,11 @@ impl MobileEngineBuilder {
             None
         };
 
+        // Reserve the NAN coordination face id before build so a NanDiscovery
+        // can target it, and so resume() recreates it without invalidating FIB.
+        #[cfg(feature = "wifi-aware")]
+        let wifi_aware_coord_id = self.wifi_aware.as_ref().map(|_| builder.alloc_face_id());
+
         // Rate-limit hook (engine pipeline stage). The table is also handed to
         // the management dispatcher below so policies are runtime-mutable.
         #[cfg(feature = "ratelimit")]
@@ -581,12 +651,42 @@ impl MobileEngineBuilder {
             None
         };
 
-        // Discovery: a custom service-discovery protocol wins over the
-        // built-in Hello probe. When the built-in probe runs, expose a snapshot
-        // of its config for `/localhost/nfd` query.
+        // A NanDiscovery (NAN pub/sub → routes) when wifi-aware bindings exist.
+        #[cfg(feature = "wifi-aware")]
+        let nan_discovery: Option<Arc<dyn DiscoveryProtocol>> =
+            match (self.wifi_aware.as_ref(), wifi_aware_coord_id) {
+                (Some(cfg), Some(coord_id))
+                    if !cfg.discover.is_empty() || !cfg.advertise.is_empty() =>
+                {
+                    let mut disc =
+                        ndn_face_wifi_aware::NanDiscovery::new(Arc::clone(&cfg.backend), coord_id);
+                    for (service, prefix) in &cfg.discover {
+                        disc = disc
+                            .discover(service.clone(), prefix.clone())
+                            .await
+                            .map_err(|e| anyhow::anyhow!("wifi-aware subscribe: {e}"))?;
+                    }
+                    for service in &cfg.advertise {
+                        disc = disc
+                            .advertise(service.clone())
+                            .await
+                            .map_err(|e| anyhow::anyhow!("wifi-aware publish: {e}"))?;
+                    }
+                    Some(Arc::new(disc))
+                }
+                _ => None,
+            };
+        #[cfg(not(feature = "wifi-aware"))]
+        let nan_discovery: Option<Arc<dyn DiscoveryProtocol>> = None;
+
+        // Discovery priority: explicit `with_discovery_protocol` > NAN pub/sub >
+        // built-in Hello probe. When the probe runs, expose a config snapshot
+        // for `/localhost/nfd` query.
         #[cfg(feature = "management")]
         let mut discovery_cfg_snapshot: Option<Arc<std::sync::RwLock<DiscoveryConfig>>> = None;
         if let Some(proto) = self.discovery_protocol {
+            builder.register_discovery(proto);
+        } else if let Some(proto) = nan_discovery {
             builder.register_discovery(proto);
         } else if let Some(ref node_name) = self.node_name {
             let cfg = DiscoveryConfig::for_profile(&DiscoveryProfile::Mobile);
@@ -644,6 +744,21 @@ impl MobileEngineBuilder {
         for (id, spec) in &network_peers {
             build_peer_face(&engine, *id, spec, network_cancel.child_token()).await;
         }
+
+        // NAN coordination face: a connectionless AdHoc bearer over the
+        // platform radio backend. Suspends with the network faces; resume
+        // rebuilds it at the same id (routes installed by NanDiscovery survive).
+        #[cfg(feature = "wifi-aware")]
+        let wifi_aware = match (self.wifi_aware, wifi_aware_coord_id) {
+            (Some(cfg), Some(coord_id)) => {
+                engine.add_face(
+                    ndn_face_wifi_aware::NanCoordFace::new(coord_id, Arc::clone(&cfg.backend)),
+                    network_cancel.child_token(),
+                );
+                Some((coord_id, cfg.backend))
+            }
+            _ => None,
+        };
 
         // In-process compute face: dispatch Interests under `prefix` to the
         // registry's native handlers. Register handlers via
@@ -804,6 +919,8 @@ impl MobileEngineBuilder {
                 compute_registry,
                 #[cfg(feature = "observability")]
                 observability,
+                #[cfg(feature = "wifi-aware")]
+                wifi_aware,
                 #[cfg(feature = "tun")]
                 tun_handle,
             },
@@ -881,6 +998,14 @@ impl MobileEngine {
         for (id, spec) in &self.network_peers {
             build_peer_face(&self.engine, *id, spec, self.network_cancel.child_token()).await;
             tracing::debug!(face_id = %id, uri = %spec.uri(), "network peer resumed");
+        }
+        #[cfg(feature = "wifi-aware")]
+        if let Some((id, backend)) = &self.wifi_aware {
+            self.engine.add_face(
+                ndn_face_wifi_aware::NanCoordFace::new(*id, Arc::clone(backend)),
+                self.network_cancel.child_token(),
+            );
+            tracing::debug!(face_id = %id, "NAN coordination face resumed");
         }
     }
 
