@@ -45,4 +45,7 @@ pub use ndn_transport::FaceId;
 /// Re-exported for [`MobileEngineBuilder::with_webtransport_peer`].
 #[cfg(feature = "webtransport")]
 pub use ndn_transport::ClientTls;
+/// Re-exported for [`MobileEngineBuilder::with_observability_config`].
+#[cfg(feature = "observability")]
+pub use ndn_observability::{SpanPublisher, SpanRetention};
 pub use tokio_util::sync::CancellationToken;

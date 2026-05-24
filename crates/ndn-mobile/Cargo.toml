@@ -55,6 +55,10 @@ enroll = ["dep:ndn-cert", "dep:ndn-safebag", "dep:serde_json", "dep:getrandom"]
 ## wtransport/quinn stack; do not enable on wasm32 (the browser uses
 ## ndn-face-webtransport-wasm instead). See `feedback_consider_wasm`.
 webtransport = ["dep:ndn-face-webtransport"]
+## Publish completed `tracing` spans as OTLP Data over NDN at
+## `/localhost/nfd/observability` (`with_observability`). Battery-conscious
+## retention default; the app's tracing layer owns the sampling rate.
+observability = ["dep:ndn-observability"]
 
 [dependencies]
 ndn-engine      = { workspace = true }
@@ -64,6 +68,7 @@ ndn-strategy-cclf = { workspace = true, optional = true, features = ["native"] }
 ndn-cert        = { workspace = true, optional = true }
 ndn-safebag     = { workspace = true, optional = true }
 ndn-face-webtransport = { workspace = true, optional = true }
+ndn-observability = { workspace = true, optional = true }
 serde_json      = { workspace = true, optional = true }
 getrandom       = { workspace = true, optional = true }
 ndn-discovery   = { workspace = true, features = ["udp-hello"] }

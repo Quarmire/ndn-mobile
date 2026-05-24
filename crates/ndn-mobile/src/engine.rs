@@ -137,6 +137,17 @@ async fn build_peer_face(
     }
 }
 
+/// Battery-conscious span retention for a phone: a short window and small ring
+/// vs the forwarder's 1-hour / 8-MiB / 10k-span default.
+#[cfg(feature = "observability")]
+fn mobile_low_retention() -> ndn_observability::SpanRetention {
+    ndn_observability::SpanRetention {
+        window: std::time::Duration::from_secs(5 * 60),
+        max_bytes: 1024 * 1024,
+        max_spans: 1_000,
+    }
+}
+
 /// In-process forwarder paired with an [`InProcFace`] for app traffic and
 /// optional UDP multicast/unicast for the network side.
 pub struct MobileEngine {
@@ -156,6 +167,9 @@ pub struct MobileEngine {
     /// `with_compute` was called. Register handlers via [`MobileEngine::compute_registry`].
     #[cfg(feature = "compute")]
     compute_registry: Option<Arc<ComputeRegistry>>,
+    /// Span publisher serving OTLP Data; `None` unless `with_observability`.
+    #[cfg(feature = "observability")]
+    observability: Option<Arc<ndn_observability::SpanPublisher>>,
     /// Platform side of the VPN datapath face; `None` unless `with_tun` was
     /// called. Drive it from the native tun pump via [`MobileEngine::tun_handle`].
     #[cfg(feature = "tun")]
@@ -200,6 +214,10 @@ pub struct MobileEngineBuilder {
     /// in-process `ComputeRegistry`, which carries no introspection metadata.
     #[cfg(feature = "management")]
     compute_mgmt_backend: Option<Arc<dyn ndn_mgmt::ComputeMgmtBackend>>,
+    /// `Some((prefix, retention))` once `with_observability[_config]` is called:
+    /// install a span publisher serving OTLP Data at `prefix`.
+    #[cfg(feature = "observability")]
+    observability: Option<(Name, ndn_observability::SpanRetention)>,
     #[cfg(feature = "compute")]
     compute_prefix: Option<Name>,
     #[cfg(feature = "ratelimit")]
@@ -237,6 +255,8 @@ impl Default for MobileEngineBuilder {
             log_inspector: None,
             #[cfg(feature = "management")]
             compute_mgmt_backend: None,
+            #[cfg(feature = "observability")]
+            observability: None,
             #[cfg(feature = "compute")]
             compute_prefix: None,
             #[cfg(feature = "ratelimit")]
@@ -389,6 +409,31 @@ impl MobileEngineBuilder {
         backend: Arc<dyn ndn_mgmt::ComputeMgmtBackend>,
     ) -> Self {
         self.compute_mgmt_backend = Some(backend);
+        self
+    }
+
+    /// Publish completed `tracing` spans as OTLP Data under
+    /// `/localhost/nfd/observability`, using a battery-conscious retention
+    /// (short window, small ring) suited to a phone. The embedding app's
+    /// tracing layer decides *which* spans are recorded (the sampling rate);
+    /// this only serves what it records. Requires the `observability` feature.
+    #[cfg(feature = "observability")]
+    pub fn with_observability(mut self) -> Self {
+        let prefix = Name::root().append(b"localhost").append(b"nfd").append(b"observability");
+        self.observability = Some((prefix, mobile_low_retention()));
+        self
+    }
+
+    /// Like [`Self::with_observability`] but with an explicit serving `prefix`
+    /// and [`SpanRetention`](ndn_observability::SpanRetention) (e.g. a larger
+    /// ring on Wi-Fi/charging, tighter on cellular/battery).
+    #[cfg(feature = "observability")]
+    pub fn with_observability_config(
+        mut self,
+        prefix: impl Into<Name>,
+        retention: ndn_observability::SpanRetention,
+    ) -> Self {
+        self.observability = Some((prefix.into(), retention));
         self
     }
 
@@ -625,6 +670,15 @@ impl MobileEngineBuilder {
             .tun_config
             .map(|config| spawn_tunnel(&engine, config, shutdown.cancel_token().child_token()));
 
+        // Span publisher: serve completed tracing spans as OTLP Data. Uses the
+        // shutdown token so it lives for the engine's life.
+        #[cfg(feature = "observability")]
+        let observability = self.observability.map(|(prefix, retention)| {
+            let publisher = ndn_observability::SpanPublisher::new(prefix, retention);
+            Arc::clone(&publisher).install(&engine, shutdown.cancel_token().child_token());
+            publisher
+        });
+
         // Local IPC listener (the cross-process UI / VPN-extension seam). Uses
         // the shutdown token, not network_cancel, so it survives backgrounding.
         if let Some(path) = self.ipc_listen_path {
@@ -748,6 +802,8 @@ impl MobileEngineBuilder {
                 network_peers,
                 #[cfg(feature = "compute")]
                 compute_registry,
+                #[cfg(feature = "observability")]
+                observability,
                 #[cfg(feature = "tun")]
                 tun_handle,
             },
@@ -862,6 +918,13 @@ impl MobileEngine {
     #[cfg(feature = "compute")]
     pub fn compute_registry(&self) -> Option<&Arc<ComputeRegistry>> {
         self.compute_registry.as_ref()
+    }
+
+    /// The span publisher, if `with_observability` was set — for the host to
+    /// query buffered spans or wire its tracing layer's output into it.
+    #[cfg(feature = "observability")]
+    pub fn observability(&self) -> Option<&Arc<ndn_observability::SpanPublisher>> {
+        self.observability.as_ref()
     }
 
     /// Platform side of the VPN datapath face, if `with_tun` was set. The
