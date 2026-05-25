@@ -126,7 +126,7 @@ pub fn spawn_tunnel(
     // permits; the streamer consumes one per published Data.
     let budget = Arc::new(Semaphore::new(0));
 
-    // ── Producer serve loop: grant budget per (persistent) Interest. ────────
+    // Producer serve loop: grant budget per (persistent) Interest.
     {
         let producer = Arc::clone(&producer);
         let budget = Arc::clone(&budget);
@@ -149,7 +149,7 @@ pub fn spawn_tunnel(
         });
     }
 
-    // ── Uplink streamer: publish outbound IP as Data while budget remains. ──
+    // Uplink streamer: publish outbound IP as Data while budget remains.
     {
         let producer = Arc::clone(&producer);
         let budget = Arc::clone(&budget);
@@ -187,7 +187,7 @@ pub fn spawn_tunnel(
         });
     }
 
-    // ── Downlink: one persistent subscription pulls IP back to the OS. ──────
+    // Downlink: one persistent subscription pulls IP back to the OS.
     {
         let consumer = engine.app_consumer(cancel.child_token());
         let peer_prefix = config.peer_prefix.clone();

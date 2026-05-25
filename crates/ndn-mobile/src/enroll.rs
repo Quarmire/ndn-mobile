@@ -209,7 +209,7 @@ impl MobileEngine {
         let mut session =
             EnrollmentSession::new(key_name.clone(), signer.clone(), cfg.validity_secs);
 
-        // ── Step 1: NEW ────────────────────────────────────────────────────
+        // Step 1: NEW
         let new_params = session
             .new_request_body()
             .await
@@ -233,7 +233,7 @@ impl MobileEngine {
             .ok_or_else(|| EnrollError::Cert("no request_id after NEW".into()))?
             .to_vec();
 
-        // ── Step 2a: CHALLENGE trigger (select "pin", no code yet) ──────────
+        // Step 2a: CHALLENGE trigger (select "pin", no code yet)
         let challenge_name = cfg
             .ca_prefix
             .clone()
@@ -265,7 +265,7 @@ impl MobileEngine {
             })
             .await;
 
-            // ── Step 2b: CHALLENGE submit (the PIN code) ────────────────────
+            // Step 2b: CHALLENGE submit (the PIN code)
             let mut code = serde_json::Map::new();
             code.insert("code".to_string(), serde_json::Value::String(pin));
             let submit_params = session
