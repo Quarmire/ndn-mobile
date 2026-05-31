@@ -37,8 +37,16 @@ impl MemoryLink {
         let (a_to_b_tx, a_to_b_rx) = mpsc::channel(buffer);
         let (b_to_a_tx, b_to_a_rx) = mpsc::channel(buffer);
         (
-            MemoryLink { id: id_a, rx: Mutex::new(b_to_a_rx), tx: a_to_b_tx },
-            MemoryLink { id: id_b, rx: Mutex::new(a_to_b_rx), tx: b_to_a_tx },
+            MemoryLink {
+                id: id_a,
+                rx: Mutex::new(b_to_a_rx),
+                tx: a_to_b_tx,
+            },
+            MemoryLink {
+                id: id_b,
+                rx: Mutex::new(a_to_b_rx),
+                tx: b_to_a_tx,
+            },
         )
     }
 }
@@ -119,8 +127,16 @@ async fn two_endpoint_tunnel(cancel: &CancellationToken) -> (Arc<TunHandle>, Arc
     engine_a.fib().add_nexthop(&prefix_b, link_a_id, 0);
     engine_b.fib().add_nexthop(&prefix_a, link_b_id, 0);
 
-    let tun_a = spawn_tunnel(&engine_a, TunConfig::new(prefix_a.clone(), prefix_b.clone()), cancel.child_token());
-    let tun_b = spawn_tunnel(&engine_b, TunConfig::new(prefix_b, prefix_a), cancel.child_token());
+    let tun_a = spawn_tunnel(
+        &engine_a,
+        TunConfig::new(prefix_a.clone(), prefix_b.clone()),
+        cancel.child_token(),
+    );
+    let tun_b = spawn_tunnel(
+        &engine_b,
+        TunConfig::new(prefix_b, prefix_a),
+        cancel.child_token(),
+    );
 
     // Keep the engines alive for the test (faces/tasks hold clones internally,
     // but the ForwarderEngine handle must outlive them).

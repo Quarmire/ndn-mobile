@@ -39,16 +39,16 @@ pub use tun::{IpFlow, TunConfig, TunHandle, parse_ip_flow, spawn_tunnel};
 pub use ndn_app::{AppError, Consumer, Producer};
 pub use ndn_discovery::DiscoveryProfile;
 pub use ndn_face_native::local::InProcHandle;
-pub use ndn_packet::{Data, Interest, Name};
-pub use ndn_security::SecurityProfile;
-pub use ndn_transport::FaceId;
-/// Re-exported for [`MobileEngineBuilder::with_webtransport_peer`].
-#[cfg(feature = "webtransport")]
-pub use ndn_transport::ClientTls;
-/// Re-exported for [`MobileEngineBuilder::with_observability_config`].
-#[cfg(feature = "observability")]
-pub use ndn_observability::{SpanPublisher, SpanRetention};
 /// Re-exported for [`MobileEngineBuilder::with_wifi_aware`].
 #[cfg(feature = "wifi-aware")]
 pub use ndn_face_wifi_aware::{NanBackend, NanServiceName};
+/// Re-exported for [`MobileEngineBuilder::with_observability_config`].
+#[cfg(feature = "observability")]
+pub use ndn_observability::{SpanPublisher, SpanRetention};
+pub use ndn_packet::{Data, Interest, Name};
+pub use ndn_security::SecurityProfile;
+/// Re-exported for [`MobileEngineBuilder::with_webtransport_peer`].
+#[cfg(feature = "webtransport")]
+pub use ndn_transport::ClientTls;
+pub use ndn_transport::FaceId;
 pub use tokio_util::sync::CancellationToken;

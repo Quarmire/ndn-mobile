@@ -17,10 +17,10 @@ use ndn_strategy::{BestRouteStrategy, MulticastStrategy};
 use ndn_transport::{FaceId, FaceKind, FacePersistency};
 use tokio_util::sync::CancellationToken;
 
-#[cfg(feature = "compute")]
-use ndn_compute::{ComputeFace, ComputeRegistry};
 #[cfg(feature = "tun")]
 use crate::tun::{TunConfig, TunHandle, spawn_tunnel};
+#[cfg(feature = "compute")]
+use ndn_compute::{ComputeFace, ComputeRegistry};
 
 /// Forwarding strategy installed at the engine root. Chosen via
 /// [`MobileEngineBuilder::with_strategy`]; the engine keeps the
@@ -108,21 +108,15 @@ async fn build_peer_face(
             }
         }
         PeerSpec::Tcp(peer) => match tcp_face_connect(id, *peer).await {
-            Ok(face) => {
-                engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent)
-            }
+            Ok(face) => engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent),
             Err(e) => tracing::warn!(%peer, error = %e, "TCP face setup failed"),
         },
         PeerSpec::WebSocket(url) => match WebSocketFace::connect(id, url).await {
-            Ok(face) => {
-                engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent)
-            }
+            Ok(face) => engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent),
             Err(e) => tracing::warn!(%url, error = %e, "WebSocket face setup failed"),
         },
         PeerSpec::Serial(port, baud) => match serial_face_open(id, port, *baud) {
-            Ok(face) => {
-                engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent)
-            }
+            Ok(face) => engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent),
             Err(e) => tracing::warn!(%port, baud, error = %e, "serial face setup failed"),
         },
         #[cfg(feature = "webtransport")]
@@ -214,10 +208,7 @@ pub struct MobileEngineBuilder {
     /// runtime policy are installed; when `None`, management is mounted open
     /// (suitable only for a trusted local IPC face).
     #[cfg(feature = "management")]
-    secured_mgmt: Option<(
-        Arc<ndn_security::Validator>,
-        Arc<dyn ndn_security::Signer>,
-    )>,
+    secured_mgmt: Option<(Arc<ndn_security::Validator>, Arc<dyn ndn_security::Signer>)>,
     /// Host-owned log ring for the `/localhost/nfd/log` module. The binary
     /// owns tracing init, so it supplies this; libraries never install it.
     #[cfg(feature = "management")]
@@ -437,7 +428,10 @@ impl MobileEngineBuilder {
     /// this only serves what it records. Requires the `observability` feature.
     #[cfg(feature = "observability")]
     pub fn with_observability(mut self) -> Self {
-        let prefix = Name::root().append(b"localhost").append(b"nfd").append(b"observability");
+        let prefix = Name::root()
+            .append(b"localhost")
+            .append(b"nfd")
+            .append(b"observability");
         self.observability = Some((prefix, mobile_low_retention()));
         self
     }
@@ -592,7 +586,9 @@ impl MobileEngineBuilder {
             MobileStrategy::BestRoute => builder.strategy(BestRouteStrategy::new()),
             MobileStrategy::Multicast => builder.strategy(MulticastStrategy::new()),
             #[cfg(feature = "cclf")]
-            MobileStrategy::Cclf => builder.strategy(ndn_strategy_cclf::native::CclfStrategy::new()),
+            MobileStrategy::Cclf => {
+                builder.strategy(ndn_strategy_cclf::native::CclfStrategy::new())
+            }
         };
         let app_face_id = builder.alloc_face_id();
         let (app_face, app_handle) = InProcFace::new(app_face_id, 256);
@@ -1029,9 +1025,7 @@ impl MobileEngine {
     /// The route is installed at the peer's stable face id, so it survives
     /// suspend/resume.
     pub fn route_to_peer(&self, prefix: impl Into<Name>, peer: &PeerRef, cost: u32) {
-        self.engine
-            .fib()
-            .add_nexthop(&prefix.into(), peer.id, cost);
+        self.engine.fib().add_nexthop(&prefix.into(), peer.id, cost);
     }
 
     pub fn engine(&self) -> &ForwarderEngine {

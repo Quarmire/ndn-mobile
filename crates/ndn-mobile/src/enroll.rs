@@ -120,10 +120,7 @@ impl EnrolledIdentity {
     /// Requires the issued certificate to have been fetched (see
     /// [`Self::certificate`]).
     pub fn to_safebag(&self, password: &[u8]) -> Result<SafeBag, EnrollError> {
-        let cert = self
-            .certificate
-            .clone()
-            .ok_or(EnrollError::NoCertificate)?;
+        let cert = self.certificate.clone().ok_or(EnrollError::NoCertificate)?;
         let pkcs8 = self
             .signer
             .to_pkcs8_der()
@@ -192,11 +189,7 @@ impl MobileEngine {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let key_name: Name = cfg
-            .identity
-            .clone()
-            .append("KEY")
-            .append_version(ts_ms);
+        let key_name: Name = cfg.identity.clone().append("KEY").append_version(ts_ms);
         let signer = Arc::new(
             EcdsaP256Signer::generate(key_name.clone())
                 .map_err(|e| EnrollError::Key(e.to_string()))?,
@@ -282,9 +275,7 @@ impl MobileEngine {
                 .await
                 .map_err(|e| EnrollError::Fetch(format!("CHALLENGE submit: {e}")))?;
             session
-                .handle_challenge_response(
-                    submit_data.content().ok_or(EnrollError::EmptyResponse)?,
-                )
+                .handle_challenge_response(submit_data.content().ok_or(EnrollError::EmptyResponse)?)
                 .map_err(|e| EnrollError::Cert(e.to_string()))?;
         }
 

@@ -37,7 +37,11 @@ async fn enroll_pin_against_live_ca() {
         // Real-CA enrollment validates the CA's signed responses against the
         // configured trust profile.
         .security_profile(SecurityProfile::Default)
-        .with_tcp_peer(tcp_peer.parse().expect("NDN_TEST_TCP_PEER must be host:port"))
+        .with_tcp_peer(
+            tcp_peer
+                .parse()
+                .expect("NDN_TEST_TCP_PEER must be host:port"),
+        )
         .build()
         .await
         .expect("engine build");

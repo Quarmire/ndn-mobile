@@ -121,7 +121,8 @@ pub fn spawn_tunnel(
     let (inject_tx, mut inject_rx) = mpsc::channel::<Bytes>(TUN_QUEUE_CAP);
     let (deliver_tx, deliver_rx) = mpsc::channel::<Bytes>(TUN_QUEUE_CAP);
 
-    let producer = Arc::new(engine.register_producer(config.self_prefix.clone(), cancel.child_token()));
+    let producer =
+        Arc::new(engine.register_producer(config.self_prefix.clone(), cancel.child_token()));
     // Streaming budget: a peer's persistent Interest adds `max_data_count`
     // permits; the streamer consumes one per published Data.
     let budget = Arc::new(Semaphore::new(0));
@@ -179,7 +180,9 @@ pub fn spawn_tunnel(
                 }
                 let name = self_prefix.clone().append_segment(seq);
                 seq += 1;
-                let data = DataBuilder::new(name, &ip).freshness(TUN_DATA_FRESHNESS).build();
+                let data = DataBuilder::new(name, &ip)
+                    .freshness(TUN_DATA_FRESHNESS)
+                    .build();
                 if producer.publish(data).await.is_err() {
                     break;
                 }
@@ -269,7 +272,14 @@ pub fn parse_ip_flow(pkt: &[u8]) -> Option<IpFlow> {
             let src = IpAddr::from([pkt[12], pkt[13], pkt[14], pkt[15]]);
             let dst = IpAddr::from([pkt[16], pkt[17], pkt[18], pkt[19]]);
             let (src_port, dst_port) = l4_ports(protocol, pkt.get(ihl..));
-            Some(IpFlow { version: 4, protocol, src, dst, src_port, dst_port })
+            Some(IpFlow {
+                version: 4,
+                protocol,
+                src,
+                dst,
+                src_port,
+                dst_port,
+            })
         }
         6 => {
             if pkt.len() < 40 {
