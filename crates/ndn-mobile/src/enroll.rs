@@ -36,6 +36,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use ndn_app::EngineAppExt;
 use ndn_cert::EnrollmentSession;
+use ndn_custodian::{Custodian, CustodianSigner, KeyId};
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Name, SignatureType};
 use ndn_safebag::SafeBag;
@@ -85,14 +86,45 @@ pub struct PinRequest {
 
 /// The result of a successful enrollment: the signing identity plus the issued
 /// certificate name (and wire, if the CA's repo served it).
+///
+/// The key's **provenance** determines whether it can be persisted as a
+/// [`SafeBag`]: a *software* key ([`enroll_pin`](MobileEngine::enroll_pin)) holds
+/// exportable private-key material; a *custodian* key
+/// ([`enroll_pin_custodian`](MobileEngine::enroll_pin_custodian) — the device
+/// enclave / a remote fob) never exposes its private key, so [`to_safebag`] is
+/// unavailable and persistence is the custodian's job.
+///
+/// [`to_safebag`]: Self::to_safebag
 pub struct EnrolledIdentity {
-    signer: Arc<EcdsaP256Signer>,
+    signer: Arc<dyn Signer>,
     key_name: Name,
     cert_name: Name,
     certificate: Option<Bytes>,
+    /// Exportable private key — `Some` for a software key (SafeBag-able),
+    /// `None` for a custodian/enclave-held key.
+    exportable: Option<Arc<EcdsaP256Signer>>,
 }
 
 impl EnrolledIdentity {
+    /// Wrap an already-certified **custodian-held** key (e.g. an enclave key
+    /// loaded at startup with its stored certificate) as an enrolled identity.
+    /// `signer` must route through the custodian (a
+    /// [`CustodianSigner`](ndn_custodian::CustodianSigner)). Not SafeBag-exportable.
+    pub fn from_custodian(
+        signer: Arc<dyn Signer>,
+        key_name: Name,
+        cert_name: Name,
+        certificate: Option<Bytes>,
+    ) -> Self {
+        Self {
+            signer,
+            key_name,
+            cert_name,
+            certificate,
+            exportable: None,
+        }
+    }
+
     /// The certified key name (`<identity>/KEY/v=<ts>`).
     pub fn key_name(&self) -> &Name {
         &self.key_name
@@ -110,19 +142,27 @@ impl EnrolledIdentity {
     }
 
     /// The signing identity, with its `KeyLocator` set to the issued cert name,
-    /// ready to sign subscriptions / management commands.
+    /// ready to sign subscriptions / management commands. For a custodian key
+    /// this signs *through* the custodian (enclave biometric per use).
     pub fn signer(&self) -> Arc<dyn Signer> {
         self.signer.clone()
     }
 
+    /// Whether the private key can be exported (software provenance). `false` for
+    /// a custodian/enclave-held key, whose key never leaves the device.
+    pub fn is_exportable(&self) -> bool {
+        self.exportable.is_some()
+    }
+
     /// Encrypt the private key + issued certificate into a password-protected
     /// [`SafeBag`] for on-device persistence (`ndnsec import`-compatible).
-    /// Requires the issued certificate to have been fetched (see
-    /// [`Self::certificate`]).
+    /// Errors with [`EnrollError::NotExportable`] for a custodian/enclave key
+    /// (its private key can't leave the device), and
+    /// [`EnrollError::NoCertificate`] if the issued cert wasn't fetched.
     pub fn to_safebag(&self, password: &[u8]) -> Result<SafeBag, EnrollError> {
+        let exportable = self.exportable.as_ref().ok_or(EnrollError::NotExportable)?;
         let cert = self.certificate.clone().ok_or(EnrollError::NoCertificate)?;
-        let pkcs8 = self
-            .signer
+        let pkcs8 = exportable
             .to_pkcs8_der()
             .map_err(|e| EnrollError::Key(e.to_string()))?;
         SafeBag::encrypt(cert, &pkcs8, password).map_err(|e| EnrollError::SafeBag(e.to_string()))
@@ -146,6 +186,8 @@ pub enum EnrollError {
     Incomplete,
     #[error("no issued cert was fetched; SafeBag needs the certificate")]
     NoCertificate,
+    #[error("custodian/enclave key is not exportable to a SafeBag")]
+    NotExportable,
     #[error("SafeBag: {0}")]
     SafeBag(String),
 }
@@ -153,7 +195,7 @@ pub enum EnrollError {
 async fn sign_interest(
     builder: InterestBuilder,
     key_name: &Name,
-    signer: &Arc<EcdsaP256Signer>,
+    signer: &Arc<dyn Signer>,
 ) -> Result<Bytes, EnrollError> {
     let s: Arc<dyn Signer> = signer.clone();
     let kn = key_name.clone();
@@ -190,11 +232,93 @@ impl MobileEngine {
             .unwrap_or_default()
             .as_millis() as u64;
         let key_name: Name = cfg.identity.clone().append("KEY").append_version(ts_ms);
-        let signer = Arc::new(
+        let ecdsa = Arc::new(
             EcdsaP256Signer::generate(key_name.clone())
                 .map_err(|e| EnrollError::Key(e.to_string()))?,
         );
+        let signer: Arc<dyn Signer> = ecdsa.clone();
 
+        let (cert_name, certificate) = self.run_ndncert(&cfg, &key_name, &signer, pin_cb).await?;
+
+        // Re-stamp the issued cert name on a fresh software signer (`with_cert_name`
+        // consumes self, and the original is shared with the session).
+        let stamped = Arc::new(
+            EcdsaP256Signer::from_pkcs8_der(
+                &ecdsa
+                    .to_pkcs8_der()
+                    .map_err(|e| EnrollError::Key(e.to_string()))?,
+                key_name.clone(),
+            )
+            .map_err(|e| EnrollError::Key(e.to_string()))?
+            .with_cert_name(cert_name.clone()),
+        );
+
+        Ok(EnrolledIdentity {
+            signer: stamped.clone(),
+            key_name,
+            cert_name,
+            certificate,
+            exportable: Some(stamped),
+        })
+    }
+
+    /// Run NDNCERT 0.3 enrollment for `cfg.identity` using a key held by a
+    /// [`Custodian`](ndn_custodian::Custodian) — the device enclave (StrongBox /
+    /// Secure Enclave) or a remote fob. The custodian must already hold the key
+    /// under `key_id` with the given ECDSA-P256 `public_key`. The private key
+    /// never leaves the custodian — every enrollment signature is produced inside
+    /// it (biometric per use) — and the result is **not** SafeBag-exportable.
+    /// Wrap the result as an `ndn_identity::Identity` with
+    /// `Identity::from_signer(.., enrolled.key_name().clone(), enrolled.signer())`.
+    pub async fn enroll_pin_custodian<F, Fut>(
+        &self,
+        cfg: EnrollConfig,
+        custodian: Arc<dyn Custodian>,
+        key_id: KeyId,
+        public_key: Bytes,
+        pin_cb: F,
+    ) -> Result<EnrolledIdentity, EnrollError>
+    where
+        F: FnOnce(PinRequest) -> Fut,
+        Fut: std::future::Future<Output = String>,
+    {
+        let key_name = key_id.as_name().clone();
+        let make_signer = || {
+            CustodianSigner::new(
+                custodian.clone(),
+                key_id.clone(),
+                SignatureType::SignatureSha256WithEcdsa,
+                Some(public_key.clone()),
+            )
+        };
+        let signer: Arc<dyn Signer> = Arc::new(make_signer());
+
+        let (cert_name, certificate) = self.run_ndncert(&cfg, &key_name, &signer, pin_cb).await?;
+
+        let stamped: Arc<dyn Signer> = Arc::new(make_signer().with_cert_name(cert_name.clone()));
+        Ok(EnrolledIdentity {
+            signer: stamped,
+            key_name,
+            cert_name,
+            certificate,
+            exportable: None,
+        })
+    }
+
+    /// The shared NDNCERT NEW → CHALLENGE(pin) → best-effort cert-fetch exchange,
+    /// signing every request with `signer` (software or custodian). Returns the
+    /// issued cert name and its wire (if a repo served it).
+    async fn run_ndncert<F, Fut>(
+        &self,
+        cfg: &EnrollConfig,
+        key_name: &Name,
+        signer: &Arc<dyn Signer>,
+        pin_cb: F,
+    ) -> Result<(Name, Option<Bytes>), EnrollError>
+    where
+        F: FnOnce(PinRequest) -> Fut,
+        Fut: std::future::Future<Output = String>,
+    {
         // A standalone token bounds the enrollment app face; the face also
         // self-cleans when `consumer` is dropped at the end of the call.
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -210,8 +334,8 @@ impl MobileEngine {
         let new_name = cfg.ca_prefix.clone().append("CA").append("NEW");
         let new_wire = sign_interest(
             InterestBuilder::new(new_name).app_parameters(new_params),
-            &key_name,
-            &signer,
+            key_name,
+            signer,
         )
         .await?;
         let new_data = consumer
@@ -238,8 +362,8 @@ impl MobileEngine {
             .map_err(|e| EnrollError::Cert(e.to_string()))?;
         let trigger_wire = sign_interest(
             InterestBuilder::new(challenge_name.clone()).app_parameters(trigger_params),
-            &key_name,
-            &signer,
+            key_name,
+            signer,
         )
         .await?;
         let trigger_data = consumer
@@ -266,8 +390,8 @@ impl MobileEngine {
                 .map_err(|e| EnrollError::Cert(e.to_string()))?;
             let submit_wire = sign_interest(
                 InterestBuilder::new(challenge_name).app_parameters(submit_params),
-                &key_name,
-                &signer,
+                key_name,
+                signer,
             )
             .await?;
             let submit_data = consumer
@@ -297,25 +421,7 @@ impl MobileEngine {
             }
         };
 
-        // Stamp the issued cert name on the signer so it signs with the right
-        // KeyLocator going forward.
-        let signer = Arc::new(
-            EcdsaP256Signer::from_pkcs8_der(
-                &signer
-                    .to_pkcs8_der()
-                    .map_err(|e| EnrollError::Key(e.to_string()))?,
-                key_name.clone(),
-            )
-            .map_err(|e| EnrollError::Key(e.to_string()))?
-            .with_cert_name(cert_name.clone()),
-        );
-
-        Ok(EnrolledIdentity {
-            signer,
-            key_name,
-            cert_name,
-            certificate,
-        })
+        Ok((cert_name, certificate))
     }
 
     /// Restore an identity persisted as a [`SafeBag`] (the inverse of
@@ -370,6 +476,29 @@ mod tests {
             restored.sign_sync(b"signed subscription").unwrap(),
             "restored identity must produce identical signatures",
         );
+    }
+
+    /// A custodian/enclave-held identity routes signing through the custodian but
+    /// cannot be exported to a SafeBag — its private key never leaves the device.
+    #[test]
+    fn custodian_provenance_is_not_safebag_exportable() {
+        let key_name: Name = "/ndn/mobile/enclave/KEY/v=1".parse().unwrap();
+        // A stand-in signer; provenance (exportable = None) is what's under test.
+        let signer: Arc<dyn Signer> =
+            Arc::new(EcdsaP256Signer::from_seed(&[7u8; 32], key_name.clone()).unwrap());
+        let cert = DataBuilder::new(key_name.clone(), b"cert-stub").build();
+        let id = EnrolledIdentity::from_custodian(
+            signer,
+            key_name.clone(),
+            key_name.clone(),
+            Some(cert),
+        );
+
+        assert!(!id.is_exportable());
+        assert!(matches!(
+            id.to_safebag(b"pw"),
+            Err(EnrollError::NotExportable)
+        ));
     }
 
     /// A wrong SafeBag password fails cleanly rather than yielding a bad key.
