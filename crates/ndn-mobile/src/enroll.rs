@@ -433,12 +433,32 @@ impl MobileEngine {
         password: &[u8],
         key_name: impl Into<Name>,
     ) -> Result<Arc<dyn Signer>, EnrollError> {
+        use ndn_safebag::SafeBagAlgorithm;
+        use ndn_security::Ed25519Signer;
+
+        let key_name = key_name.into();
         let pkcs8 = bag
             .decrypt_pkcs8(password)
             .map_err(|e| EnrollError::SafeBag(e.to_string()))?;
-        let signer = EcdsaP256Signer::from_pkcs8_der(&pkcs8, key_name.into())
-            .map_err(|e| EnrollError::Key(e.to_string()))?;
-        Ok(Arc::new(signer))
+        // Dispatch on the key algorithm: enrolled identities are ECDSA-P256,
+        // recovered operational keys are Ed25519 (the did:ndn key-state type).
+        let alg = bag
+            .algorithm(password)
+            .map_err(|e| EnrollError::SafeBag(e.to_string()))?;
+        let signer: Arc<dyn Signer> = match alg {
+            SafeBagAlgorithm::Ed25519 => Arc::new(
+                Ed25519Signer::from_pkcs8_der(&pkcs8, key_name)
+                    .map_err(|e| EnrollError::Key(e.to_string()))?,
+            ),
+            SafeBagAlgorithm::EcdsaP256 => Arc::new(
+                EcdsaP256Signer::from_pkcs8_der(&pkcs8, key_name)
+                    .map_err(|e| EnrollError::Key(e.to_string()))?,
+            ),
+            SafeBagAlgorithm::Other(oid) => {
+                return Err(EnrollError::Key(format!("unsupported key algorithm {oid}")));
+            }
+        };
+        Ok(signer)
     }
 }
 
