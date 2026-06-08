@@ -262,6 +262,139 @@ impl MobileEngine {
         })
     }
 
+    /// Run NDNCERT 0.3 enrollment using the **`token`** challenge — a one-round
+    /// exchange where an invitation token is the proof (the "scan an invitation"
+    /// flow). Mirrors [`enroll_pin`](Self::enroll_pin) but needs no interactive
+    /// callback. A route toward the CA prefix must already be installed.
+    pub async fn enroll_token(
+        &self,
+        cfg: EnrollConfig,
+        token: String,
+    ) -> Result<EnrolledIdentity, EnrollError> {
+        let ts_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let key_name: Name = cfg.identity.clone().append("KEY").append_version(ts_ms);
+        let ecdsa = Arc::new(
+            EcdsaP256Signer::generate(key_name.clone())
+                .map_err(|e| EnrollError::Key(e.to_string()))?,
+        );
+        let signer: Arc<dyn Signer> = ecdsa.clone();
+
+        let (cert_name, certificate) =
+            self.run_ndncert_token(&cfg, &key_name, &signer, &token).await?;
+
+        // Re-stamp the issued cert name on a fresh software signer (as enroll_pin).
+        let stamped = Arc::new(
+            EcdsaP256Signer::from_pkcs8_der(
+                &ecdsa
+                    .to_pkcs8_der()
+                    .map_err(|e| EnrollError::Key(e.to_string()))?,
+                key_name.clone(),
+            )
+            .map_err(|e| EnrollError::Key(e.to_string()))?
+            .with_cert_name(cert_name.clone()),
+        );
+
+        Ok(EnrolledIdentity {
+            signer: stamped.clone(),
+            key_name,
+            cert_name,
+            certificate,
+            exportable: Some(stamped),
+        })
+    }
+
+    /// NDNCERT NEW → CHALLENGE(`token`) → best-effort cert-fetch. The token is
+    /// submitted in a single challenge round (it is the proof). Structurally
+    /// mirrors [`run_ndncert`](Self::run_ndncert)'s pin path.
+    async fn run_ndncert_token(
+        &self,
+        cfg: &EnrollConfig,
+        key_name: &Name,
+        signer: &Arc<dyn Signer>,
+        token: &str,
+    ) -> Result<(Name, Option<Bytes>), EnrollError> {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut consumer = self.engine().app_consumer(cancel.child_token());
+        let mut session =
+            EnrollmentSession::new(key_name.clone(), signer.clone(), cfg.validity_secs);
+
+        // Step 1: NEW
+        let new_params = session
+            .new_request_body()
+            .await
+            .map_err(|e| EnrollError::Cert(e.to_string()))?;
+        let new_name = cfg.ca_prefix.clone().append("CA").append("NEW");
+        let new_wire = sign_interest(
+            InterestBuilder::new(new_name).app_parameters(new_params),
+            key_name,
+            signer,
+        )
+        .await?;
+        let new_data = consumer
+            .fetch_wire(new_wire, INTEREST_LIFETIME + Duration::from_millis(500))
+            .await
+            .map_err(|e| EnrollError::Fetch(format!("NEW: {e}")))?;
+        session
+            .handle_new_response(new_data.content().ok_or(EnrollError::EmptyResponse)?)
+            .map_err(|e| EnrollError::Cert(e.to_string()))?;
+        let request_id_bytes = session
+            .request_id_bytes()
+            .ok_or_else(|| EnrollError::Cert("no request_id after NEW".into()))?
+            .to_vec();
+
+        // Step 2: CHALLENGE("token", {token}) — one round; the token is the proof.
+        let challenge_name = cfg
+            .ca_prefix
+            .clone()
+            .append("CA")
+            .append("CHALLENGE")
+            .append(&request_id_bytes);
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "token".to_string(),
+            serde_json::Value::String(token.to_string()),
+        );
+        let challenge_params = session
+            .challenge_request_body("token", params)
+            .map_err(|e| EnrollError::Cert(e.to_string()))?;
+        let challenge_wire = sign_interest(
+            InterestBuilder::new(challenge_name).app_parameters(challenge_params),
+            key_name,
+            signer,
+        )
+        .await?;
+        let challenge_data = consumer
+            .fetch_wire(challenge_wire, INTEREST_LIFETIME + Duration::from_millis(500))
+            .await
+            .map_err(|e| EnrollError::Fetch(format!("CHALLENGE token: {e}")))?;
+        session
+            .handle_challenge_response(challenge_data.content().ok_or(EnrollError::EmptyResponse)?)
+            .map_err(|e| EnrollError::Cert(e.to_string()))?;
+
+        if !session.is_complete() {
+            return Err(EnrollError::Incomplete);
+        }
+
+        let cert_name = session
+            .issued_cert_name()
+            .ok_or_else(|| EnrollError::Cert("no issued cert name".into()))?
+            .clone();
+
+        // Step 3 (best-effort): fetch the issued cert (served by a repo).
+        let certificate = match consumer.fetch(cert_name.clone()).await {
+            Ok(data) => data.content().cloned(),
+            Err(e) => {
+                tracing::debug!(error = %e, "issued cert fetch skipped (no repo)");
+                None
+            }
+        };
+
+        Ok((cert_name, certificate))
+    }
+
     /// Run NDNCERT 0.3 enrollment for `cfg.identity` using a key held by a
     /// [`Custodian`](ndn_custodian::Custodian) — the device enclave (StrongBox /
     /// Secure Enclave) or a remote fob. The custodian must already hold the key
