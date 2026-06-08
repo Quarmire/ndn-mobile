@@ -492,6 +492,43 @@ impl MobileEngine {
         })
     }
 
+    /// As [`enroll_pin_custodian`](Self::enroll_pin_custodian), but via the
+    /// **token** challenge — a hardware/enclave key certified by the CA after a
+    /// one-round token challenge (no interactive PIN). Each NDNCERT request is
+    /// signed by the custodian key, so the platform prompts for biometric per
+    /// signature. Returns a non-exportable identity.
+    pub async fn enroll_token_custodian(
+        &self,
+        cfg: EnrollConfig,
+        custodian: Arc<dyn Custodian>,
+        key_id: KeyId,
+        public_key: Bytes,
+        token: String,
+    ) -> Result<EnrolledIdentity, EnrollError> {
+        let key_name = key_id.as_name().clone();
+        let make_signer = || {
+            CustodianSigner::new(
+                custodian.clone(),
+                key_id.clone(),
+                SignatureType::SignatureSha256WithEcdsa,
+                Some(public_key.clone()),
+            )
+        };
+        let signer: Arc<dyn Signer> = Arc::new(make_signer());
+
+        let (cert_name, certificate) =
+            self.run_ndncert_token(&cfg, &key_name, &signer, &token).await?;
+
+        let stamped: Arc<dyn Signer> = Arc::new(make_signer().with_cert_name(cert_name.clone()));
+        Ok(EnrolledIdentity {
+            signer: stamped,
+            key_name,
+            cert_name,
+            certificate,
+            exportable: None,
+        })
+    }
+
     /// The shared NDNCERT NEW → CHALLENGE(pin) → best-effort cert-fetch exchange,
     /// signing every request with `signer` (software or custodian). Returns the
     /// issued cert name and its wire (if a repo served it).
