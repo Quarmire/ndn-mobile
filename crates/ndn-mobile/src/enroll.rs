@@ -385,7 +385,9 @@ impl MobileEngine {
 
         // Step 3 (best-effort): fetch the issued cert (served by a repo).
         let certificate = match consumer.fetch(cert_name.clone()).await {
-            Ok(data) => data.content().cloned(),
+            // The fetched Data IS the cert; embed its full wire (Data TLV 0x06)
+            // so the SafeBag round-trips — not its Content (the SPKI key, 0x30).
+            Ok(data) => Some(data.raw().clone()),
             Err(e) => {
                 tracing::debug!(error = %e, "issued cert fetch skipped (no repo)");
                 None
@@ -547,7 +549,9 @@ impl MobileEngine {
 
         // ── Step 3 (best-effort): fetch the issued cert (served by a repo). ─
         let certificate = match consumer.fetch(cert_name.clone()).await {
-            Ok(data) => data.content().cloned(),
+            // The fetched Data IS the cert; embed its full wire (Data TLV 0x06)
+            // so the SafeBag round-trips — not its Content (the SPKI key, 0x30).
+            Ok(data) => Some(data.raw().clone()),
             Err(e) => {
                 tracing::debug!(error = %e, "issued cert fetch skipped (no repo)");
                 None
