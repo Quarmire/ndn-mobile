@@ -97,38 +97,98 @@ async fn build_peer_face(
     spec: &PeerSpec,
     cancel: CancellationToken,
 ) {
+    // Try once, bounded by a short timeout, so a reachable peer (a live gateway,
+    // or any UDP peer — bind is instant) is connected by the time `build()`
+    // returns. This preserves the synchronous-success contract (and the
+    // suspend/resume rebuild) without stalling build when the gateway is
+    // unreachable.
+    const FIRST_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(2);
+    let first =
+        tokio::time::timeout(FIRST_ATTEMPT, connect_peer_once(engine, id, spec, cancel.child_token()))
+            .await;
+    if let Ok(Ok(())) = first {
+        return;
+    }
+
+    // The first dial failed or timed out. A mobile leaf's gateway is routinely
+    // unreachable at the instant the engine builds — the radio, the VPN tunnel,
+    // or (in testing) `adb reverse` may come up a moment later — and giving up
+    // here used to strand the node with no upstream until the next full engine
+    // rebuild. Hand off to a cancel-aware background task that retries with
+    // capped exponential backoff. The default route already points at `id`, so
+    // the face goes live the moment a dial succeeds; the token is cancelled on
+    // engine shutdown/rebuild, which stops the loop.
+    let engine = engine.clone();
+    let spec = spec.clone();
+    tokio::spawn(async move {
+        let mut backoff = std::time::Duration::from_millis(250);
+        const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
+        loop {
+            if cancel.is_cancelled() {
+                return;
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+            match connect_peer_once(&engine, id, &spec, cancel.child_token()).await {
+                Ok(()) => {
+                    tracing::info!(?spec, "peer face connected (after retry)");
+                    return;
+                }
+                Err(e) => tracing::warn!(
+                    ?spec,
+                    error = %e,
+                    next_retry_in_ms = backoff.as_millis() as u64,
+                    "peer dial failed; retrying"
+                ),
+            }
+        }
+    });
+}
+
+/// One dial attempt for `spec`: connect the transport and mount it as a
+/// `Persistent` face at the stable `id`. Returns `Err` so the caller can retry.
+async fn connect_peer_once(
+    engine: &ForwarderEngine,
+    id: FaceId,
+    spec: &PeerSpec,
+    cancel: CancellationToken,
+) -> Result<(), String> {
     match spec {
         PeerSpec::UdpUnicast(peer) => {
             let local: SocketAddr = "0.0.0.0:0".parse().unwrap();
-            match UdpFace::bind(local, *peer, id).await {
-                Ok(face) => {
-                    engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent)
-                }
-                Err(e) => tracing::warn!(%peer, error = %e, "UDP unicast face setup failed"),
-            }
+            let face = UdpFace::bind(local, *peer, id)
+                .await
+                .map_err(|e| e.to_string())?;
+            engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent);
         }
-        PeerSpec::Tcp(peer) => match tcp_face_connect(id, *peer).await {
-            Ok(face) => engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent),
-            Err(e) => tracing::warn!(%peer, error = %e, "TCP face setup failed"),
-        },
-        PeerSpec::WebSocket(url) => match WebSocketFace::connect(id, url).await {
-            Ok(face) => engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent),
-            Err(e) => tracing::warn!(%url, error = %e, "WebSocket face setup failed"),
-        },
-        PeerSpec::Serial(port, baud) => match serial_face_open(id, port, *baud) {
-            Ok(face) => engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent),
-            Err(e) => tracing::warn!(%port, baud, error = %e, "serial face setup failed"),
-        },
+        PeerSpec::Tcp(peer) => {
+            let face = tcp_face_connect(id, *peer)
+                .await
+                .map_err(|e| e.to_string())?;
+            engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent);
+        }
+        PeerSpec::WebSocket(url) => {
+            let face = WebSocketFace::connect(id, url)
+                .await
+                .map_err(|e| e.to_string())?;
+            engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent);
+        }
+        PeerSpec::Serial(port, baud) => {
+            let face = serial_face_open(id, port, *baud).map_err(|e| e.to_string())?;
+            engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent);
+        }
         #[cfg(feature = "webtransport")]
         PeerSpec::WebTransport(url, tls) => {
-            match ndn_face_webtransport::WebTransportFace::connect(id, url, tls.clone()).await {
-                Ok(face) => {
-                    engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent)
-                }
-                Err(e) => tracing::warn!(%url, error = %e, "WebTransport face setup failed"),
-            }
+            let face = ndn_face_webtransport::WebTransportFace::connect(id, url, tls.clone())
+                .await
+                .map_err(|e| e.to_string())?;
+            engine.add_face_with_persistency(face, cancel, FacePersistency::Persistent);
         }
     }
+    Ok(())
 }
 
 /// Battery-conscious span retention for a phone: a short window and small ring
