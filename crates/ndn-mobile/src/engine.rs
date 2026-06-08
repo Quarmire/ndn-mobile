@@ -970,6 +970,21 @@ impl MobileEngine {
             .register_producer(prefix, self.shutdown.cancel_token().child_token())
     }
 
+    /// Allocate an in-process app face and return a connection-generic
+    /// [`Connection`](ndn_app::Connection) over it whose `register_prefix`
+    /// installs a FIB route to this face directly (the in-proc equivalent of the
+    /// cross-process NFD `rib/register`). Lets a caller drive producers /
+    /// consumers over the embedded engine through the same `Connection` API used
+    /// for a cross-process forwarder, registering prefixes uniformly.
+    pub fn new_registering_app_connection(&self) -> Arc<dyn ndn_app::Connection> {
+        let (face_id, handle) = self.new_app_handle();
+        Arc::new(RegisteringInProcConnection {
+            inner: ndn_app::InProcConnection::new(handle),
+            fib: self.engine.fib(),
+            face_id,
+        })
+    }
+
     pub fn consumer(&self, handle: InProcHandle) -> Consumer {
         Consumer::from_handle(handle)
     }
@@ -1084,5 +1099,79 @@ impl MobileEngine {
     /// Drains in-flight packets before returning.
     pub async fn shutdown(self) {
         self.shutdown.shutdown().await;
+    }
+}
+
+/// A connection-generic [`Connection`](ndn_app::Connection) over an embedded
+/// engine's in-process app face whose `register_prefix` installs a FIB route to
+/// the face directly — the in-proc equivalent of the cross-process NFD
+/// `rib/register`. `send` / `recv` delegate to the wrapped
+/// [`InProcConnection`](ndn_app::InProcConnection). Built by
+/// [`MobileEngine::new_registering_app_connection`].
+//
+// Implemented without `async_trait` (ndn-mobile doesn't depend on the macro):
+// the trait's async methods desugar to boxed-future returns, matched here.
+struct RegisteringInProcConnection {
+    inner: ndn_app::InProcConnection,
+    fib: Arc<ndn_engine::Fib>,
+    face_id: FaceId,
+}
+
+impl ndn_app::Connection for RegisteringInProcConnection {
+    fn send<'a, 'async_trait>(
+        &'a self,
+        wire: bytes::Bytes,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), ndn_app::AppError>> + Send + 'async_trait>,
+    >
+    where
+        'a: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.inner.send(wire)
+    }
+
+    fn recv<'a, 'async_trait>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<bytes::Bytes>> + Send + 'async_trait>,
+    >
+    where
+        'a: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.inner.recv()
+    }
+
+    fn recv_with_meta<'a, 'async_trait>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Option<(bytes::Bytes, ndn_app::LpInfo)>>
+                + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'a: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.inner.recv_with_meta()
+    }
+
+    fn register_prefix<'a, 'b, 'async_trait>(
+        &'a self,
+        prefix: &'b Name,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), ndn_app::AppError>> + Send + 'async_trait>,
+    >
+    where
+        'a: 'async_trait,
+        'b: 'async_trait,
+        Self: 'async_trait,
+    {
+        // Embedded engine: write the FIB directly (the in-proc rib/register).
+        self.fib.add_nexthop(prefix, self.face_id, 0);
+        Box::pin(async { Ok(()) })
     }
 }

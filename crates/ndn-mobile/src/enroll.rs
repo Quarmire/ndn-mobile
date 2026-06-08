@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use ndn_app::EngineAppExt;
+use ndn_app::{Connection, Consumer, EngineAppExt};
 use ndn_cert::EnrollmentSession;
 use ndn_custodian::{Custodian, CustodianSigner, KeyId};
 use ndn_packet::encode::InterestBuilder;
@@ -368,11 +368,28 @@ impl MobileEngine {
         signer: &Arc<dyn Signer>,
         token: &str,
     ) -> Result<(Name, Option<Bytes>), EnrollError> {
+        // A standalone token bounds the enrollment app face; the face also
+        // self-cleans when `consumer` is dropped at the end of the call.
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut consumer = self.engine().app_consumer(cancel.child_token());
-        let mut session =
-            EnrollmentSession::new(key_name.clone(), signer.clone(), cfg.validity_secs);
+        run_ndncert_token_on(&mut consumer, cfg, key_name, signer, token).await
+    }
+}
 
+/// The NDNCERT NEW → CHALLENGE(`token`) → best-effort cert-fetch exchange over an
+/// arbitrary [`Consumer`] — the connection-generic core of
+/// [`MobileEngine::run_ndncert_token`]. Lets the same enrollment run over an
+/// embedded engine's in-proc face *or* a cross-process forwarder connection.
+async fn run_ndncert_token_on(
+    consumer: &mut Consumer,
+    cfg: &EnrollConfig,
+    key_name: &Name,
+    signer: &Arc<dyn Signer>,
+    token: &str,
+) -> Result<(Name, Option<Bytes>), EnrollError> {
+    let mut session = EnrollmentSession::new(key_name.clone(), signer.clone(), cfg.validity_secs);
+
+    {
         // Step 1: NEW
         let new_params = session
             .new_request_body()
@@ -448,7 +465,91 @@ impl MobileEngine {
 
         Ok((cert_name, certificate))
     }
+}
 
+/// Run NDNCERT 0.3 token-challenge enrollment for `cfg.identity` over an
+/// arbitrary forwarder [`Connection`] — the connection-generic twin of
+/// [`MobileEngine::enroll_token`]. Used by the FFI layer so identity enrollment
+/// runs over either an embedded engine's in-proc face or a cross-process
+/// socketpair connection. A route toward the CA prefix must already exist.
+pub async fn enroll_token_conn(
+    conn: Arc<dyn Connection>,
+    cfg: EnrollConfig,
+    token: String,
+) -> Result<EnrolledIdentity, EnrollError> {
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let key_name: Name = cfg.identity.clone().append("KEY").append_version(ts_ms);
+    let ecdsa = Arc::new(
+        EcdsaP256Signer::generate(key_name.clone()).map_err(|e| EnrollError::Key(e.to_string()))?,
+    );
+    let signer: Arc<dyn Signer> = ecdsa.clone();
+
+    let mut consumer = Consumer::new(conn);
+    let (cert_name, certificate) =
+        run_ndncert_token_on(&mut consumer, &cfg, &key_name, &signer, &token).await?;
+
+    // Re-stamp the issued cert name on a fresh software signer (as enroll_token).
+    let stamped = Arc::new(
+        EcdsaP256Signer::from_pkcs8_der(
+            &ecdsa
+                .to_pkcs8_der()
+                .map_err(|e| EnrollError::Key(e.to_string()))?,
+            key_name.clone(),
+        )
+        .map_err(|e| EnrollError::Key(e.to_string()))?
+        .with_cert_name(cert_name.clone()),
+    );
+
+    Ok(EnrolledIdentity {
+        signer: stamped.clone(),
+        key_name,
+        cert_name,
+        certificate,
+        exportable: Some(stamped),
+    })
+}
+
+/// As [`enroll_token_conn`], but for a **custodian/enclave-held** key over an
+/// arbitrary [`Connection`] — the connection-generic twin of
+/// [`MobileEngine::enroll_token_custodian`]. The private key never leaves the
+/// custodian and the result is **not** SafeBag-exportable.
+pub async fn enroll_token_custodian_conn(
+    conn: Arc<dyn Connection>,
+    cfg: EnrollConfig,
+    custodian: Arc<dyn Custodian>,
+    key_id: KeyId,
+    public_key: Bytes,
+    token: String,
+) -> Result<EnrolledIdentity, EnrollError> {
+    let key_name = key_id.as_name().clone();
+    let make_signer = || {
+        CustodianSigner::new(
+            custodian.clone(),
+            key_id.clone(),
+            SignatureType::SignatureSha256WithEcdsa,
+            Some(public_key.clone()),
+        )
+    };
+    let signer: Arc<dyn Signer> = Arc::new(make_signer());
+
+    let mut consumer = Consumer::new(conn);
+    let (cert_name, certificate) =
+        run_ndncert_token_on(&mut consumer, &cfg, &key_name, &signer, &token).await?;
+
+    let stamped: Arc<dyn Signer> = Arc::new(make_signer().with_cert_name(cert_name.clone()));
+    Ok(EnrolledIdentity {
+        signer: stamped,
+        key_name,
+        cert_name,
+        certificate,
+        exportable: None,
+    })
+}
+
+impl MobileEngine {
     /// Run NDNCERT 0.3 enrollment for `cfg.identity` using a key held by a
     /// [`Custodian`](ndn_custodian::Custodian) — the device enclave (StrongBox /
     /// Secure Enclave) or a remote fob. The custodian must already hold the key
