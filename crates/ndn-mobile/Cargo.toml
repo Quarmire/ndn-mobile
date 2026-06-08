@@ -21,6 +21,10 @@ classification = "extension"
 ## Enables iOS App Group content-store sharing when the native code supplies
 ## the App Group container path.
 fjall = ["ndn-store/fjall"]
+## Persistent CS backed by bundled SQLite (`SqliteCs`) — the Android backend,
+## where fjall's directory lock is unsupported. Also satisfies
+## `with_persistent_cs()`; on Android it is preferred over fjall at build time.
+sqlite-cs = ["ndn-store/sqlite-cs"]
 ## NFD-compatible management dispatcher (`/localhost/nfd/<module>/<verb>`).
 ## Required for `MobileEngineBuilder::with_management()`. Off by default to
 ## keep the minimal mobile build lean; the VPN/dashboard UI enables it.

@@ -233,7 +233,10 @@ pub struct MobileEngineBuilder {
     enable_fec: bool,
     #[cfg(feature = "tun")]
     tun_config: Option<TunConfig>,
-    #[cfg_attr(not(feature = "fjall"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(feature = "fjall", feature = "sqlite-cs")),
+        allow(dead_code)
+    )]
     persistent_cs_path: Option<PathBuf>,
 }
 
@@ -562,8 +565,10 @@ impl MobileEngineBuilder {
     }
 
     /// On-disk content store at `path` (e.g. iOS App Group container,
-    /// Android `Context.getFilesDir()`). Requires the `fjall` feature.
-    #[cfg(feature = "fjall")]
+    /// Android `Context.getFilesDir()`). Requires the `fjall` or `sqlite-cs`
+    /// feature; on Android the SQLite backend is used (fjall's directory lock
+    /// is unsupported there).
+    #[cfg(any(feature = "fjall", feature = "sqlite-cs"))]
     pub fn with_persistent_cs(mut self, path: impl Into<PathBuf>) -> Self {
         self.persistent_cs_path = Some(path.into());
         self
@@ -594,13 +599,31 @@ impl MobileEngineBuilder {
         let (app_face, app_handle) = InProcFace::new(app_face_id, 256);
         builder = builder.face(app_face);
 
-        #[cfg(feature = "fjall")]
+        #[cfg(any(feature = "fjall", feature = "sqlite-cs"))]
         if let Some(ref path) = self.persistent_cs_path {
-            let cs =
-                ndn_store::FjallCs::open(path, self.cs_capacity_mb * 1024 * 1024).map_err(|e| {
+            let max_bytes = self.cs_capacity_mb * 1024 * 1024;
+            // Android: fjall's directory lock (`std::fs::File::try_lock`) returns
+            // `Unsupported` on `target_os = "android"`, so use the SQLite backend
+            // there. Desktop/iOS keep fjall. Either satisfies `content_store`.
+            #[cfg(all(feature = "sqlite-cs", target_os = "android"))]
+            let cs: Arc<dyn ndn_store::ErasedContentStore> = Arc::new(
+                ndn_store::SqliteCs::open(path, max_bytes).map_err(|e| {
+                    anyhow::anyhow!("failed to open SQLite CS at {}: {e}", path.display())
+                })?,
+            );
+            #[cfg(all(feature = "sqlite-cs", not(feature = "fjall"), not(target_os = "android")))]
+            let cs: Arc<dyn ndn_store::ErasedContentStore> = Arc::new(
+                ndn_store::SqliteCs::open(path, max_bytes).map_err(|e| {
+                    anyhow::anyhow!("failed to open SQLite CS at {}: {e}", path.display())
+                })?,
+            );
+            #[cfg(all(feature = "fjall", not(all(feature = "sqlite-cs", target_os = "android"))))]
+            let cs: Arc<dyn ndn_store::ErasedContentStore> = Arc::new(
+                ndn_store::FjallCs::open(path, max_bytes).map_err(|e| {
                     anyhow::anyhow!("failed to open persistent CS at {}: {e}", path.display())
-                })?;
-            builder = builder.content_store(Arc::new(cs));
+                })?,
+            );
+            builder = builder.content_store(cs);
         }
 
         // Reserve the multicast face ID so resume() can recreate it without
