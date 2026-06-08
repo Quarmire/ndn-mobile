@@ -901,6 +901,18 @@ impl MobileEngineBuilder {
                 handles,
             );
             tokio::spawn(fut);
+
+            // A mobile node is an *intermediate* forwarder: the UI process drives
+            // `/localhost` over the seam (handled locally), but `/localhop` is the
+            // node's own upstream registration to its gateway and must EGRESS
+            // there, not be claimed here (this node has no localhop validator).
+            // `mount_management` always installs a `/localhop/nfd` FIB entry to the
+            // internal mgmt face; clear it so `/localhop` falls through to the
+            // default route to the gateway — the same path the non-management
+            // in-process engine took.
+            engine
+                .fib()
+                .set_nexthops(&ndn_mgmt::mgmt_localhop_prefix(), vec![]);
         }
 
         Ok((
