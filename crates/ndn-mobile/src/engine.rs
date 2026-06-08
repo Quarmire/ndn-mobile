@@ -939,6 +939,27 @@ impl MobileEngine {
         (face_id, handle)
     }
 
+    /// Adopt one half of a `socketpair()` — an already-connected `SOCK_STREAM`
+    /// fd — as a `FaceKind::App` face. This is the cross-process seam: the
+    /// engine runs in the tunnel process (Android `VpnService` / iOS Network
+    /// Extension) and the UI process holds the other half, speaking NDN
+    /// Interest/Data (and NFD management) to this engine over it. The face is a
+    /// plain `StreamFace`, so it forwards exactly like any other face; the fd
+    /// is owned by the face and closed when the peer hangs up or the engine
+    /// shuts down. Returns the new face id. Unix only.
+    #[cfg(unix)]
+    pub fn mount_app_fd(&self, fd: std::os::fd::RawFd) -> std::io::Result<FaceId> {
+        let face_id = self.engine.faces().alloc_id();
+        let face = ndn_face_native::local::ipc_face_from_raw_fd(
+            face_id,
+            ndn_transport::FaceKind::App,
+            fd,
+        )?;
+        self.engine
+            .add_face(face, self.shutdown.cancel_token().child_token());
+        Ok(face_id)
+    }
+
     /// Allocates an in-process face, installs a FIB route for `prefix`, and
     /// returns a [`Producer`] bound to that face. Delegates to the shared
     /// [`EngineAppExt`](ndn_app::EngineAppExt) helper so desktop, mobile, and
