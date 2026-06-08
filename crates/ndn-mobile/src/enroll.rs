@@ -306,6 +306,58 @@ impl MobileEngine {
         })
     }
 
+    /// Generate a **self-signed** local identity for `name` — a fresh device key
+    /// with no CA. The key self-signs its own certificate; the result is
+    /// persistable as a SafeBag exactly like an enrolled identity. Intended for a
+    /// blank device that will then be *sponsored* (a principal delegates a scope
+    /// to this name). Associated fn — needs no engine/network.
+    pub async fn generate_identity(
+        name: Name,
+        validity_secs: u64,
+    ) -> Result<EnrolledIdentity, EnrollError> {
+        let ts_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let key_name: Name = name.append("KEY").append_version(ts_ms);
+        let ecdsa = Arc::new(
+            EcdsaP256Signer::generate(key_name.clone())
+                .map_err(|e| EnrollError::Key(e.to_string()))?,
+        );
+        let pubkey = ecdsa
+            .public_key()
+            .ok_or_else(|| EnrollError::Key("generated key has no public key".into()))?;
+
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let until_ns = now_ns.saturating_add(validity_secs.saturating_mul(1_000_000_000));
+        let cert_name = key_name.clone().append("self").append_version(0);
+        let cert_wire =
+            ndn_security::encode_cert_data(&cert_name, &pubkey, ecdsa.as_ref(), now_ns, until_ns)
+                .await
+                .map_err(|e| EnrollError::Cert(e.to_string()))?;
+
+        let stamped = Arc::new(
+            EcdsaP256Signer::from_pkcs8_der(
+                &ecdsa
+                    .to_pkcs8_der()
+                    .map_err(|e| EnrollError::Key(e.to_string()))?,
+                key_name.clone(),
+            )
+            .map_err(|e| EnrollError::Key(e.to_string()))?
+            .with_cert_name(cert_name.clone()),
+        );
+        Ok(EnrolledIdentity {
+            signer: stamped.clone(),
+            key_name,
+            cert_name,
+            certificate: Some(cert_wire),
+            exportable: Some(stamped),
+        })
+    }
+
     /// NDNCERT NEW → CHALLENGE(`token`) → best-effort cert-fetch. The token is
     /// submitted in a single challenge round (it is the proof). Structurally
     /// mirrors [`run_ndncert`](Self::run_ndncert)'s pin path.
