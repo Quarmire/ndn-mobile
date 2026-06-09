@@ -9,9 +9,10 @@ name = "ripple-peer"
 path = "src/main.rs"
 
 [dependencies]
-ndn-mobile = { workspace = true }
-ndn-app    = { workspace = true }
-ndn-packet = { workspace = true, features = ["std"] }
+ndn-mobile   = { workspace = true }
+ndn-app      = { workspace = true }
+ndn-packet   = { workspace = true, features = ["std"] }
+ndn-security = { workspace = true }
 tokio      = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 anyhow     = { workspace = true }
 bytes      = { workspace = true }
