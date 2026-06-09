@@ -103,46 +103,58 @@ async fn build_peer_face(
     // suspend/resume rebuild) without stalling build when the gateway is
     // unreachable.
     const FIRST_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(2);
-    let first =
-        tokio::time::timeout(FIRST_ATTEMPT, connect_peer_once(engine, id, spec, cancel.child_token()))
-            .await;
-    if let Ok(Ok(())) = first {
-        return;
-    }
+    let _ = tokio::time::timeout(
+        FIRST_ATTEMPT,
+        connect_peer_once(engine, id, spec, cancel.child_token()),
+    )
+    .await;
 
-    // The first dial failed or timed out. A mobile leaf's gateway is routinely
-    // unreachable at the instant the engine builds — the radio, the VPN tunnel,
-    // or (in testing) `adb reverse` may come up a moment later — and giving up
-    // here used to strand the node with no upstream until the next full engine
-    // rebuild. Hand off to a cancel-aware background task that retries with
-    // capped exponential backoff. The default route already points at `id`, so
-    // the face goes live the moment a dial succeeds; the token is cancelled on
-    // engine shutdown/rebuild, which stops the loop.
+    // Then supervise for the engine's life: keep the peer connected. A mobile
+    // leaf's gateway is unreachable at build time (radio / VPN tunnel / `adb
+    // reverse` come up late) AND drops later (cell handover, gateway restart) —
+    // giving up either way stranded the node with no upstream until the next full
+    // engine rebuild. The engine drops a dead Persistent face but KEEPS its FIB
+    // routes, so re-dialing at the same `id` restores the upstream with no route
+    // churn. The token is cancelled on engine shutdown/rebuild, stopping the loop.
     let engine = engine.clone();
     let spec = spec.clone();
     tokio::spawn(async move {
-        let mut backoff = std::time::Duration::from_millis(250);
         const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
+        const PROBE: std::time::Duration = std::time::Duration::from_secs(2);
         loop {
-            if cancel.is_cancelled() {
-                return;
-            }
-            tokio::select! {
-                _ = cancel.cancelled() => return,
-                _ = tokio::time::sleep(backoff) => {}
-            }
-            backoff = (backoff * 2).min(MAX_BACKOFF);
-            match connect_peer_once(&engine, id, &spec, cancel.child_token()).await {
-                Ok(()) => {
-                    tracing::info!(?spec, "peer face connected (after retry)");
+            // (Re)dial with capped exponential backoff until the face is present.
+            let mut backoff = std::time::Duration::from_millis(250);
+            while engine.faces().get(id).is_none() {
+                if cancel.is_cancelled() {
                     return;
                 }
-                Err(e) => tracing::warn!(
-                    ?spec,
-                    error = %e,
-                    next_retry_in_ms = backoff.as_millis() as u64,
-                    "peer dial failed; retrying"
-                ),
+                match connect_peer_once(&engine, id, &spec, cancel.child_token()).await {
+                    Ok(()) => {
+                        tracing::info!(?spec, "peer face connected");
+                        break;
+                    }
+                    Err(e) => tracing::warn!(
+                        ?spec, error = %e,
+                        retry_in_ms = backoff.as_millis() as u64,
+                        "peer dial failed; retrying"
+                    ),
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+            // Connected. Watch for the face dropping, then loop to re-dial.
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(PROBE) => {}
+                }
+                if engine.faces().get(id).is_none() {
+                    tracing::info!(?spec, "peer face dropped; reconnecting");
+                    break;
+                }
             }
         }
     });
