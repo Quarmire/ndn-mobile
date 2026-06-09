@@ -1171,6 +1171,24 @@ impl MobileEngine {
         self.engine.fib().add_nexthop(&prefix.into(), peer.id, cost);
     }
 
+    /// Register a FIB route for `prefix` toward the UDP **multicast** face, so
+    /// Interests under `prefix` egress onto the local NDN multicast group. This
+    /// is what makes a multicast node symmetric: serving over multicast needs
+    /// only a prefix registration (incoming Interests route to the producer),
+    /// but *fetching* needs an outbound route to the multicast face — the face
+    /// is added unrouted. Typically `route_to_multicast("/")` so any
+    /// not-locally-served Interest broadcasts to peers on the group. Returns
+    /// `false` if no multicast face is configured.
+    pub fn route_to_multicast(&self, prefix: impl Into<Name>) -> bool {
+        if self.multicast_face_id == FaceId(0) {
+            return false;
+        }
+        self.engine
+            .fib()
+            .add_nexthop(&prefix.into(), self.multicast_face_id, 0);
+        true
+    }
+
     pub fn engine(&self) -> &ForwarderEngine {
         &self.engine
     }
