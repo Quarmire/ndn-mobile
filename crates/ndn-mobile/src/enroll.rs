@@ -333,7 +333,12 @@ impl MobileEngine {
             .unwrap_or_default()
             .as_nanos() as u64;
         let until_ns = now_ns.saturating_add(validity_secs.saturating_mul(1_000_000_000));
-        let cert_name = key_name.clone().append("self").append_version(0);
+        // Name the self-signed cert EXACTLY the key name — the same convention as
+        // `SecurityManager::issue_self_signed` / `KeyChain`. `sign_with_sync`
+        // writes `key_name` as the Data KeyLocator, so the cert must be named
+        // `key_name` for a verifier to resolve it; a `/self/v=0` suffix left the
+        // chain unresolved → Pending (see the ndn-boltffi verified-fetch witness).
+        let cert_name = key_name.clone();
         let cert_wire =
             ndn_security::encode_cert_data(&cert_name, &pubkey, ecdsa.as_ref(), now_ns, until_ns)
                 .await
