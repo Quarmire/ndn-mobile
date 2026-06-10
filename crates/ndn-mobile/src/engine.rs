@@ -13,7 +13,7 @@ use ndn_face_native::net::{MulticastUdpFace, UdpFace, WebSocketFace, tcp_face_co
 use ndn_face_native::serial::serial_face_open;
 use ndn_packet::Name;
 use ndn_security::SecurityProfile;
-use ndn_strategy::{BestRouteStrategy, MulticastStrategy};
+use ndn_strategy::{BestRouteStrategy, MeasuredStrategy, MulticastStrategy};
 use ndn_transport::{FaceId, FaceKind, FacePersistency, LinkProfile};
 use tokio_util::sync::CancellationToken;
 
@@ -1223,8 +1223,14 @@ impl MobileEngine {
     /// cheapest face it's reachable on — instead of flooding every radio. This is
     /// the "route to deliver" half of discovery: `/` stays multicast for
     /// first-contact, but once we know a peer is on Wi-Fi Aware (cost 20) and BLE
-    /// (cost 50), a fetch to it prefers Wi-Fi Aware. No-op if no such face is
-    /// attached. Idempotent (re-noting refreshes the nexthop).
+    /// (cost 50), a fetch to it prefers Wi-Fi Aware.
+    ///
+    /// When a **NAN NDP** bulk path is later established to the same peer (see
+    /// [`Self::attach_ndp_face`]), it adds a `UdpFace` nexthop at the much lower
+    /// UDP cost (10) to this same prefix, so `BestRoute` automatically switches
+    /// the peer's traffic onto the high-throughput, reliable data path — the
+    /// connectionless coordination radios stay as the fallback. No-op if no such
+    /// face is attached. Idempotent (re-noting refreshes the nexthop).
     pub fn note_peer_route(&self, prefix: &Name, face: &str) {
         // The face names match the discovery dataset's `faces` ("wifi-aware",
         // "ble", "multicast").
@@ -1245,11 +1251,104 @@ impl MobileEngine {
         let Some(id) = face_id else { return };
         let cost = self.link_profile.cost(kind);
         self.engine.fib().add_nexthop(prefix, id, cost);
+        // Measured best-route: starts as static-cost best-route, then adapts to
+        // live RTT / RSSI / congestion as samples accrue (e.g. prefers a warm NDP
+        // but moves off it if it degrades). Cold-start identical to `BestRoute`.
         self.engine.strategy_table().insert(
             prefix,
-            Arc::new(BestRouteStrategy::new()) as Arc<dyn ndn_strategy::ErasedStrategy>,
+            Arc::new(MeasuredStrategy::new()) as Arc<dyn ndn_strategy::ErasedStrategy>,
         );
         tracing::debug!(%prefix, ?kind, cost, "cost-aware peer route installed");
+    }
+
+    /// Adopt an app-established **NAN NDP** (Network Data Path) UDP socket as a
+    /// high-throughput [`UdpFace`] to a peer, and route the peer's `prefix` over
+    /// it. The platform (Android `WifiAwareManager.requestNetwork`) negotiates
+    /// the NDP, binds a UDP socket on the resulting IPv6 link-local network, and
+    /// hands the bound socket's `fd` + the peer's `SocketAddr` here; this adopts
+    /// the fd as a Tokio socket, adds the face, and installs a cost-`Udp` (10)
+    /// nexthop on `prefix` so `BestRoute` prefers it over the connectionless
+    /// coordination radios (Wi-Fi Aware follow-ups cost 20, BLE 50). This is the
+    /// WS3 bulk fast path: discovery + small control stay on the named-radio
+    /// faces; bulk Data flows over the real Wi-Fi NDP link.
+    ///
+    /// Must be called within the engine's Tokio runtime (adopting the fd builds a
+    /// Tokio `UdpSocket` and `add_face` spawns the I/O task). Takes ownership of
+    /// `fd`. Returns the new face id.
+    #[cfg(unix)]
+    pub fn attach_ndp_face(
+        &self,
+        prefix: &Name,
+        fd: std::os::fd::RawFd,
+        peer: SocketAddr,
+    ) -> std::io::Result<FaceId> {
+        use std::os::fd::FromRawFd;
+        let face_id = self.engine.faces().alloc_id();
+        // SAFETY: the platform hands us sole ownership of a freshly-bound UDP
+        // socket fd (detached from its Java owner); we adopt it exactly once.
+        let std_sock = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+        std_sock.set_nonblocking(true)?;
+        // Hold the socket as an `Arc` so the keepalive task can share it with the
+        // face (NAN tears down an *idle* NDP within ~a minute; periodic traffic
+        // keeps the data path warm so the face stays usable between transfers).
+        let socket = Arc::new(tokio::net::UdpSocket::from_std(std_sock)?);
+        let face = UdpFace::from_shared_socket(face_id, Arc::clone(&socket), peer);
+        self.engine
+            .add_face(face, self.network_cancel.child_token());
+        let cost = self.link_profile.cost(FaceKind::Udp);
+        self.engine.fib().add_nexthop(prefix, face_id, cost);
+        self.engine.strategy_table().insert(
+            prefix,
+            Arc::new(MeasuredStrategy::new()) as Arc<dyn ndn_strategy::ErasedStrategy>,
+        );
+        // Keepalive: a tiny datagram every NDP_KEEPALIVE keeps the NAN data path
+        // from idle-tearing-down. The peer's face decodes it as a malformed
+        // packet and drops it harmlessly; the point is just to keep bytes moving.
+        // Bound to the network cancel token so it stops when faces suspend.
+        // Comfortably under the NAN idle-teardown window (~minute).
+        const NDP_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(20);
+        let cancel = self.network_cancel.child_token();
+        self.engine.runtime().spawn(Box::pin(async move {
+            let mut tick = tokio::time::interval(NDP_KEEPALIVE);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tick.tick() => {
+                        if socket.send_to(&[0u8], peer).await.is_err() {
+                            break; // socket gone (NDP dropped) — stop the keepalive
+                        }
+                    }
+                }
+            }
+        }));
+        tracing::info!(%prefix, %peer, cost, "NDP bulk face attached (Wi-Fi Aware data path)");
+        Ok(face_id)
+    }
+
+    /// Tear down an NDP bulk face (e.g. the `ConnectivityManager` reported the
+    /// Wi-Fi Aware network `onLost`). Removes the face and all its FIB nexthops,
+    /// so `BestRoute` falls back to the connectionless coordination radios
+    /// (Wi-Fi Aware follow-ups / BLE) until the NDP is re-established. Without
+    /// this, a dropped NDP leaves a stale low-cost nexthop that black-holes the
+    /// peer's traffic. Idempotent.
+    #[cfg(unix)]
+    pub fn detach_ndp_face(&self, face_id: u64) {
+        self.engine.remove_face(FaceId(face_id));
+        tracing::info!(face_id, "NDP bulk face detached (Wi-Fi Aware data path lost)");
+    }
+
+    /// Declare a **producer region** this node hosts (NFD `NetworkRegionTable`):
+    /// a routable prefix for which this forwarder owns the producer. A hinted
+    /// Interest whose forwarding hint reaches `prefix` is then stripped here and
+    /// forwarded by its Data name to the local producer, instead of being looped
+    /// back toward the hint. Used at discovery start with this node's own
+    /// `/ndn/node/<id>` prefix, so a peer fetching identity-named content with
+    /// `ForwardingHint = /ndn/node/<id>` is delivered to the app that serves it.
+    /// Idempotent.
+    pub fn add_producer_region(&self, prefix: &Name) {
+        self.engine.network_region().add_region(prefix.clone());
+        tracing::debug!(%prefix, "producer region added");
     }
 
     /// A node with a broadcast/mesh face (NAN, BLE, …) is a mesh peer: it can't
@@ -1478,6 +1577,47 @@ mod cost_route_tests {
         assert!(costs.contains(&50), "BLE cost (50) present: {costs:?}");
         // BestRoute prefers the lowest cost → Wi-Fi Aware over BLE.
         assert_eq!(costs.iter().min(), Some(&20));
+
+        engine.shutdown().await;
+    }
+}
+
+#[cfg(all(test, unix))]
+mod ndp_face_tests {
+    use super::*;
+    use ndn_packet::Name;
+    use std::os::fd::IntoRawFd;
+
+    /// Adopting an NDP UDP socket installs a UDP-cost (10) nexthop on the peer
+    /// prefix, so once the bulk Wi-Fi Aware data path is up, `BestRoute` prefers
+    /// it over the connectionless coordination radios (cost 20 / 50). A real
+    /// loopback UDP socket stands in for the platform's NDP-bound socket.
+    #[tokio::test]
+    async fn attach_ndp_face_installs_low_cost_udp_route() {
+        let (engine, _h) = MobileEngine::builder().build().await.unwrap();
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fd = sock.into_raw_fd();
+        let prefix: Name = "/ndn/node/peerNDP".parse().unwrap();
+        let peer: SocketAddr = "127.0.0.1:6363".parse().unwrap();
+
+        let face_id = engine
+            .attach_ndp_face(&prefix, fd, peer)
+            .expect("attach NDP face");
+
+        let entry = engine
+            .engine()
+            .fib()
+            .dump()
+            .into_iter()
+            .find(|(n, _)| *n == prefix)
+            .expect("ndp route installed")
+            .1;
+        let costs: Vec<u32> = entry.nexthops.iter().map(|n| n.cost).collect();
+        assert!(costs.contains(&10), "UDP-cost (10) NDP nexthop present: {costs:?}");
+        assert!(
+            entry.nexthops.iter().any(|n| n.face_id == face_id),
+            "the NDP face is a nexthop on the peer prefix",
+        );
 
         engine.shutdown().await;
     }
