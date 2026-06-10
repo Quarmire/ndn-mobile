@@ -1212,6 +1212,15 @@ impl MobileEngine {
             ndn_face_wifi_aware::NanCoordFace::new(id, Arc::clone(&backend)),
             self.network_cancel.child_token(),
         );
+        // Egress route for not-locally-served Interests: broadcast them over the
+        // NAN bearer to the cluster. The build-time path installs a `NanDiscovery`
+        // that routes per-prefix on peer discovery; the runtime attach has no
+        // discovery protocol, so it routes the default prefix at the face — the
+        // symmetric-peer default (mirrors `route_to_multicast("/")`). Incoming
+        // Interests still reach local producers via their prefix registrations
+        // with no FIB route, so a pure producer is unaffected.
+        self.engine.fib().add_nexthop(&Name::root(), id, 0);
+        tracing::debug!(face_id = %id, "NAN coordination face attached + default route");
         self.wifi_aware = Some((id, backend));
         id
     }
