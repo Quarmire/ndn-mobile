@@ -31,8 +31,9 @@ async fn main() -> Result<()> {
 fn usage() -> ! {
     eprintln!(
         "usage:\n  \
-         ripple-peer <iface-ipv4> publish <ndn-name> <file>\n  \
-         ripple-peer <iface-ipv4> fetch   <ndn-name> <outfile>"
+         ripple-peer <iface-ipv4> publish <ndn-name> <file>      # over NDN multicast\n  \
+         ripple-peer <iface-ipv4> fetch   <ndn-name> <outfile>   # over NDN multicast\n  \
+         ripple-peer via <ip:port> fetch  <ndn-name> <outfile>   # verified, unicast via a forwarder"
     );
     std::process::exit(2);
 }
@@ -46,17 +47,39 @@ async fn run() -> Result<()> {
         .ok();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.len() != 4 {
+    // Two transports:
+    //   <iface-ipv4> <cmd> <name> <path>   — over the local NDN multicast group
+    //   via <ip:port> <cmd> <name> <path>  — unicast through a forwarder (e.g. a
+    //                                         laptop ndn-fwd the phone uplinks to);
+    //                                         isolates the secure transfer from
+    //                                         the AP's multicast behaviour.
+    let via = args.first().map(|s| s.as_str()) == Some("via");
+    let base = if via { 1 } else { 0 };
+    if args.len() != base + 4 {
         usage();
     }
-    let iface: std::net::Ipv4Addr = args[0]
+    let uplink: Option<std::net::SocketAddr> = if via {
+        Some(
+            args[1]
+                .parse()
+                .with_context(|| format!("bad forwarder addr `{}`", args[1]))?,
+        )
+    } else {
+        None
+    };
+    let iface: std::net::Ipv4Addr = if via {
+        std::net::Ipv4Addr::UNSPECIFIED
+    } else {
+        args[0]
+            .parse()
+            .with_context(|| format!("bad interface IPv4 `{}`", args[0]))?
+    };
+    let cmd = args[base + 1].as_str();
+    let name_str = args[base + 2].clone();
+    let name: Name = name_str
         .parse()
-        .with_context(|| format!("bad interface IPv4 `{}`", args[0]))?;
-    let cmd = args[1].as_str();
-    let name: Name = args[2]
-        .parse()
-        .with_context(|| format!("bad NDN name `{}`", args[2]))?;
-    let path = &args[3];
+        .with_context(|| format!("bad NDN name `{name_str}`"))?;
+    let path = &args[base + 3];
 
     // Persisted NDN identity, named for the object so it sits hierarchically
     // above it — secure by default: published Data is SIGNED with this key, and
@@ -68,23 +91,29 @@ async fn run() -> Result<()> {
     let id_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
         .join(".ripple-peer");
     std::fs::create_dir_all(&id_dir).ok();
-    let id_path = id_dir.join(args[2].trim_start_matches('/').replace('/', "_"));
-    let keychain = ndn_security::KeyChain::open_or_create(&id_path, &args[2])
+    let id_path = id_dir.join(name_str.trim_start_matches('/').replace('/', "_"));
+    let keychain = ndn_security::KeyChain::open_or_create(&id_path, &name_str)
         .map_err(|e| anyhow::anyhow!("identity: {e}"))?;
-    if let Ok(cert_path) = std::env::var("RIPPLE_TRUST") {
-        let der = std::fs::read(&cert_path).with_context(|| format!("reading {cert_path}"))?;
-        let data = ndn_packet::Data::decode(bytes::Bytes::from(der))
-            .map_err(|e| anyhow::anyhow!("RIPPLE_TRUST not a Data/cert: {e}"))?;
-        let cert = ndn_security::Certificate::decode(&data)
-            .map_err(|e| anyhow::anyhow!("RIPPLE_TRUST cert: {e}"))?;
-        keychain.add_trust_anchor(cert);
-        eprintln!("pinned trust anchor from {cert_path}");
-    }
+    let pinned: Option<ndn_security::Certificate> = match std::env::var("RIPPLE_TRUST") {
+        Ok(cert_path) => {
+            let der = std::fs::read(&cert_path).with_context(|| format!("reading {cert_path}"))?;
+            let data = ndn_packet::Data::decode(bytes::Bytes::from(der))
+                .map_err(|e| anyhow::anyhow!("RIPPLE_TRUST not a Data/cert: {e}"))?;
+            let cert = ndn_security::Certificate::decode(&data)
+                .map_err(|e| anyhow::anyhow!("RIPPLE_TRUST cert: {e}"))?;
+            eprintln!("pinned trust anchor from {cert_path}");
+            Some(cert)
+        }
+        Err(_) => None,
+    };
 
-    // A full forwarding node whose only face is the local NDN multicast group —
-    // gateway-free.
-    let (engine, _default_handle) = MobileEngine::builder()
-        .with_udp_multicast(iface)
+    // A full forwarding node. Default face = the local NDN multicast group
+    // (gateway-free); with `via`, a unicast TCP face to the forwarder instead.
+    let builder = match uplink {
+        Some(addr) => MobileEngine::builder().with_tcp_peer(addr),
+        None => MobileEngine::builder().with_udp_multicast(iface),
+    };
+    let (engine, _default_handle) = builder
         .build()
         .await
         .map_err(|e| anyhow::anyhow!("engine build failed: {e}"))?;
@@ -116,16 +145,32 @@ async fn run() -> Result<()> {
             }
         }
         "fetch" => {
-            // A consumer must egress its Interests onto the group: the multicast
-            // face is added unrouted, so install `/` → multicast first.
-            if !engine.route_to_multicast("/") {
-                bail!("no multicast face — cannot fetch over the group");
+            // Egress route for our Interests: `/` → the multicast face, or `/` →
+            // the forwarder face when uplinking.
+            match uplink {
+                None => {
+                    if !engine.route_to_multicast("/") {
+                        bail!("no multicast face — cannot fetch over the group");
+                    }
+                }
+                Some(_) => {
+                    let root: Name = "/".parse().unwrap();
+                    for peer in engine.peers() {
+                        engine.route_to_peer(root.clone(), &peer, 0);
+                    }
+                }
             }
             let (_face_id, handle) = engine.new_app_handle();
-            // verifying(): every segment + the metadata Data is checked against
-            // the pinned anchors before reassembly — unsigned/untrusted is refused.
-            let mut consumer = Consumer::from_handle(handle).verifying(keychain.validator());
-            eprintln!("fetching {name} over multicast via {iface} (verified) …");
+            // Build the validator (own anchors) and register the pinned peer cert
+            // as a TERMINAL anchor (add_trust_anchor, so the chain walk stops at
+            // it — not just cert-cached). verifying(): every segment + the metadata
+            // Data is checked before reassembly; unsigned/untrusted is refused.
+            let validator = keychain.validator();
+            if let Some(cert) = pinned.clone() {
+                validator.add_trust_anchor(cert);
+            }
+            let mut consumer = Consumer::from_handle(handle).verifying(validator);
+            eprintln!("fetching {name} (verified) …");
             let bytes = consumer
                 .fetch_object(name.clone())
                 .await
