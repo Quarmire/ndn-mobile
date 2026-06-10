@@ -1189,6 +1189,33 @@ impl MobileEngine {
         true
     }
 
+    /// Attach a Wi-Fi Aware (NAN) coordination face at runtime over a
+    /// platform-supplied [`NanBackend`](ndn_face_wifi_aware::NanBackend),
+    /// returning its stable face id. This is the runtime equivalent of
+    /// [`MobileEngineBuilder::with_wifi_aware`]: the radio (Android
+    /// `WifiAwareManager`) is often only available — and only permitted — after
+    /// the engine is already running, so the NAN bearer is added here rather
+    /// than at build time. The face is registered against the network cancel
+    /// token, so it suspends/resumes with the other network faces and is rebuilt
+    /// by [`Self::resume_network_faces`]. A second call replaces the stored
+    /// backend and re-adds a fresh face under the same id.
+    #[cfg(feature = "wifi-aware")]
+    pub fn attach_wifi_aware(
+        &mut self,
+        backend: Arc<dyn ndn_face_wifi_aware::NanBackend>,
+    ) -> FaceId {
+        let id = match &self.wifi_aware {
+            Some((id, _)) => *id,
+            None => self.engine.faces().alloc_id(),
+        };
+        self.engine.add_face(
+            ndn_face_wifi_aware::NanCoordFace::new(id, Arc::clone(&backend)),
+            self.network_cancel.child_token(),
+        );
+        self.wifi_aware = Some((id, backend));
+        id
+    }
+
     pub fn engine(&self) -> &ForwarderEngine {
         &self.engine
     }
