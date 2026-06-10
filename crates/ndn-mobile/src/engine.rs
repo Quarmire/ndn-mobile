@@ -249,6 +249,10 @@ pub struct MobileEngine {
     /// `None` unless `with_wifi_aware`.
     #[cfg(feature = "wifi-aware")]
     wifi_aware: Option<(FaceId, Arc<dyn ndn_face_wifi_aware::NanBackend>)>,
+    /// BLE advertising face (stable id + platform backend), rebuilt on resume.
+    /// `None` unless `attach_ble`.
+    #[cfg(feature = "ble")]
+    ble: Option<(FaceId, Arc<dyn ndn_face_ble_adv::AdvBackend>)>,
     /// Platform side of the VPN datapath face; `None` unless `with_tun` was
     /// called. Drive it from the native tun pump via [`MobileEngine::tun_handle`].
     #[cfg(feature = "tun")]
@@ -1024,6 +1028,10 @@ impl MobileEngineBuilder {
                 observability,
                 #[cfg(feature = "wifi-aware")]
                 wifi_aware,
+                // BLE is runtime-attached (the radio is only available/permitted
+                // after start), so it begins `None` and `attach_ble` populates it.
+                #[cfg(feature = "ble")]
+                ble: None,
                 #[cfg(feature = "tun")]
                 tun_handle,
             },
@@ -1146,6 +1154,14 @@ impl MobileEngine {
             );
             tracing::debug!(face_id = %id, "NAN coordination face resumed");
         }
+        #[cfg(feature = "ble")]
+        if let Some((id, backend)) = &self.ble {
+            self.engine.add_face(
+                ndn_face_ble_adv::BleAdvFace::new(*id, Arc::clone(backend)),
+                self.network_cancel.child_token(),
+            );
+            tracing::debug!(face_id = %id, "BLE advertising face resumed");
+        }
     }
 
     /// The configured network peers (unicast / TCP / WebSocket / serial), each
@@ -1222,6 +1238,31 @@ impl MobileEngine {
         self.engine.fib().add_nexthop(&Name::root(), id, 0);
         tracing::debug!(face_id = %id, "NAN coordination face attached + default route");
         self.wifi_aware = Some((id, backend));
+        id
+    }
+
+    /// Attach a connectionless **BLE advertising** face at runtime over a
+    /// platform-supplied [`AdvBackend`](ndn_face_ble_adv::AdvBackend), returning
+    /// its stable face id. BLE is near-universal, so this is the widest-support
+    /// named-radio face — the complement to Wi-Fi Aware (use both at once; they
+    /// fill each other's gaps). Like [`Self::attach_wifi_aware`], the radio is
+    /// only available after start, so it's attached here rather than at build
+    /// time; the face registers against the network cancel token (suspend/resume)
+    /// and routes the default prefix so not-locally-served Interests advertise
+    /// out. A second call replaces the backend and re-adds under the same id.
+    #[cfg(feature = "ble")]
+    pub fn attach_ble(&mut self, backend: Arc<dyn ndn_face_ble_adv::AdvBackend>) -> FaceId {
+        let id = match &self.ble {
+            Some((id, _)) => *id,
+            None => self.engine.faces().alloc_id(),
+        };
+        self.engine.add_face(
+            ndn_face_ble_adv::BleAdvFace::new(id, Arc::clone(&backend)),
+            self.network_cancel.child_token(),
+        );
+        self.engine.fib().add_nexthop(&Name::root(), id, 0);
+        tracing::debug!(face_id = %id, "BLE advertising face attached + default route");
+        self.ble = Some((id, backend));
         id
     }
 

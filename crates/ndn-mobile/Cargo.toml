@@ -67,6 +67,10 @@ observability = ["dep:ndn-observability"]
 ## AP-less named-radio bearer. The platform supplies the `NanBackend` (Android
 ## WifiAwareManager via JNI); pub/sub discovery installs routes.
 wifi-aware = ["dep:ndn-face-wifi-aware"]
+## Connectionless BLE **advertising** face (`attach_ble`) — the widest-support
+## named-radio bearer (BLE is near-universal). The platform supplies the
+## `AdvBackend` (Android BluetoothLeAdvertiser/Scanner via JNI).
+ble = ["dep:ndn-face-ble-adv"]
 
 [dependencies]
 ndn-engine      = { workspace = true }
@@ -78,6 +82,7 @@ ndn-safebag     = { workspace = true, optional = true }
 ndn-custodian   = { workspace = true, optional = true }
 ndn-face-webtransport = { workspace = true, optional = true }
 ndn-face-wifi-aware = { workspace = true, optional = true }
+ndn-face-ble-adv    = { workspace = true, optional = true }
 ndn-observability = { workspace = true, optional = true }
 serde_json      = { workspace = true, optional = true }
 getrandom       = { workspace = true, optional = true }
