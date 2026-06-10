@@ -197,6 +197,7 @@ pub fn spawn_tunnel(
         let opts = SubscribeOptions {
             max_data_count: config.credit,
             lifetime: config.lifetime,
+            ..SubscribeOptions::default()
         };
         let cancel = cancel.child_token();
         tokio::spawn(async move {
