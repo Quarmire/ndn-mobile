@@ -1205,6 +1205,21 @@ impl MobileEngine {
         true
     }
 
+    /// A node with a broadcast/mesh face (NAN, BLE, …) is a mesh peer: it can't
+    /// know which radio reaches a given peer, so it must fan each not-locally-
+    /// served Interest over ALL of them. Install `MulticastStrategy` at the root
+    /// so this holds even with no multicast face (e.g. BLE-only with Wi-Fi off),
+    /// where `build`'s `BestRoute` default would forward `/` to a single nexthop
+    /// — and possibly a dead radio. The build-time path already does this when a
+    /// multicast face is present; the runtime broadcast-face attaches call this.
+    #[cfg(any(feature = "wifi-aware", feature = "ble"))]
+    fn ensure_mesh_strategy(&self) {
+        self.engine.strategy_table().insert(
+            &Name::root(),
+            Arc::new(ndn_strategy::MulticastStrategy::new()) as Arc<dyn ndn_strategy::ErasedStrategy>,
+        );
+    }
+
     /// Attach a Wi-Fi Aware (NAN) coordination face at runtime over a
     /// platform-supplied [`NanBackend`](ndn_face_wifi_aware::NanBackend),
     /// returning its stable face id. This is the runtime equivalent of
@@ -1236,6 +1251,7 @@ impl MobileEngine {
         // Interests still reach local producers via their prefix registrations
         // with no FIB route, so a pure producer is unaffected.
         self.engine.fib().add_nexthop(&Name::root(), id, 0);
+        self.ensure_mesh_strategy();
         tracing::debug!(face_id = %id, "NAN coordination face attached + default route");
         self.wifi_aware = Some((id, backend));
         id
@@ -1261,6 +1277,7 @@ impl MobileEngine {
             self.network_cancel.child_token(),
         );
         self.engine.fib().add_nexthop(&Name::root(), id, 0);
+        self.ensure_mesh_strategy();
         tracing::debug!(face_id = %id, "BLE advertising face attached + default route");
         self.ble = Some((id, backend));
         id
