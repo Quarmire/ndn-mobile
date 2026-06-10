@@ -14,7 +14,7 @@ use ndn_face_native::serial::serial_face_open;
 use ndn_packet::Name;
 use ndn_security::SecurityProfile;
 use ndn_strategy::{BestRouteStrategy, MulticastStrategy};
-use ndn_transport::{FaceId, FaceKind, FacePersistency};
+use ndn_transport::{FaceId, FaceKind, FacePersistency, LinkProfile};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "tun")]
@@ -234,6 +234,8 @@ pub struct MobileEngine {
     multicast_iface: Option<Ipv4Addr>,
     /// Stable across suspend/resume so existing FIB entries survive.
     multicast_face_id: FaceId,
+    /// Per-face routing-cost prior used when installing discovery routes.
+    link_profile: LinkProfile,
     /// Unicast/TCP/WebSocket/serial peers with their stable face ids. Retained
     /// so `resume_network_faces` rebuilds every one (not just multicast) with
     /// the same id, and so `route_to_peer` can resolve a [`PeerRef`].
@@ -275,6 +277,7 @@ pub struct MobileEngineBuilder {
     discovery_protocol: Option<Arc<dyn DiscoveryProtocol>>,
     node_name: Option<Name>,
     strategy: MobileStrategy,
+    link_profile: LinkProfile,
     pipeline_threads: usize,
     #[cfg_attr(not(feature = "management"), allow(dead_code))]
     enable_management: bool,
@@ -333,6 +336,7 @@ impl Default for MobileEngineBuilder {
             discovery_protocol: None,
             node_name: None,
             strategy: MobileStrategy::default(),
+            link_profile: LinkProfile::default(),
             pipeline_threads: 1,
             enable_management: false,
             #[cfg(feature = "management")]
@@ -378,6 +382,13 @@ impl MobileEngineBuilder {
     /// Choose the root forwarding strategy (default [`MobileStrategy::BestRoute`]).
     /// A single-gateway leaf wants `BestRoute`; a mesh node may prefer
     /// `Multicast` or (with the `cclf` feature) `Cclf`.
+    /// Set the per-face routing-cost prior used for discovery routes. Lower cost
+    /// = preferred radio (see [`LinkProfile`]).
+    pub fn with_link_profile(mut self, profile: LinkProfile) -> Self {
+        self.link_profile = profile;
+        self
+    }
+
     pub fn with_strategy(mut self, strategy: MobileStrategy) -> Self {
         self.strategy = strategy;
         self
@@ -1021,6 +1032,7 @@ impl MobileEngineBuilder {
                 network_cancel,
                 multicast_iface: self.multicast_iface,
                 multicast_face_id: multicast_face_id.unwrap_or(FaceId(0)),
+                link_profile: self.link_profile,
                 network_peers,
                 #[cfg(feature = "compute")]
                 compute_registry,
@@ -1203,6 +1215,41 @@ impl MobileEngine {
             .fib()
             .add_nexthop(&prefix.into(), self.multicast_face_id, 0);
         true
+    }
+
+    /// Install a **cost-aware route** to a discovered peer's `prefix` toward the
+    /// face it was heard on (`kind`), at this node's [`LinkProfile`] cost for that
+    /// radio, and set `BestRoute` on the prefix so traffic to that peer takes the
+    /// cheapest face it's reachable on — instead of flooding every radio. This is
+    /// the "route to deliver" half of discovery: `/` stays multicast for
+    /// first-contact, but once we know a peer is on Wi-Fi Aware (cost 20) and BLE
+    /// (cost 50), a fetch to it prefers Wi-Fi Aware. No-op if no such face is
+    /// attached. Idempotent (re-noting refreshes the nexthop).
+    pub fn note_peer_route(&self, prefix: &Name, face: &str) {
+        // The face names match the discovery dataset's `faces` ("wifi-aware",
+        // "ble", "multicast").
+        let kind = match face {
+            "wifi-aware" => FaceKind::WifiAware,
+            "ble" => FaceKind::Bluetooth,
+            "multicast" | "udp" => FaceKind::Udp,
+            _ => return,
+        };
+        let face_id: Option<FaceId> = match kind {
+            #[cfg(feature = "wifi-aware")]
+            FaceKind::WifiAware => self.wifi_aware.as_ref().map(|(id, _)| *id),
+            #[cfg(feature = "ble")]
+            FaceKind::Bluetooth => self.ble.as_ref().map(|(id, _)| *id),
+            FaceKind::Udp => (self.multicast_face_id != FaceId(0)).then_some(self.multicast_face_id),
+            _ => None,
+        };
+        let Some(id) = face_id else { return };
+        let cost = self.link_profile.cost(kind);
+        self.engine.fib().add_nexthop(prefix, id, cost);
+        self.engine.strategy_table().insert(
+            prefix,
+            Arc::new(BestRouteStrategy::new()) as Arc<dyn ndn_strategy::ErasedStrategy>,
+        );
+        tracing::debug!(%prefix, ?kind, cost, "cost-aware peer route installed");
     }
 
     /// A node with a broadcast/mesh face (NAN, BLE, …) is a mesh peer: it can't
@@ -1392,5 +1439,46 @@ impl ndn_app::Connection for RegisteringInProcConnection {
         // Embedded engine: write the FIB directly (the in-proc rib/register).
         self.fib.add_nexthop(prefix, self.face_id, 0);
         Box::pin(async { Ok(()) })
+    }
+}
+
+#[cfg(all(test, feature = "wifi-aware", feature = "ble"))]
+mod cost_route_tests {
+    use super::*;
+    use ndn_packet::Name;
+    use std::sync::Arc;
+
+    /// Discovery installs a **cost-aware** route to a peer toward each radio it
+    /// was heard on, at this node's `LinkProfile` cost — so a fetch to the peer
+    /// (BestRoute on the prefix) takes the cheaper radio (Wi-Fi Aware) over BLE,
+    /// instead of flooding both. The general per-face cost model now lives in
+    /// `ndn-transport`, so every forwarder gets this, not just the phone.
+    #[tokio::test]
+    async fn note_peer_route_installs_cost_aware_routes() {
+        let (mut engine, _h) = MobileEngine::builder().build().await.unwrap();
+        let nan = ndn_face_wifi_aware::LoopbackNanBus::new();
+        let ble = ndn_face_ble_adv::LoopbackAdvBus::new();
+        engine.attach_wifi_aware(Arc::new(nan.endpoint(1, [0u8; 6], -50)));
+        engine.attach_ble(Arc::new(ble.endpoint(1, [0u8; 6], -60)));
+
+        let prefix: Name = "/ndn/node/peerX".parse().unwrap();
+        engine.note_peer_route(&prefix, "wifi-aware");
+        engine.note_peer_route(&prefix, "ble");
+
+        let entry = engine
+            .engine()
+            .fib()
+            .dump()
+            .into_iter()
+            .find(|(n, _)| *n == prefix)
+            .expect("peer route installed")
+            .1;
+        let costs: Vec<u32> = entry.nexthops.iter().map(|n| n.cost).collect();
+        assert!(costs.contains(&20), "Wi-Fi Aware cost (20) present: {costs:?}");
+        assert!(costs.contains(&50), "BLE cost (50) present: {costs:?}");
+        // BestRoute prefers the lowest cost → Wi-Fi Aware over BLE.
+        assert_eq!(costs.iter().min(), Some(&20));
+
+        engine.shutdown().await;
     }
 }
