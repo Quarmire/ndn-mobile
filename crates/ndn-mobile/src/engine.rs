@@ -1251,14 +1251,22 @@ impl MobileEngine {
         let Some(id) = face_id else { return };
         let cost = self.link_profile.cost(kind);
         self.engine.fib().add_nexthop(prefix, id, cost);
-        // Measured best-route: starts as static-cost best-route, then adapts to
-        // live RTT / RSSI / congestion as samples accrue (e.g. prefers a warm NDP
-        // but moves off it if it degrades). Cold-start identical to `BestRoute`.
+        // Fan over EVERY coordination radio for this peer (NAN + BLE + multicast),
+        // not just the single measured-best face. The coordination radios are
+        // individually flaky — NAN drops on a Wi-Fi switch, multicast is lossy,
+        // BLE is slow — so a single-best route fails entirely whenever its one
+        // chosen face stops delivering, which is exactly what stalls offer-board
+        // fetches (the offer Interest egresses on one face and never arrives).
+        // Multicast gives redundancy: at least one radio carries the small
+        // discovery/offer Interests through. The per-face `cost` still orders the
+        // FIB (cheapest radio first); a bulk-data face (Wi-Fi Direct, far cheaper
+        // cost) added later still wins the actual transfer via that ordering.
         self.engine.strategy_table().insert(
             prefix,
-            Arc::new(MeasuredStrategy::new()) as Arc<dyn ndn_strategy::ErasedStrategy>,
+            Arc::new(ndn_strategy::MulticastStrategy::new())
+                as Arc<dyn ndn_strategy::ErasedStrategy>,
         );
-        tracing::debug!(%prefix, ?kind, cost, "cost-aware peer route installed");
+        tracing::debug!(%prefix, ?kind, cost, "fan-out peer route installed (multicast over coordination radios)");
     }
 
     /// Adopt an app-established **NAN NDP** (Network Data Path) UDP socket as a
