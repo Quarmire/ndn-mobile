@@ -1267,6 +1267,25 @@ impl MobileEngine {
         let Some(id) = face_id else { return };
         let cost = self.link_profile.cost(kind);
         self.engine.fib().add_nexthop(prefix, id, cost);
+        // If a bulk-transfer face (Wi-Fi Direct, cost 8 — cheaper than any
+        // coordination radio) is already up to this peer, leave its single-best
+        // `MeasuredStrategy` (installed by `attach_udp_bulk_face`) ALONE. This
+        // helper runs on every discovery beacon (~every 150 ms); re-installing
+        // the fan-out strategy here mid-transfer both clobbers the bulk route —
+        // fanning ~8 KB Data Interests back over BLE, flooding it — and churns
+        // the strategy object, resetting its measurement state and starving the
+        // tail of a large transfer. Discovery only needs the fan when there is
+        // NO bulk face yet (the offer-board fetch over coordination radios).
+        let wd_cost = self.link_profile.cost(FaceKind::WifiDirect);
+        let has_bulk_face = self
+            .engine
+            .fib()
+            .lpm(prefix)
+            .is_some_and(|e| e.nexthops.iter().any(|nh| nh.cost <= wd_cost));
+        if has_bulk_face {
+            tracing::debug!(%prefix, ?kind, "peer route: bulk face up — keeping single-best strategy (no fan clobber)");
+            return;
+        }
         // Fan over EVERY coordination radio for this peer (NAN + BLE + multicast),
         // not just the single measured-best face. The coordination radios are
         // individually flaky — NAN drops on a Wi-Fi switch, multicast is lossy,
@@ -1275,8 +1294,7 @@ impl MobileEngine {
         // fetches (the offer Interest egresses on one face and never arrives).
         // Multicast gives redundancy: at least one radio carries the small
         // discovery/offer Interests through. The per-face `cost` still orders the
-        // FIB (cheapest radio first); a bulk-data face (Wi-Fi Direct, far cheaper
-        // cost) added later still wins the actual transfer via that ordering.
+        // FIB (cheapest radio first).
         self.engine.strategy_table().insert(
             prefix,
             Arc::new(ndn_strategy::MulticastStrategy::new())
