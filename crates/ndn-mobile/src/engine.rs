@@ -17,6 +17,20 @@ use ndn_strategy::{BestRouteStrategy, MeasuredStrategy, MulticastStrategy};
 use ndn_transport::{FaceId, FaceKind, FacePersistency, LinkProfile, Transport};
 use tokio_util::sync::CancellationToken;
 
+/// LP fragmentation MTU for the NAN **coordination** face (follow-up messages).
+///
+/// The crate default (`ndn_face_wifi_aware::FOLLOWUP_MTU`) sits just under the
+/// NAN spec's 255-byte service-info ceiling, but real radios enforce a *lower*
+/// per-message limit than they advertise: a Samsung S23 reports a 270-byte
+/// `maxServiceSpecificInfoLength` yet rejects ~246–255-byte follow-ups with
+/// "Message length longer than supported by device characteristics", so an
+/// offer-board segment that LP-fragments into a 255-byte frame stalls on the
+/// first fetch. Cut fragments well under the observed flaky ceiling so every
+/// frame is accepted on the first send. Bulk transfers ride the NDP `UdpFace`
+/// (high MTU), not these follow-ups, so the extra fragment here is cheap.
+#[cfg(feature = "wifi-aware")]
+const NAN_COORD_MTU: usize = 200;
+
 #[cfg(feature = "tun")]
 use crate::tun::{TunConfig, TunHandle, spawn_tunnel};
 #[cfg(feature = "compute")]
@@ -858,7 +872,8 @@ impl MobileEngineBuilder {
         let wifi_aware = match (self.wifi_aware, wifi_aware_coord_id) {
             (Some(cfg), Some(coord_id)) => {
                 engine.add_face(
-                    ndn_face_wifi_aware::NanCoordFace::new(coord_id, Arc::clone(&cfg.backend)),
+                    ndn_face_wifi_aware::NanCoordFace::new(coord_id, Arc::clone(&cfg.backend))
+                        .with_mtu(NAN_COORD_MTU),
                     network_cancel.child_token(),
                 );
                 Some((coord_id, cfg.backend))
@@ -1161,7 +1176,8 @@ impl MobileEngine {
         #[cfg(feature = "wifi-aware")]
         if let Some((id, backend)) = &self.wifi_aware {
             self.engine.add_face(
-                ndn_face_wifi_aware::NanCoordFace::new(*id, Arc::clone(backend)),
+                ndn_face_wifi_aware::NanCoordFace::new(*id, Arc::clone(backend))
+                    .with_mtu(NAN_COORD_MTU),
                 self.network_cancel.child_token(),
             );
             tracing::debug!(face_id = %id, "NAN coordination face resumed");
@@ -1464,7 +1480,8 @@ impl MobileEngine {
             None => self.engine.faces().alloc_id(),
         };
         self.engine.add_face(
-            ndn_face_wifi_aware::NanCoordFace::new(id, Arc::clone(&backend)),
+            ndn_face_wifi_aware::NanCoordFace::new(id, Arc::clone(&backend))
+                .with_mtu(NAN_COORD_MTU),
             self.network_cancel.child_token(),
         );
         // Egress route for not-locally-served Interests: broadcast them over the
