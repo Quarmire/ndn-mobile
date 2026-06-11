@@ -1282,6 +1282,42 @@ impl MobileEngine {
         fd: std::os::fd::RawFd,
         peer: SocketAddr,
     ) -> std::io::Result<FaceId> {
+        // An NDP bulk face is an ordinary UDP link tagged `Udp`; the Wi-Fi Direct
+        // path is the same flow tagged `WifiDirect` (cost 8 vs 10).
+        self.attach_udp_bulk_face(prefix, fd, peer, FaceKind::Udp, "NAN NDP")
+    }
+
+    /// Adopt an app-bound UDP socket fd as a high-throughput **Wi-Fi Direct**
+    /// bulk face to a peer on the P2P group subnet (typically `192.168.49.x`),
+    /// and route the peer's `prefix` over it. Identical machinery to
+    /// [`Self::attach_ndp_face`] — the host-centric group-owner election and
+    /// DHCP stay in the platform glue *below* this Face; here it is just a fast
+    /// unicast UDP link — but the face is tagged [`FaceKind::WifiDirect`], so a
+    /// cost-aware strategy prefers this dedicated 5 GHz peer link (cost 8) over
+    /// the connectionless Wi-Fi Aware (20) / BLE (50) radios and the NDP/LAN UDP
+    /// path (10). Takes ownership of `fd`. Returns the new face id. Unix only.
+    #[cfg(unix)]
+    pub fn attach_wifi_direct_face(
+        &self,
+        prefix: &Name,
+        fd: std::os::fd::RawFd,
+        peer: SocketAddr,
+    ) -> std::io::Result<FaceId> {
+        self.attach_udp_bulk_face(prefix, fd, peer, FaceKind::WifiDirect, "Wi-Fi Direct")
+    }
+
+    /// Shared body for the fd-adopting unicast bulk faces (NDP, Wi-Fi Direct):
+    /// adopt the socket, tag it `kind`, route `prefix` at the kind's cost under a
+    /// [`MeasuredStrategy`], and run a keepalive. `label` only colours the log.
+    #[cfg(unix)]
+    fn attach_udp_bulk_face(
+        &self,
+        prefix: &Name,
+        fd: std::os::fd::RawFd,
+        peer: SocketAddr,
+        kind: FaceKind,
+        label: &str,
+    ) -> std::io::Result<FaceId> {
         use std::os::fd::FromRawFd;
         let face_id = self.engine.faces().alloc_id();
         // SAFETY: the platform hands us sole ownership of a freshly-bound UDP
@@ -1289,49 +1325,74 @@ impl MobileEngine {
         let std_sock = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
         std_sock.set_nonblocking(true)?;
         // Hold the socket as an `Arc` so the keepalive task can share it with the
-        // face (NAN tears down an *idle* NDP within ~a minute; periodic traffic
-        // keeps the data path warm so the face stays usable between transfers).
+        // face. (Wi-Fi Aware tears down an *idle* NDP within ~a minute; periodic
+        // traffic keeps the data path warm. Wi-Fi Direct does not idle-teardown,
+        // but the keepalive is harmless there and keeps the face symmetric.)
         let socket = Arc::new(tokio::net::UdpSocket::from_std(std_sock)?);
-        let face = UdpFace::from_shared_socket(face_id, Arc::clone(&socket), peer);
-        // The NDP link is a real Wi-Fi data path on an IPv6 link-local interface
-        // (MTU 1500). Bump the per-fragment UDP payload from the conservative
-        // 1400 default to 1452 (= 1500 − 40-byte IPv6 − 8-byte UDP) so each
-        // NDNLP fragment fills the frame without IP-fragmenting — a few percent
-        // fewer fragments. (The link MTU is 1500, so this is the ceiling before
-        // IP fragmentation would *hurt*; the real throughput lever is the fetch
-        // window, not the MTU.)
-        const NDP_FRAGMENT_MTU: u64 = 1452;
-        let _ = face.set_send_mtu(Some(NDP_FRAGMENT_MTU));
+        let face =
+            UdpFace::from_shared_socket(face_id, Arc::clone(&socket), peer).with_kind(kind);
+        // Real Wi-Fi data path (link MTU 1500): bump the per-fragment UDP payload
+        // from the conservative 1400 default to 1452 (= 1500 − 40-byte IPv6 −
+        // 8-byte UDP; also safe over IPv4's smaller header) so each NDNLP fragment
+        // fills the frame without IP-fragmenting. The real throughput lever is the
+        // fetch window, not the MTU.
+        const BULK_FRAGMENT_MTU: u64 = 1452;
+        let _ = face.set_send_mtu(Some(BULK_FRAGMENT_MTU));
         self.engine
             .add_face(face, self.network_cancel.child_token());
-        let cost = self.link_profile.cost(FaceKind::Udp);
+        let cost = self.link_profile.cost(kind);
         self.engine.fib().add_nexthop(prefix, face_id, cost);
         self.engine.strategy_table().insert(
             prefix,
             Arc::new(MeasuredStrategy::new()) as Arc<dyn ndn_strategy::ErasedStrategy>,
         );
-        // Keepalive: a tiny datagram every NDP_KEEPALIVE keeps the NAN data path
-        // from idle-tearing-down. The peer's face decodes it as a malformed
-        // packet and drops it harmlessly; the point is just to keep bytes moving.
-        // Bound to the network cancel token so it stops when faces suspend.
-        // Comfortably under the NAN idle-teardown window (~minute).
-        const NDP_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(20);
+        // Keepalive: a tiny datagram every 20s keeps the data path warm (and, on
+        // NAN, prevents idle-teardown). The peer decodes it as a malformed packet
+        // and drops it harmlessly. Bound to the network cancel token.
+        const BULK_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(20);
         let cancel = self.network_cancel.child_token();
         self.engine.runtime().spawn(Box::pin(async move {
-            let mut tick = tokio::time::interval(NDP_KEEPALIVE);
+            let mut tick = tokio::time::interval(BULK_KEEPALIVE);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     _ = tick.tick() => {
                         if socket.send_to(&[0u8], peer).await.is_err() {
-                            break; // socket gone (NDP dropped) — stop the keepalive
+                            break; // socket gone (link dropped) — stop the keepalive
                         }
                     }
                 }
             }
         }));
-        tracing::info!(%prefix, %peer, cost, "NDP bulk face attached (Wi-Fi Aware data path)");
+        tracing::info!(%prefix, %peer, cost, kind = %kind, link = label, "bulk UDP face attached");
+        Ok(face_id)
+    }
+
+    /// Attach a **Wi-Fi Direct one-to-many** face: join the NDN multicast group
+    /// (`224.0.23.170:56363`) on the P2P group interface `local_ipv4`, route `/`
+    /// over it, and install [`MulticastStrategy`](ndn_strategy::MulticastStrategy)
+    /// at the root so a single Interest fans to every peer in the group and PIT
+    /// aggregation collapses the Data back — true NDN multicast over the group's
+    /// broadcast domain (the "seed a file to the room" path). The face is tagged
+    /// [`FaceKind::WifiDirect`]. Note Wi-Fi multicast frames go at the basic rate
+    /// and are un-ACKed, so this is for coordination + Interests (and FEC-coded
+    /// one-to-many bulk); 1:1 bulk uses [`Self::attach_wifi_direct_face`].
+    /// Returns the new face id. Unix only.
+    #[cfg(unix)]
+    pub async fn attach_wifi_direct_multicast_face(
+        &self,
+        local_ipv4: std::net::Ipv4Addr,
+    ) -> std::io::Result<FaceId> {
+        let face_id = self.engine.faces().alloc_id();
+        let face = MulticastUdpFace::ndn_default(local_ipv4, face_id)
+            .await?
+            .with_kind(FaceKind::WifiDirect);
+        self.engine
+            .add_face(face, self.network_cancel.child_token());
+        self.engine.fib().add_nexthop(&Name::root(), face_id, 0);
+        self.ensure_mesh_strategy();
+        tracing::info!(face_id = %face_id, %local_ipv4, "Wi-Fi Direct multicast face attached + root route");
         Ok(face_id)
     }
 
@@ -1367,7 +1428,7 @@ impl MobileEngine {
     /// where `build`'s `BestRoute` default would forward `/` to a single nexthop
     /// — and possibly a dead radio. The build-time path already does this when a
     /// multicast face is present; the runtime broadcast-face attaches call this.
-    #[cfg(any(feature = "wifi-aware", feature = "ble"))]
+    #[cfg(any(feature = "wifi-aware", feature = "ble", unix))]
     fn ensure_mesh_strategy(&self) {
         self.engine.strategy_table().insert(
             &Name::root(),
