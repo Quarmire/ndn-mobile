@@ -14,7 +14,7 @@ use ndn_face_native::serial::serial_face_open;
 use ndn_packet::Name;
 use ndn_security::SecurityProfile;
 use ndn_strategy::{BestRouteStrategy, MeasuredStrategy, MulticastStrategy};
-use ndn_transport::{FaceId, FaceKind, FacePersistency, LinkProfile};
+use ndn_transport::{FaceId, FaceKind, FacePersistency, LinkProfile, Transport};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "tun")]
@@ -1293,6 +1293,15 @@ impl MobileEngine {
         // keeps the data path warm so the face stays usable between transfers).
         let socket = Arc::new(tokio::net::UdpSocket::from_std(std_sock)?);
         let face = UdpFace::from_shared_socket(face_id, Arc::clone(&socket), peer);
+        // The NDP link is a real Wi-Fi data path on an IPv6 link-local interface
+        // (MTU 1500). Bump the per-fragment UDP payload from the conservative
+        // 1400 default to 1452 (= 1500 − 40-byte IPv6 − 8-byte UDP) so each
+        // NDNLP fragment fills the frame without IP-fragmenting — a few percent
+        // fewer fragments. (The link MTU is 1500, so this is the ceiling before
+        // IP fragmentation would *hurt*; the real throughput lever is the fetch
+        // window, not the MTU.)
+        const NDP_FRAGMENT_MTU: u64 = 1452;
+        let _ = face.set_send_mtu(Some(NDP_FRAGMENT_MTU));
         self.engine
             .add_face(face, self.network_cancel.child_token());
         let cost = self.link_profile.cost(FaceKind::Udp);
