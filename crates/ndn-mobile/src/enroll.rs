@@ -40,7 +40,7 @@ use ndn_custodian::{Custodian, CustodianSigner, KeyId};
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Name, SignatureType};
 use ndn_safebag::SafeBag;
-use ndn_security::{EcdsaP256Signer, Signer};
+use ndn_security::{EcdsaP256Signer, Ed25519Signer, Signer};
 
 use crate::engine::MobileEngine;
 
@@ -100,9 +100,9 @@ pub struct EnrolledIdentity {
     key_name: Name,
     cert_name: Name,
     certificate: Option<Bytes>,
-    /// Exportable private key — `Some` for a software key (SafeBag-able),
-    /// `None` for a custodian/enclave-held key.
-    exportable: Option<Arc<EcdsaP256Signer>>,
+    /// Exportable private key as PKCS#8 DER (algorithm-agnostic) — `Some` for a
+    /// software key (SafeBag-able), `None` for a custodian/enclave-held key.
+    exportable: Option<Vec<u8>>,
 }
 
 impl EnrolledIdentity {
@@ -160,12 +160,9 @@ impl EnrolledIdentity {
     /// (its private key can't leave the device), and
     /// [`EnrollError::NoCertificate`] if the issued cert wasn't fetched.
     pub fn to_safebag(&self, password: &[u8]) -> Result<SafeBag, EnrollError> {
-        let exportable = self.exportable.as_ref().ok_or(EnrollError::NotExportable)?;
+        let pkcs8 = self.exportable.as_ref().ok_or(EnrollError::NotExportable)?;
         let cert = self.certificate.clone().ok_or(EnrollError::NoCertificate)?;
-        let pkcs8 = exportable
-            .to_pkcs8_der()
-            .map_err(|e| EnrollError::Key(e.to_string()))?;
-        SafeBag::encrypt(cert, &pkcs8, password).map_err(|e| EnrollError::SafeBag(e.to_string()))
+        SafeBag::encrypt(cert, pkcs8, password).map_err(|e| EnrollError::SafeBag(e.to_string()))
     }
 }
 
@@ -253,12 +250,13 @@ impl MobileEngine {
             .with_cert_name(cert_name.clone()),
         );
 
+        let exportable = stamped.to_pkcs8_der().map_err(|e| EnrollError::Key(e.to_string()))?;
         Ok(EnrolledIdentity {
-            signer: stamped.clone(),
+            signer: stamped,
             key_name,
             cert_name,
             certificate,
-            exportable: Some(stamped),
+            exportable: Some(exportable),
         })
     }
 
@@ -297,12 +295,13 @@ impl MobileEngine {
             .with_cert_name(cert_name.clone()),
         );
 
+        let exportable = stamped.to_pkcs8_der().map_err(|e| EnrollError::Key(e.to_string()))?;
         Ok(EnrolledIdentity {
-            signer: stamped.clone(),
+            signer: stamped,
             key_name,
             cert_name,
             certificate,
-            exportable: Some(stamped),
+            exportable: Some(exportable),
         })
     }
 
@@ -320,11 +319,13 @@ impl MobileEngine {
             .unwrap_or_default()
             .as_millis() as u64;
         let key_name: Name = name.append("KEY").append_version(ts_ms);
-        let ecdsa = Arc::new(
-            EcdsaP256Signer::generate(key_name.clone())
-                .map_err(|e| EnrollError::Key(e.to_string()))?,
+        // Ed25519 by default: ~7× faster sign+verify than ECDSA P-256, which is
+        // the object-fetch throughput ceiling once the link is fast. The cert
+        // path is algorithm-generic (`Signer::public_key` returns SPKI for both).
+        let key = Arc::new(
+            Ed25519Signer::generate(key_name.clone()).map_err(|e| EnrollError::Key(e.to_string()))?,
         );
-        let pubkey = ecdsa
+        let pubkey = key
             .public_key()
             .ok_or_else(|| EnrollError::Key("generated key has no public key".into()))?;
 
@@ -333,33 +334,26 @@ impl MobileEngine {
             .unwrap_or_default()
             .as_nanos() as u64;
         let until_ns = now_ns.saturating_add(validity_secs.saturating_mul(1_000_000_000));
-        // Name the self-signed cert EXACTLY the key name — the same convention as
-        // `SecurityManager::issue_self_signed` / `KeyChain`. `sign_with_sync`
-        // writes `key_name` as the Data KeyLocator, so the cert must be named
-        // `key_name` for a verifier to resolve it; a `/self/v=0` suffix left the
-        // chain unresolved → Pending (see the ndn-boltffi verified-fetch witness).
+        // The self-signed cert is named EXACTLY the key name (KeyChain convention)
+        // so a verifier resolving the Data's KeyLocator finds it.
         let cert_name = key_name.clone();
         let cert_wire =
-            ndn_security::encode_cert_data(&cert_name, &pubkey, ecdsa.as_ref(), now_ns, until_ns)
+            ndn_security::encode_cert_data(&cert_name, &pubkey, key.as_ref(), now_ns, until_ns)
                 .await
                 .map_err(|e| EnrollError::Cert(e.to_string()))?;
 
-        let stamped = Arc::new(
-            EcdsaP256Signer::from_pkcs8_der(
-                &ecdsa
-                    .to_pkcs8_der()
-                    .map_err(|e| EnrollError::Key(e.to_string()))?,
-                key_name.clone(),
-            )
-            .map_err(|e| EnrollError::Key(e.to_string()))?
-            .with_cert_name(cert_name.clone()),
+        let pkcs8 = key.to_pkcs8_der().map_err(|e| EnrollError::Key(e.to_string()))?;
+        let stamped: Arc<dyn Signer> = Arc::new(
+            Ed25519Signer::from_pkcs8_der(&pkcs8, key_name.clone())
+                .map_err(|e| EnrollError::Key(e.to_string()))?
+                .with_cert_name(cert_name.clone()),
         );
         Ok(EnrolledIdentity {
-            signer: stamped.clone(),
+            signer: stamped,
             key_name,
             cert_name,
             certificate: Some(cert_wire),
-            exportable: Some(stamped),
+            exportable: Some(pkcs8),
         })
     }
 
@@ -508,12 +502,13 @@ pub async fn enroll_token_conn(
         .with_cert_name(cert_name.clone()),
     );
 
+    let exportable = stamped.to_pkcs8_der().map_err(|e| EnrollError::Key(e.to_string()))?;
     Ok(EnrolledIdentity {
-        signer: stamped.clone(),
+        signer: stamped,
         key_name,
         cert_name,
         certificate,
-        exportable: Some(stamped),
+        exportable: Some(exportable),
     })
 }
 
