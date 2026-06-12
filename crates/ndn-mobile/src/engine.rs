@@ -707,24 +707,26 @@ impl MobileEngineBuilder {
             // `Unsupported` on `target_os = "android"`, so use the SQLite backend
             // there. Desktop/iOS keep fjall. Either satisfies `content_store`.
             #[cfg(all(feature = "sqlite-cs", target_os = "android"))]
-            let cs: Arc<dyn ndn_store::ErasedContentStore> = Arc::new(
-                ndn_store::SqliteCs::open(path, max_bytes).map_err(|e| {
-                    anyhow::anyhow!("failed to open SQLite CS at {}: {e}", path.display())
-                })?,
-            );
+            let opened = ndn_store::SqliteCs::open(path, max_bytes)
+                .map(|cs| Arc::new(cs) as Arc<dyn ndn_store::ErasedContentStore>);
             #[cfg(all(feature = "sqlite-cs", not(feature = "fjall"), not(target_os = "android")))]
-            let cs: Arc<dyn ndn_store::ErasedContentStore> = Arc::new(
-                ndn_store::SqliteCs::open(path, max_bytes).map_err(|e| {
-                    anyhow::anyhow!("failed to open SQLite CS at {}: {e}", path.display())
-                })?,
-            );
+            let opened = ndn_store::SqliteCs::open(path, max_bytes)
+                .map(|cs| Arc::new(cs) as Arc<dyn ndn_store::ErasedContentStore>);
             #[cfg(all(feature = "fjall", not(all(feature = "sqlite-cs", target_os = "android"))))]
-            let cs: Arc<dyn ndn_store::ErasedContentStore> = Arc::new(
-                ndn_store::FjallCs::open(path, max_bytes).map_err(|e| {
-                    anyhow::anyhow!("failed to open persistent CS at {}: {e}", path.display())
-                })?,
-            );
-            builder = builder.content_store(cs);
+            let opened = ndn_store::FjallCs::open(path, max_bytes)
+                .map(|cs| Arc::new(cs) as Arc<dyn ndn_store::ErasedContentStore>);
+            // The persistent CS is a cache, not storage: if it can't open — e.g. a
+            // stale engine process from a prior run still holds the file lock across
+            // a restart — fall back to the in-memory CS rather than failing the whole
+            // node (which is what dropped offers when two engines raced cs.sqlite).
+            match opened {
+                Ok(cs) => builder = builder.content_store(cs),
+                Err(e) => tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "persistent CS unavailable; falling back to in-memory CS"
+                ),
+            }
         }
 
         // Reserve the multicast face ID so resume() can recreate it without
