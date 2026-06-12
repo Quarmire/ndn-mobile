@@ -1269,15 +1269,10 @@ impl MobileEngine {
         let Some(id) = face_id else { return };
         let cost = self.link_profile.cost(kind);
         self.engine.fib().add_nexthop(prefix, id, cost);
-        // If a bulk-transfer face (Wi-Fi Direct, cost 8 — cheaper than any
-        // coordination radio) is already up to this peer, leave its single-best
-        // `MeasuredStrategy` (installed by `attach_udp_bulk_face`) ALONE. This
-        // helper runs on every discovery beacon (~every 150 ms); re-installing
-        // the fan-out strategy here mid-transfer both clobbers the bulk route —
-        // fanning ~8 KB Data Interests back over BLE, flooding it — and churns
-        // the strategy object, resetting its measurement state and starving the
-        // tail of a large transfer. Discovery only needs the fan when there is
-        // NO bulk face yet (the offer-board fetch over coordination radios).
+        // Don't clobber an active bulk route. This runs on every discovery beacon
+        // (~150 ms); once a bulk face (cost <= Wi-Fi Direct's 8) is up, keep its
+        // single-best MeasuredStrategy — re-fanning mid-transfer resets its state
+        // and floods BLE with bulk Data. Fan only before a bulk face exists.
         let wd_cost = self.link_profile.cost(FaceKind::WifiDirect);
         let has_bulk_face = self
             .engine
@@ -1288,15 +1283,10 @@ impl MobileEngine {
             tracing::debug!(%prefix, ?kind, "peer route: bulk face up — keeping single-best strategy (no fan clobber)");
             return;
         }
-        // Fan over EVERY coordination radio for this peer (NAN + BLE + multicast),
-        // not just the single measured-best face. The coordination radios are
-        // individually flaky — NAN drops on a Wi-Fi switch, multicast is lossy,
-        // BLE is slow — so a single-best route fails entirely whenever its one
-        // chosen face stops delivering, which is exactly what stalls offer-board
-        // fetches (the offer Interest egresses on one face and never arrives).
-        // Multicast gives redundancy: at least one radio carries the small
-        // discovery/offer Interests through. The per-face `cost` still orders the
-        // FIB (cheapest radio first).
+        // Fan over every coordination radio (NAN + BLE + multicast): each is flaky
+        // (NAN drops on a Wi-Fi switch, multicast lossy, BLE slow), so a single-best
+        // route black-holes when its one face stops delivering — what stalls the
+        // offer fetch. The per-face `cost` still orders the FIB cheapest-first.
         self.engine.strategy_table().insert(
             prefix,
             Arc::new(ndn_strategy::MulticastStrategy::new())
