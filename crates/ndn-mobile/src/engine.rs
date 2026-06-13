@@ -1271,15 +1271,16 @@ impl MobileEngine {
         let cost = self.link_profile.cost(kind);
         self.engine.fib().add_nexthop(prefix, id, cost);
         // Don't clobber an active bulk route. This runs on every discovery beacon
-        // (~150 ms); once a bulk face (cost <= Wi-Fi Direct's 8) is up, keep its
-        // single-best MeasuredStrategy — re-fanning mid-transfer resets its state
-        // and floods BLE with bulk Data. Fan only before a bulk face exists.
-        let wd_cost = self.link_profile.cost(FaceKind::WifiDirect);
+        // (~150 ms); once a bulk face is up — any unicast link cheaper than the
+        // coordination radios: Wi-Fi Direct, NDP, or the same-AP infra tunnel —
+        // keep its single-best MeasuredStrategy. Re-fanning mid-transfer resets
+        // its state and floods the coordination radios with bulk Data.
+        let coordination_cost = self.link_profile.cost(FaceKind::WifiAware);
         let has_bulk_face = self
             .engine
             .fib()
             .lpm(prefix)
-            .is_some_and(|e| e.nexthops.iter().any(|nh| nh.cost <= wd_cost));
+            .is_some_and(|e| e.nexthops.iter().any(|nh| nh.cost < coordination_cost));
         if has_bulk_face {
             tracing::debug!(%prefix, ?kind, "peer route: bulk face up — keeping single-best strategy (no fan clobber)");
             return;
@@ -1339,6 +1340,37 @@ impl MobileEngine {
         peer: SocketAddr,
     ) -> std::io::Result<FaceId> {
         self.attach_udp_bulk_face(prefix, fd, peer, FaceKind::WifiDirect, "Wi-Fi Direct")
+    }
+
+    /// Bind a local UDP socket and adopt it as a transitional **same-network**
+    /// bulk face to a peer's AP-assigned `peer` address, routing `prefix` over it.
+    /// Unlike [`Self::attach_ndp_face`] / [`Self::attach_wifi_direct_face`] there
+    /// is no platform handshake — both devices already share Wi-Fi infrastructure,
+    /// so the engine binds the socket itself. Tagged [`FaceKind::InfraTunnel`] (a
+    /// non-blessed fallback, cost 12) so a cost-aware strategy prefers it over the
+    /// connectionless radios but below the blessed NDP / Wi-Fi Direct links. Off
+    /// by default — the caller opts in once it learns the peer's address from
+    /// discovery. Takes ownership of the bound socket. Returns the new face id.
+    #[cfg(unix)]
+    pub fn attach_infra_tunnel_face(
+        &self,
+        prefix: &Name,
+        local: SocketAddr,
+        peer: SocketAddr,
+    ) -> std::io::Result<FaceId> {
+        use std::os::fd::IntoRawFd;
+        let sock = std::net::UdpSocket::bind(local)?;
+        tracing::warn!(
+            %prefix, %local, %peer,
+            "attaching InfraTunnel face — transitional same-AP unicast fallback, not a blessed native face"
+        );
+        self.attach_udp_bulk_face(
+            prefix,
+            sock.into_raw_fd(),
+            peer,
+            FaceKind::InfraTunnel,
+            "infra tunnel (same-AP fallback)",
+        )
     }
 
     /// Shared body for the fd-adopting unicast bulk faces (NDP, Wi-Fi Direct):
