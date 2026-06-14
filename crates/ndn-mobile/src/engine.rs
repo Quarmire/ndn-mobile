@@ -1447,8 +1447,13 @@ impl MobileEngine {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     _ = tick.tick() => {
-                        if socket.send_to(&[0u8], peer).await.is_err() {
-                            break; // socket gone (link dropped) — stop the keepalive
+                        match socket.send_to(&[0u8], peer).await {
+                            Ok(_) => tracing::debug!(%peer, "bulk face keepalive sent"),
+                            Err(e) => {
+                                // socket gone (link dropped) — stop the keepalive
+                                tracing::warn!(%peer, error = %e, "bulk face keepalive failed; stopping");
+                                break;
+                            }
                         }
                     }
                 }
