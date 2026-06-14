@@ -1270,31 +1270,23 @@ impl MobileEngine {
         let Some(id) = face_id else { return };
         let cost = self.link_profile.cost(kind);
         self.engine.fib().add_nexthop(prefix, id, cost);
-        // Don't clobber an active bulk route. This runs on every discovery beacon
-        // (~150 ms); once a bulk face is up — any unicast link cheaper than the
-        // coordination radios: Wi-Fi Direct, NDP, or the same-AP infra tunnel —
-        // keep its single-best MeasuredStrategy. Re-fanning mid-transfer resets
-        // its state and floods the coordination radios with bulk Data.
-        let coordination_cost = self.link_profile.cost(FaceKind::WifiAware);
-        let has_bulk_face = self
-            .engine
-            .fib()
-            .lpm(prefix)
-            .is_some_and(|e| e.nexthops.iter().any(|nh| nh.cost < coordination_cost));
-        if has_bulk_face {
-            tracing::debug!(%prefix, ?kind, "peer route: bulk face up — keeping single-best strategy (no fan clobber)");
-            return;
-        }
-        // Fan over every coordination radio (NAN + BLE + multicast): each is flaky
-        // (NAN drops on a Wi-Fi switch, multicast lossy, BLE slow), so a single-best
-        // route black-holes when its one face stops delivering — what stalls the
-        // offer fetch. The per-face `cost` still orders the FIB cheapest-first.
+        // Fan over EVERY nexthop to this peer (coordination radios + any bulk
+        // face). A single-best strategy black-holes the moment its one chosen face
+        // stops delivering — which silently broke offer fetches when the same-AP
+        // InfraTunnel was picked but its packets weren't reaching the peer. The
+        // radios are individually flaky too (NAN drops on a Wi-Fi switch, BLE is
+        // lossy), so redundancy is what makes the small control/offer Interests
+        // arrive. A working InfraTunnel still delivers first (lowest RTT), so bulk
+        // rides it when it's healthy; the cost ordering remains the prior.
+        //
+        // NOTE: fanning bulk Data over BLE is wasteful (a follow-up should keep the
+        // fan for control and pin bulk to the unicast face once it's proven live).
         self.engine.strategy_table().insert(
             prefix,
             Arc::new(ndn_strategy::MulticastStrategy::new())
                 as Arc<dyn ndn_strategy::ErasedStrategy>,
         );
-        tracing::debug!(%prefix, ?kind, cost, "fan-out peer route installed (multicast over coordination radios)");
+        tracing::debug!(%prefix, ?kind, cost, "fan-out peer route installed (all faces to peer)");
     }
 
     /// Adopt an app-established **NAN NDP** (Network Data Path) UDP socket as a
