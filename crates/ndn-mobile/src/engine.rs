@@ -273,6 +273,13 @@ pub struct MobileEngine {
     /// called. Drive it from the native tun pump via [`MobileEngine::tun_handle`].
     #[cfg(feature = "tun")]
     tun_handle: Option<Arc<TunHandle>>,
+    /// Prefixes served by a live unicast bulk face (NDP / Wi-Fi Direct /
+    /// InfraTunnel) → that face's id. While present, `note_peer_route` refreshes
+    /// the radio nexthops as fallback but does NOT re-install `MulticastStrategy`
+    /// (the discovery radios are never bulk). Cleared on detach, reverting the
+    /// prefix to fan-out. This stops the per-beacon clobber that re-fanned bulk
+    /// over NAN/BLE right after a bulk face attached.
+    bulk_pinned: Arc<std::sync::Mutex<std::collections::HashMap<Name, FaceId>>>,
 }
 
 /// Mobile-tuned defaults: 8 MB CS, single pipeline thread, full chain validation.
@@ -1064,6 +1071,7 @@ impl MobileEngineBuilder {
                 ble: None,
                 #[cfg(feature = "tun")]
                 tun_handle,
+                bulk_pinned: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             },
             app_handle,
         ))
@@ -1269,24 +1277,35 @@ impl MobileEngine {
         };
         let Some(id) = face_id else { return };
         let cost = self.link_profile.cost(kind);
+        // Always (re)install the radio nexthop: beacons refresh it, and it is the
+        // fallback if the unicast bulk face dies.
         self.engine.fib().add_nexthop(prefix, id, cost);
-        // Fan over EVERY nexthop to this peer (coordination radios + any bulk
-        // face). A single-best strategy black-holes the moment its one chosen face
-        // stops delivering — which silently broke offer fetches when the same-AP
-        // InfraTunnel was picked but its packets weren't reaching the peer. The
-        // radios are individually flaky too (NAN drops on a Wi-Fi switch, BLE is
-        // lossy), so redundancy is what makes the small control/offer Interests
-        // arrive. A working InfraTunnel still delivers first (lowest RTT), so bulk
-        // rides it when it's healthy; the cost ordering remains the prior.
-        //
-        // NOTE: fanning bulk Data over BLE is wasteful (a follow-up should keep the
-        // fan for control and pin bulk to the unicast face once it's proven live).
+
+        // If a live unicast bulk face (NDP / Wi-Fi Direct / InfraTunnel) is pinned
+        // for this prefix, LEAVE its strategy in place (MeasuredStrategy, which
+        // prefers the unicast link). Re-installing MulticastStrategy here would
+        // re-fan bulk Data over the discovery-only radios — NAN follow-ups
+        // (tiny/lossy, HAL-queue-wedging) and BLE adv (basic-rate) — which carry
+        // discovery + small control ONLY. This clobber-on-every-beacon was the
+        // nondeterminism: a beacon after the bulk attach flipped the prefix back to
+        // a radio fan and the fetch timed out. detach clears the pin → fan-out.
+        if self.bulk_pinned.lock().unwrap().contains_key(prefix) {
+            tracing::debug!(
+                %prefix, ?kind, cost,
+                "radio nexthop refreshed as fallback (bulk pinned to unicast; strategy intact)"
+            );
+            return;
+        }
+
+        // No bulk face yet (first contact / radios only): fan each not-locally-
+        // served Interest over every nexthop so small control/offer Interests
+        // survive any single flaky radio.
         self.engine.strategy_table().insert(
             prefix,
             Arc::new(ndn_strategy::MulticastStrategy::new())
                 as Arc<dyn ndn_strategy::ErasedStrategy>,
         );
-        tracing::debug!(%prefix, ?kind, cost, "fan-out peer route installed (all faces to peer)");
+        tracing::debug!(%prefix, ?kind, cost, "fan-out peer route installed (radios only; no bulk pin)");
     }
 
     /// Adopt an app-established **NAN NDP** (Network Data Path) UDP socket as a
@@ -1427,6 +1446,9 @@ impl MobileEngine {
             prefix,
             Arc::new(MeasuredStrategy::new()) as Arc<dyn ndn_strategy::ErasedStrategy>,
         );
+        // Pin: a later discovery beacon must not flip this prefix back to a radio
+        // fan (see note_peer_route) — the discovery radios are never bulk.
+        self.bulk_pinned.lock().unwrap().insert(prefix.clone(), face_id);
         // Keepalive: a tiny datagram every 20s keeps the data path warm (and, on
         // NAN, prevents idle-teardown). The peer decodes it as a malformed packet
         // and drops it harmlessly. Bound to the network cancel token.
@@ -1491,6 +1513,25 @@ impl MobileEngine {
     #[cfg(unix)]
     pub fn detach_ndp_face(&self, face_id: u64) {
         self.engine.remove_face(FaceId(face_id));
+        // Drop the bulk pin for any prefix this face served and revert it to
+        // fan-out, so small control/offer Interests still reach the peer over the
+        // radios until a bulk face is re-attached.
+        let mut reverted = Vec::new();
+        self.bulk_pinned.lock().unwrap().retain(|prefix, fid| {
+            if *fid == FaceId(face_id) {
+                reverted.push(prefix.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for prefix in reverted {
+            self.engine.strategy_table().insert(
+                &prefix,
+                Arc::new(ndn_strategy::MulticastStrategy::new())
+                    as Arc<dyn ndn_strategy::ErasedStrategy>,
+            );
+        }
         tracing::info!(face_id, "NDP bulk face detached (Wi-Fi Aware data path lost)");
     }
 
