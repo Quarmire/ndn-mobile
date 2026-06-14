@@ -1373,6 +1373,28 @@ impl MobileEngine {
         )
     }
 
+    /// Adopt a **Wi-Fi-network-bound** UDP socket (created by the platform with
+    /// `Network.bindSocket`, so it egresses Wi-Fi regardless of the default
+    /// network) as the same-AP [`FaceKind::InfraTunnel`] bulk face to `peer`.
+    /// This is the Android path — unlike [`Self::attach_infra_tunnel_face`], which
+    /// binds in Rust and so can't set the per-network fwmark Android routing needs.
+    /// Takes ownership of `fd`. Returns the new face id.
+    #[cfg(unix)]
+    pub fn attach_infra_tunnel_fd(
+        &self,
+        prefix: &Name,
+        fd: std::os::fd::RawFd,
+        peer: SocketAddr,
+    ) -> std::io::Result<FaceId> {
+        self.attach_udp_bulk_face(
+            prefix,
+            fd,
+            peer,
+            FaceKind::InfraTunnel,
+            "infra tunnel (same-AP fallback)",
+        )
+    }
+
     /// Shared body for the fd-adopting unicast bulk faces (NDP, Wi-Fi Direct):
     /// adopt the socket, tag it `kind`, route `prefix` at the kind's cost under a
     /// [`MeasuredStrategy`], and run a keepalive. `label` only colours the log.
