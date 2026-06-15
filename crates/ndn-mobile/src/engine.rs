@@ -1435,6 +1435,7 @@ impl MobileEngine {
                 size,
                 chunk,
                 signer,
+                crate::object_relay::DEFAULT_LOOKAHEAD,
                 cancel,
             );
         }));

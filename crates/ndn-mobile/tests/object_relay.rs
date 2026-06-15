@@ -77,8 +77,16 @@ impl Transport for MemoryLink {
 /// installs *true* persistence (one Interest → many Data); a real deployment
 /// swaps in a trust schema. (Same rationale as the tun datapath witness.)
 async fn build_engine() -> ForwarderEngine {
+    build_engine_cs(64 * 1024 * 1024).await
+}
+
+/// As [`build_engine`] but with an explicit CS capacity, to force the
+/// object-larger-than-CS case the demand-paced relay must survive.
+async fn build_engine_cs(cs_bytes: usize) -> ForwarderEngine {
     let validator = Arc::new(Validator::new(TrustSchema::accept_all()));
-    let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+    let mut config = EngineConfig::default();
+    config.cs_capacity_bytes = cs_bytes;
+    let (engine, shutdown) = EngineBuilder::new(config)
         .validator(validator)
         .build()
         .await
@@ -139,6 +147,7 @@ async fn relay_serves_node_signed_object_streamed_from_a_keyless_leaf() {
         size,
         8192,
         node_signer,
+        512,
         cancel.child_token(),
     );
 
@@ -159,6 +168,82 @@ async fn relay_serves_node_signed_object_streamed_from_a_keyless_leaf() {
         payload.as_slice(),
         "relayed + node-signed object reassembles to the leaf's content"
     );
+
+    std::mem::forget((engine_a, engine_b));
+    cancel.cancel();
+}
+
+/// Demand-pacing witness: an object **much larger than the node CS** still
+/// completes. The relay keeps only `lookahead` segments ahead of the consumer's
+/// demand front, so it never races ahead and evicts a not-yet-fetched segment
+/// (which, before pacing, stalled big-file transfers at 0 segments received).
+#[tokio::test]
+async fn relay_streams_object_larger_than_cs_without_stalling() {
+    let cancel = CancellationToken::new();
+
+    let node_kc = KeyChain::ephemeral("/ndn/node/test").expect("node keychain");
+    let node_signer = node_kc.signer().expect("node signer");
+
+    let engine_a = build_engine().await; // leaf: full CS, holds its own copy
+    // Node CS holds ~128 segments (1 MiB) — far smaller than the 300-segment
+    // (~2.4 MB) object, so without pacing the relay races ahead and evicts a
+    // not-yet-fetched segment (the big-file stall). The CS must still exceed the
+    // consumer window (≤48) + the relay lookahead (32 below), the invariant the
+    // demand-paced relay relies on.
+    let engine_b = build_engine_cs(1024 * 1024).await;
+
+    let link_a_id = engine_a.faces().alloc_id();
+    let link_b_id = engine_b.faces().alloc_id();
+    let (link_a, link_b) = MemoryLink::pair(link_a_id, link_b_id, 256);
+    engine_a.add_face(link_a, cancel.child_token());
+    engine_b.add_face(link_b, cancel.child_token());
+
+    let internal: Name = "/localhost/leaf/content/big".parse().unwrap();
+    let public: Name = "/ndn/node/test/file/big".parse().unwrap();
+    engine_b.fib().add_nexthop(&internal, link_b_id, 0);
+
+    // 300 segments at 8 KiB ≈ 2.4 MB ≫ the 512 KiB node CS.
+    let payload: Vec<u8> = (0..(300u32 * 8192)).map(|i| (i & 0xff) as u8).collect();
+    let size = payload.len() as u64;
+
+    {
+        let producer = engine_a.register_producer(internal.clone(), cancel.child_token());
+        let prepared = Arc::new(PreparedObject::build(
+            internal.clone(),
+            Bytes::from(payload.clone()),
+            8192,
+        ));
+        let cancel = cancel.child_token();
+        tokio::spawn(async move {
+            let _ = serve_object_stream(producer, prepared, cancel).await;
+        });
+    }
+
+    // Lookahead 32 ≪ the CS's ~64 segments, so the relay's bounded lead fits.
+    spawn_object_relay(
+        &engine_b,
+        public.clone(),
+        internal.clone(),
+        size,
+        8192,
+        node_signer,
+        32,
+        cancel.child_token(),
+    );
+
+    let consumer: Consumer = engine_b.app_consumer(cancel.child_token());
+    let reassembled = tokio::time::timeout(
+        Duration::from_secs(30),
+        consumer
+            .verifying(node_kc.validator())
+            .fetch_object(public.clone()),
+    )
+    .await
+    .expect("object larger than the CS completed (demand pacing, no eviction stall)")
+    .expect("verified fetch of the large node-signed object");
+
+    assert_eq!(reassembled.len(), payload.len(), "full object reassembled");
+    assert_eq!(reassembled.as_ref(), payload.as_slice());
 
     std::mem::forget((engine_a, engine_b));
     cancel.cancel();
