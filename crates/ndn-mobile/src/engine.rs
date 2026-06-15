@@ -1406,6 +1406,40 @@ impl MobileEngine {
         )
     }
 
+    /// Become the **producer of record** for `public_name`, serving it as a
+    /// node-signed RDR object whose segment content is streamed from a keyless
+    /// source over `source_prefix` (the leaf's internal content prefix — see
+    /// [`ndn_app::serve_object_stream`]). The node key (`signer`) signs each
+    /// segment locally; the leaf never signs and is never on the per-segment
+    /// path. `size`/`chunk` define the RDR metadata. Serving is tied to the
+    /// engine's shutdown token (survives network suspend). This is the producer
+    /// half of "bulk off the seam" — the caller (the offer board) authorizes the
+    /// source's right to publish under `public_name` before calling.
+    pub fn spawn_object_relay(
+        &self,
+        public_name: Name,
+        source_prefix: Name,
+        size: u64,
+        chunk: usize,
+        signer: Arc<dyn ndn_security::Signer>,
+    ) {
+        let engine = self.engine.clone();
+        let cancel = self.shutdown.cancel_token().child_token();
+        // Run on the engine runtime so the relay's spawned serve/stream tasks
+        // have a runtime context.
+        self.engine.runtime().spawn(Box::pin(async move {
+            crate::object_relay::spawn_object_relay(
+                &engine,
+                public_name,
+                source_prefix,
+                size,
+                chunk,
+                signer,
+                cancel,
+            );
+        }));
+    }
+
     /// Shared body for the fd-adopting unicast bulk faces (NDP, Wi-Fi Direct):
     /// adopt the socket, tag it `kind`, route `prefix` at the kind's cost under a
     /// [`MeasuredStrategy`], and run a keepalive. `label` only colours the log.
