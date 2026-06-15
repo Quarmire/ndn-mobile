@@ -24,6 +24,7 @@
 
 pub mod bluetooth;
 pub mod engine;
+pub mod object_relay;
 #[cfg(feature = "enroll")]
 pub mod enroll;
 #[cfg(feature = "tun")]
@@ -31,6 +32,7 @@ pub mod tun;
 
 pub use bluetooth::bluetooth_face_from_parts;
 pub use engine::{MobileEngine, MobileEngineBuilder, MobileStrategy, PeerRef};
+pub use object_relay::spawn_object_relay;
 #[cfg(feature = "enroll")]
 pub use enroll::{EnrollConfig, EnrollError, EnrolledIdentity, PinRequest};
 #[cfg(feature = "tun")]
