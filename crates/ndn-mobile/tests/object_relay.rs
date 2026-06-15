@@ -245,6 +245,22 @@ async fn relay_streams_object_larger_than_cs_without_stalling() {
     assert_eq!(reassembled.len(), payload.len(), "full object reassembled");
     assert_eq!(reassembled.as_ref(), payload.as_slice());
 
+    // Backward re-fetch: a *second* fetch of the same object. The relay's front is
+    // now at the end and the early segments are long evicted from the small CS, so
+    // every segment is a backward miss — each must be one-shot re-fetched from the
+    // leaf and re-served. (Before backward re-fetch this returned 0 segments.)
+    let consumer2: Consumer = engine_b.app_consumer(cancel.child_token());
+    let again = tokio::time::timeout(
+        Duration::from_secs(30),
+        consumer2
+            .verifying(node_kc.validator())
+            .fetch_object(public.clone()),
+    )
+    .await
+    .expect("re-fetch completed (backward re-fetch of evicted segments)")
+    .expect("verified re-fetch of the large object");
+    assert_eq!(again.as_ref(), payload.as_slice(), "re-fetch reassembles");
+
     std::mem::forget((engine_a, engine_b));
     cancel.cancel();
 }
