@@ -266,6 +266,14 @@ async fn run_relay(inp: RelayInputs) {
         lifetime: RELAY_LIFETIME,
         ..SubscribeOptions::default()
     };
+    // Per-step wall-clock accumulators (chasing the ~serial seg/s ceiling on the
+    // produce side): recv = blocked on the leaf's stream over the seam;
+    // sign = node Ed25519 re-sign; insert = CS write; publish = fan to faces.
+    let mut recv_t = Duration::ZERO;
+    let mut sign_t = Duration::ZERO;
+    let mut insert_t = Duration::ZERO;
+    let mut publish_t = Duration::ZERO;
+    let mut produced_count: u64 = 0;
     'resubscribe: loop {
         if cancel.is_cancelled() {
             return;
@@ -290,10 +298,12 @@ async fn run_relay(inp: RelayInputs) {
                     _ = demand.wake.notified() => {}
                 }
             }
+            let recv_t0 = std::time::Instant::now();
             tokio::select! {
                 _ = cancel.cancelled() => return,
                 r = sub.recv() => match r {
                     Ok(data) => {
+                        recv_t += recv_t0.elapsed();
                         let Some(seg) = data
                             .name
                             .components()
@@ -314,6 +324,7 @@ async fn run_relay(inp: RelayInputs) {
                         }
                         let content = data.content().cloned().unwrap_or_default();
                         let name = versioned.clone().append_segment(seg);
+                        let sign_t0 = std::time::Instant::now();
                         let wire = match DataBuilder::new(name.clone(), content.as_ref())
                             .freshness(SEGMENT_FRESHNESS)
                             .sign_with(signer.as_ref())
@@ -322,11 +333,28 @@ async fn run_relay(inp: RelayInputs) {
                             Ok(w) => w,
                             Err(_) => continue,
                         };
+                        sign_t += sign_t0.elapsed();
                         let stale_at = now_ns() + SEGMENT_FRESHNESS.as_nanos() as u64;
+                        let ins_t0 = std::time::Instant::now();
                         cs.insert_erased(wire.clone(), Arc::new(name), CsMeta { stale_at })
                             .await;
+                        insert_t += ins_t0.elapsed();
+                        let pub_t0 = std::time::Instant::now();
                         producer.publish(wire).await.ok();
+                        publish_t += pub_t0.elapsed();
                         produced.store(produced.load(Ordering::Relaxed).max(seg + 1), Ordering::Relaxed);
+                        produced_count += 1;
+                        if produced_count.is_multiple_of(1000) {
+                            tracing::debug!(
+                                target: "ndn_app::fetch",
+                                produced_count,
+                                recv_ms = recv_t.as_millis() as u64,
+                                sign_ms = sign_t.as_millis() as u64,
+                                insert_ms = insert_t.as_millis() as u64,
+                                publish_ms = publish_t.as_millis() as u64,
+                                "relay produce breakdown (recv≫rest ⇒ leaf/seam-bound; else node-produce-bound)"
+                            );
+                        }
                     }
                     Err(_) => continue 'resubscribe,
                 }
