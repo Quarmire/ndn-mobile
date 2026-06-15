@@ -1424,6 +1424,11 @@ impl MobileEngine {
         // socket fd (detached from its Java owner); we adopt it exactly once.
         let std_sock = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
         std_sock.set_nonblocking(true)?;
+        // The platform hands us a default-buffered socket; a bulk fetch's in-flight
+        // window (hundreds of KB) overruns the kernel default and drops segments,
+        // forcing retransmits. Apply the same large SO_RCVBUF/SO_SNDBUF the UdpFace
+        // bind path uses (4 MiB / 1 MiB, kernel-clamped) so the burst fits.
+        ndn_face_native::net::sockopt::tune_datagram_socket(&std_sock, label);
         // Hold the socket as an `Arc` so the keepalive task can share it with the
         // face. (Wi-Fi Aware tears down an *idle* NDP within ~a minute; periodic
         // traffic keeps the data path warm. Wi-Fi Direct does not idle-teardown,
