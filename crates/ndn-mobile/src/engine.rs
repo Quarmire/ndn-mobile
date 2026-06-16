@@ -1009,11 +1009,15 @@ impl MobileEngineBuilder {
                 None => (None, None, false, None, None, true),
             };
 
+            // discovery management module lives in ndn-discovery now; register
+            // it via extra_modules (service discovery is not enabled on mobile).
+            let discovery_modules: Vec<Arc<dyn ndn_mgmt::MgmtModule>> = vec![Arc::new(
+                ndn_discovery::mgmt::DiscoveryMgmtModule::new(discovery_cfg_snapshot),
+            )];
             let handles = ndn_mgmt::MgmtHandles {
-                extra_modules: Vec::new(),
+                extra_modules: discovery_modules,
                 face_provisioners: Vec::new(),
                 control_surfaces: Vec::new(),
-                discovery_cfg: discovery_cfg_snapshot,
                 security_is_ephemeral,
                 command_validator,
                 localhop_command_validator: None,
@@ -1029,15 +1033,7 @@ impl MobileEngineBuilder {
                 approval_handler: None,
                 runtime_policy,
             };
-            let fut = ndn_mgmt::mount_management(
-                &engine,
-                cancel,
-                None,
-                Vec::new(),
-                config,
-                None,
-                handles,
-            );
+            let fut = ndn_mgmt::mount_management(&engine, cancel, config, None, handles);
             tokio::spawn(fut);
 
             // A mobile node is an *intermediate* forwarder: the UI process drives

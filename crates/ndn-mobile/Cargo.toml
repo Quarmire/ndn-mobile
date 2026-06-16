@@ -86,7 +86,7 @@ ndn-face-ble-adv    = { workspace = true, optional = true }
 ndn-observability = { workspace = true, optional = true }
 serde_json      = { workspace = true, optional = true }
 getrandom       = { workspace = true, optional = true }
-ndn-discovery   = { workspace = true, features = ["udp-hello"] }
+ndn-discovery   = { workspace = true, features = ["udp-hello", "mgmt"] }
 ndn-discovery-core = { workspace = true }
 ndn-packet      = { workspace = true, features = ["std"] }
 ndn-security    = { workspace = true }
