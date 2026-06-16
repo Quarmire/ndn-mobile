@@ -1,6 +1,6 @@
 //! NDN face over a Bluetooth byte stream (RFCOMM or L2CAP) using COBS
 //! framing, the same codec as
-//! [`SerialFace`](ndn_face_native::serial::SerialFace).
+//! [`SerialFace`](ndn_face::serial::SerialFace).
 //!
 //! This type does not open the connection. The caller (JNI / Swift FFI)
 //! provides pre-split async halves; LP fragmentation is enabled so NDN
@@ -8,7 +8,7 @@
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use ndn_face_native::serial::cobs::CobsCodec;
+use ndn_face::serial::cobs::CobsCodec;
 use ndn_transport::{FaceId, FaceKind, StreamFace};
 
 pub type BluetoothFace<R, W> = StreamFace<R, W, CobsCodec>;

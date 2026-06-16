@@ -8,9 +8,9 @@ use ndn_app::{Consumer, Producer};
 use ndn_discovery::{DiscoveryConfig, DiscoveryProfile, NeighborProbeProtocol};
 use ndn_discovery_core::DiscoveryProtocol;
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, RoutingProtocol, ShutdownHandle};
-use ndn_face_native::local::{InProcFace, InProcHandle, IpcListener};
-use ndn_face_native::net::{MulticastUdpFace, UdpFace, WebSocketFace, tcp_face_connect};
-use ndn_face_native::serial::serial_face_open;
+use ndn_face::local::{InProcFace, InProcHandle, IpcListener};
+use ndn_face::net::{MulticastUdpFace, UdpFace, WebSocketFace, tcp_face_connect};
+use ndn_face::serial::serial_face_open;
 use ndn_packet::Name;
 use ndn_security::SecurityProfile;
 use ndn_strategy::{BestRouteStrategy, MeasuredStrategy, MulticastStrategy};
@@ -1104,7 +1104,7 @@ impl MobileEngine {
     #[cfg(unix)]
     pub fn mount_app_fd(&self, fd: std::os::fd::RawFd) -> std::io::Result<FaceId> {
         let face_id = self.engine.faces().alloc_id();
-        let face = ndn_face_native::local::ipc_face_from_raw_fd(
+        let face = ndn_face::local::ipc_face_from_raw_fd(
             face_id,
             ndn_transport::FaceKind::App,
             fd,
@@ -1464,7 +1464,7 @@ impl MobileEngine {
         // window (hundreds of KB) overruns the kernel default and drops segments,
         // forcing retransmits. Apply the same large SO_RCVBUF/SO_SNDBUF the UdpFace
         // bind path uses (4 MiB / 1 MiB, kernel-clamped) so the burst fits.
-        ndn_face_native::net::sockopt::tune_datagram_socket(&std_sock, label);
+        ndn_face::net::sockopt::tune_datagram_socket(&std_sock, label);
         // Hold the socket as an `Arc` so the keepalive task can share it with the
         // face. (Wi-Fi Aware tears down an *idle* NDP within ~a minute; periodic
         // traffic keeps the data path warm. Wi-Fi Direct does not idle-teardown,

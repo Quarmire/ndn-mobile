@@ -40,7 +40,7 @@ pub use tun::{IpFlow, TunConfig, TunHandle, parse_ip_flow, spawn_tunnel};
 
 pub use ndn_app::{AppError, Consumer, Producer};
 pub use ndn_discovery::DiscoveryProfile;
-pub use ndn_face_native::local::InProcHandle;
+pub use ndn_face::local::InProcHandle;
 /// Re-exported for [`MobileEngineBuilder::with_wifi_aware`].
 #[cfg(feature = "wifi-aware")]
 pub use ndn_face_wifi_aware::{NanBackend, NanServiceName};
