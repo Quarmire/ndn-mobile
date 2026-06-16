@@ -28,7 +28,7 @@ sqlite-cs = ["ndn-store/sqlite-cs"]
 ## NFD-compatible management dispatcher (`/localhost/nfd/<module>/<verb>`).
 ## Required for `MobileEngineBuilder::with_management()`. Off by default to
 ## keep the minimal mobile build lean; the VPN/dashboard UI enables it.
-management = ["dep:ndn-mgmt", "dep:ndn-config"]
+management = ["dep:ndn-mgmt", "dep:ndn-config", "ndn-config/mgmt"]
 ## In-process named-function compute (`ComputeFace` + `ComputeRegistry`).
 ## Required for `MobileEngineBuilder::with_compute()`. The sandboxed
 ## wasmtime/JIT executor is NOT pulled in (forbidden on iOS): only native
