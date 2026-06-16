@@ -1010,6 +1010,7 @@ impl MobileEngineBuilder {
 
             let handles = ndn_mgmt::MgmtHandles {
                 extra_modules: Vec::new(),
+                face_provisioners: Vec::new(),
                 discovery_cfg: discovery_cfg_snapshot,
                 security_is_ephemeral,
                 command_validator,
