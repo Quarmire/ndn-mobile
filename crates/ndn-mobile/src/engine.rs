@@ -10,7 +10,7 @@ use ndn_discovery_core::DiscoveryProtocol;
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, RoutingProtocol, ShutdownHandle};
 use ndn_face::local::{InProcFace, InProcHandle, IpcListener};
 use ndn_face::net::{MulticastUdpFace, UdpFace, WebSocketFace, tcp_face_connect};
-use ndn_face::serial::serial_face_open;
+use ndn_face_serial::serial_face_open;
 use ndn_packet::Name;
 use ndn_security::SecurityProfile;
 use ndn_strategy::{BestRouteStrategy, MeasuredStrategy, MulticastStrategy};

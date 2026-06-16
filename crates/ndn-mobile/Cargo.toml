@@ -92,7 +92,8 @@ ndn-packet      = { workspace = true, features = ["std"] }
 ndn-security    = { workspace = true }
 ndn-store       = { workspace = true }
 ndn-transport   = { workspace = true }
-ndn-face     = { workspace = true, features = ["serial"] }
+ndn-face     = { workspace = true }
+ndn-face-serial = { workspace = true }
 ndn-mgmt        = { workspace = true, optional = true }
 ndn-config      = { workspace = true, optional = true }
 # wasm-exec (wasmtime/JIT) is opt-in on ndn-compute and stays off here — iOS forbids JIT.
