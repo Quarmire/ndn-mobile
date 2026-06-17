@@ -36,10 +36,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use ndn_app::{Connection, Consumer, EngineAppExt};
 use ndn_cert::EnrollmentSession;
-use ndn_custodian::{Custodian, CustodianSigner, KeyId};
+use ndn_security::custodian::{Custodian, CustodianSigner, KeyId};
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Name, SignatureType};
-use ndn_safebag::SafeBag;
+use ndn_security::safebag::SafeBag;
 use ndn_security::{EcdsaP256Signer, Ed25519Signer, Signer};
 
 use crate::engine::MobileEngine;
@@ -109,7 +109,7 @@ impl EnrolledIdentity {
     /// Wrap an already-certified **custodian-held** key (e.g. an enclave key
     /// loaded at startup with its stored certificate) as an enrolled identity.
     /// `signer` must route through the custodian (a
-    /// [`CustodianSigner`](ndn_custodian::CustodianSigner)). Not SafeBag-exportable.
+    /// [`CustodianSigner`](ndn_security::custodian::CustodianSigner)). Not SafeBag-exportable.
     pub fn from_custodian(
         signer: Arc<dyn Signer>,
         key_name: Name,
@@ -551,7 +551,7 @@ pub async fn enroll_token_custodian_conn(
 
 impl MobileEngine {
     /// Run NDNCERT 0.3 enrollment for `cfg.identity` using a key held by a
-    /// [`Custodian`](ndn_custodian::Custodian) — the device enclave (StrongBox /
+    /// [`Custodian`](ndn_security::custodian::Custodian) — the device enclave (StrongBox /
     /// Secure Enclave) or a remote fob. The custodian must already hold the key
     /// under `key_id` with the given ECDSA-P256 `public_key`. The private key
     /// never leaves the custodian — every enrollment signature is produced inside
@@ -760,7 +760,7 @@ impl MobileEngine {
         password: &[u8],
         key_name: impl Into<Name>,
     ) -> Result<Arc<dyn Signer>, EnrollError> {
-        use ndn_safebag::SafeBagAlgorithm;
+        use ndn_security::safebag::SafeBagAlgorithm;
         use ndn_security::Ed25519Signer;
 
         let key_name = key_name.into();
