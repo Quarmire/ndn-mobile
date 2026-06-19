@@ -21,73 +21,34 @@ name = "ndn-rs"
 
 [workspace.dependencies]
 # NDN workspace crates — grouped by subdirectory layer
-ndn-foundation-types = { path = "../ndn-rs/crates/core/ndn-foundation-types", default-features = false }
-ndn-tlv       = { path = "../ndn-rs/crates/core/ndn-tlv",       default-features = false }
-ndn-packet    = { path = "../ndn-rs/crates/core/ndn-packet",    default-features = false }
-ndn-fwd-core  = { path = "../ndn-rs/crates/forwarding/ndn-fwd-core",  default-features = false }
-ndn-crypto-core = { path = "../ndn-rs/crates/core/ndn-crypto-core" }
-ndn-sealed-box  = { path = "../ndn-ext/crates/compute/ndn-sealed-box" }
-ndn-signals-core = { path = "../ndn-rs/crates/core/ndn-signals-core", default-features = false }
-ndn-ble-framing = { path = "../ndn-rs/crates/core/ndn-ble-framing" }
-ndn-mgmt-wire = { path = "../ndn-rs/crates/core/ndn-mgmt-wire" }
-ndn-transport = { path = "../ndn-rs/crates/core/ndn-transport" }
-ndn-store     = { path = "../ndn-rs/crates/forwarding/ndn-store" }
-ndn-runtime   = { path = "../ndn-rs/crates/core/ndn-runtime" }
-ndn-pib-idb   = { path = "../ndn-fwd/crates/ndn-pib-idb" }
-ndn-trust-envelope = { path = "../ndn-ext/crates/onboarding/ndn-trust-envelope" }
-ndn-face-local        = { path = "../ndn-rs/crates/faces/ndn-face-local" }
-ndn-face             = { path = "../ndn-rs/crates/faces/ndn-face" }
-ndn-face-serial      = { path = "../ndn-ext/crates/faces/ndn-face-serial" }
-ndn-face-websocket   = { path = "../ndn-ext/crates/faces/ndn-face-websocket" }
-ndn-face-shm         = { path = "../ndn-ext/crates/faces/ndn-face-shm" }
-ndn-face-bluetooth   = { path = "../ndn-ext/crates/faces/ndn-face-bluetooth" }
-ndn-face-afxdp       = { path = "../ndn-ext/crates/faces/ndn-face-afxdp" }
-ndn-face-webtransport = { path = "../ndn-ext/crates/faces/ndn-face-webtransport" }
-ndn-face-quic         = { path = "../ndn-ext/crates/faces/ndn-face-quic" }
-ndn-face-webtransport-wasm = { path = "../ndn-ext/crates/faces/ndn-face-webtransport-wasm" }
-ndn-face-webrtc       = { path = "../ndn-ext/crates/faces/ndn-face-webrtc" }
-ndn-face-shared-worker = { path = "../ndn-ext/crates/faces/ndn-face-shared-worker" }
-ndn-face-webble       = { path = "../ndn-ext/crates/faces/ndn-face-webble" }
-ndn-face-ble-adv      = { path = "../ndn-ext/crates/faces/ndn-face-ble-adv" }
-ndn-face-wifi-aware   = { path = "../ndn-ext/crates/faces/ndn-face-wifi-aware" }
-ndn-frame-io          = { path = "../ndn-rs/crates/core/ndn-frame-io" }
-ndn-face-monitor-wifi = { path = "../ndn-ext/crates/faces/ndn-face-monitor-wifi" }
-ndn-pipes             = { path = "../ndn-ext/crates/pipes/ndn-pipes" }
-ndn-rtc-signaling-relay = { path = "../ndn-ext/crates/faces/ndn-rtc-signaling-relay" }
-ndn-acme              = { path = "../ndn-fwd/crates/ndn-acme" }
-ndn-strategy  = { path = "../ndn-rs/crates/forwarding/ndn-strategy" }
-ndn-security  = { path = "../ndn-rs/crates/security/ndn-security" }
-ndn-engine    = { path = "../ndn-rs/crates/forwarding/ndn-engine" }
-ndn-app       = { path = "../ndn-rs/crates/app/ndn-app" }
-ndn-rs-prelude = { path = "../ndn-rs/crates/app/ndn-rs-prelude" }
-ndn-web-attach = { path = "../ndn-ext/crates/bindings/ndn-web-attach" }
-ndn-ipc       = { path = "../ndn-rs/crates/forwarding/ndn-ipc" }
-ndn-ipc-shm   = { path = "../ndn-ext/crates/faces/ndn-ipc-shm" }
-ndn-config    = { path = "../ndn-rs/crates/platform/ndn-config" }
-ndn-dashboard-core = { path = "../ndn-ext/crates/dashboard/ndn-dashboard-core", default-features = false }
-ndn-discovery = { path = "../ndn-ext/crates/discovery/ndn-discovery",     default-features = false }
-ndn-discovery-core = { path = "../ndn-rs/crates/forwarding/ndn-discovery-core" }
-ndn-discovery-broadcast = { path = "../ndn-ext/crates/discovery/ndn-discovery-broadcast" }
-ndn-routing    = { path = "../ndn-ext/crates/routing/ndn-routing" }
-ndn-sync      = { path = "../ndn-rs/crates/protocols/ndn-sync" }
-ndn-repo      = { path = "../ndn-repo/crates/ndn-repo" }
-ndn-repo-cluster = { path = "../ndn-repo/crates/ndn-repo-cluster" }
-ndn-cert     = { path = "../ndn-rs/crates/security/ndn-cert" }
-ndn-identity = { path = "../ndn-rs/crates/security/ndn-identity" }
-ndn-mgmt     = { path = "../ndn-rs/crates/forwarding/ndn-mgmt" }
-ndn-observability = { path = "../ndn-rs/crates/platform/ndn-observability" }
-ndn-sim       = { path = "../ndn-sim/crates/ndn-sim" }
-ndn-wasm      = { path = "../ndn-ext/crates/bindings/ndn-wasm" }
-ndn-strategy-wasm = { path = "../ndn-ext/crates/strategies/ndn-strategy-wasm" }
-ndn-compute   = { path = "../ndn-ext/crates/compute/ndn-compute" }
-ndn-coding    = { path = "../ndn-ext/crates/coding/ndn-coding" }
-ndn-radio-cognition = { path = "../ndn-ext/crates/faces/ndn-radio-cognition" }
-ndn-signal-sources = { path = "../ndn-ext/crates/faces/ndn-signal-sources" }
-ndn-strategy-cclf = { path = "../ndn-ext/crates/strategies/ndn-strategy-cclf", default-features = false }
-ndn-ratelimit = { path = "../ndn-ext/crates/ratelimit/ndn-ratelimit" }
-ndn-embedded  = { path = "../ndn-embedded/crates/ndn-embedded" }
+ndn-packet    = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1", default-features = false }
+ndn-transport = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
+ndn-store     = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
+ndn-trust-envelope = { git = "https://github.com/Quarmire/ndn-ext", tag = "v0.1.0-alpha.1" }
+ndn-face             = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
+ndn-face-serial      = { git = "https://github.com/Quarmire/ndn-ext", tag = "v0.1.0-alpha.1" }
+ndn-face-websocket   = { git = "https://github.com/Quarmire/ndn-ext", tag = "v0.1.0-alpha.1" }
+ndn-face-webtransport = { git = "https://github.com/Quarmire/ndn-ext", tag = "v0.1.0-alpha.1" }
+ndn-face-ble-adv      = { git = "https://github.com/Quarmire/ndn-ext", tag = "v0.1.0-alpha.1" }
+ndn-face-wifi-aware   = { git = "https://github.com/Quarmire/ndn-ext", tag = "v0.1.0-alpha.1" }
+ndn-strategy  = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
+ndn-security  = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
+ndn-engine    = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
+ndn-app       = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
+ndn-ipc       = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
+ndn-config    = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
+ndn-dashboard-core = { git = "https://github.com/Quarmire/ndn-ext", tag = "v0.1.0-alpha.1", default-features = false }
+ndn-discovery = { git = "https://github.com/Quarmire/ndn-ext", tag = "v0.1.0-alpha.1", default-features = false }
+ndn-discovery-core = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
+ndn-cert     = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
+ndn-identity = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
+ndn-mgmt     = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
+ndn-observability = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.1" }
+ndn-compute   = { git = "https://github.com/Quarmire/ndn-ext", tag = "v0.1.0-alpha.1" }
+ndn-coding    = { git = "https://github.com/Quarmire/ndn-ext", tag = "v0.1.0-alpha.1" }
+ndn-strategy-cclf = { git = "https://github.com/Quarmire/ndn-ext", tag = "v0.1.0-alpha.1", default-features = false }
+ndn-ratelimit = { git = "https://github.com/Quarmire/ndn-ext", tag = "v0.1.0-alpha.1" }
 ndn-mobile    = { path = "crates/ndn-mobile" }
-ndn-tools-core = { path = "../ndn-fwd/crates/tooling/ndn-tools-core" }
 
 # Core async runtime — individual crates enable only the features they need
 tokio      = { version = "1", default-features = false }
