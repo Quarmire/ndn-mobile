@@ -17,6 +17,14 @@ name = "ndn_boltffi"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
+## Operator identity is on by default: this is the native-only (`#![cfg(unix)]`)
+## Android/iOS FFI surface, and every mobile target uses enrollment/signing. It
+## must be a default because boltffi's `#[export]` macro generates FFI shims
+## that reference the identity methods/types without propagating their
+## per-method `#[cfg(feature = "identity")]`, so an identity-off build fails to
+## resolve them. wasm/no-default builds were already incompatible with these
+## native deps and are unaffected.
+default = ["identity"]
 ## Enable the persistent on-disk content store (backed by fjall).
 ## Required to use `NdnEngineConfig.persistent_cs_path`. Desktop/iOS backend.
 fjall = ["ndn-mobile/fjall"]
