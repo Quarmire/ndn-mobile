@@ -78,11 +78,11 @@ ndn-sim       = { path = "../ndn-sim/crates/ndn-sim" }
 ndn-wasm      = { path = "../ndn-ext/crates/bindings/ndn-wasm" }
 ndn-strategy-wasm = { path = "../ndn-ext/crates/strategies/ndn-strategy-wasm" }
 ndn-compute   = { path = "../ndn-ext/crates/compute/ndn-compute" }
-ndn-coding    = { path = "../ndn-rs/crates/protocols/ndn-coding" }
+ndn-coding    = { path = "../ndn-ext/crates/coding/ndn-coding" }
 ndn-radio-cognition = { path = "../ndn-ext/crates/faces/ndn-radio-cognition" }
 ndn-signal-sources = { path = "../ndn-ext/crates/faces/ndn-signal-sources" }
 ndn-strategy-cclf = { path = "../ndn-ext/crates/strategies/ndn-strategy-cclf", default-features = false }
-ndn-ratelimit = { path = "../ndn-rs/crates/forwarding/ndn-ratelimit" }
+ndn-ratelimit = { path = "../ndn-ext/crates/ratelimit/ndn-ratelimit" }
 ndn-embedded  = { path = "../ndn-embedded/crates/ndn-embedded" }
 ndn-mobile    = { path = "crates/ndn-mobile" }
 ndn-tools-core = { path = "../ndn-fwd/crates/tooling/ndn-tools-core" }
