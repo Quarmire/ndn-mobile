@@ -1,10 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/ndn-boltffi",
     "crates/ndn-mobile",
     "examples/ripple-peer",
 ]
 default-members = [
+    "crates/ndn-boltffi",
     "examples/ripple-peer",
 ]
 
@@ -62,7 +64,7 @@ ndn-web-attach = { path = "../ndn-ext/crates/bindings/ndn-web-attach" }
 ndn-ipc       = { path = "../ndn-rs/crates/forwarding/ndn-ipc" }
 ndn-ipc-shm   = { path = "../ndn-ext/crates/faces/ndn-ipc-shm" }
 ndn-config    = { path = "../ndn-rs/crates/platform/ndn-config" }
-ndn-dashboard-core = { path = "../ndn-fwd/crates/tooling/ndn-dashboard-core", default-features = false }
+ndn-dashboard-core = { path = "../ndn-ext/crates/dashboard/ndn-dashboard-core", default-features = false }
 ndn-discovery = { path = "../ndn-ext/crates/discovery/ndn-discovery",     default-features = false }
 ndn-discovery-core = { path = "../ndn-rs/crates/forwarding/ndn-discovery-core" }
 ndn-discovery-broadcast = { path = "../ndn-ext/crates/discovery/ndn-discovery-broadcast" }

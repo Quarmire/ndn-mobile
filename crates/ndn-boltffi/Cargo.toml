@@ -1,0 +1,87 @@
+[package]
+name = "ndn-boltffi"
+description = "BoltFFI bindings for ndn-rs — Android (Kotlin/JVM) and iOS/iPadOS (Swift)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "extension"
+
+[lib]
+name = "ndn_boltffi"
+# staticlib → XCFramework for iOS
+# cdylib    → .so for Android (JNI) and the wasm module
+# rlib      → lets the `boltffi generate` type-resolution runner `use` this
+#             crate as a normal Rust dependency, and `cargo test` work
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+## Enable the persistent on-disk content store (backed by fjall).
+## Required to use `NdnEngineConfig.persistent_cs_path`. Desktop/iOS backend.
+fjall = ["ndn-mobile/fjall"]
+## Persistent CS backed by bundled SQLite — the Android backend (fjall's
+## directory lock is unsupported on `target_os = "android"`). Also satisfies
+## `NdnEngineConfig.persistent_cs_path`. The android pack enables this instead
+## of `fjall`.
+sqlite-cs = ["ndn-mobile/sqlite-cs"]
+## Mount NFD-compatible management on the engine so a client can register
+## prefixes and drive `/localhost/nfd/...` over a face — required for the
+## VpnService / Network-Extension split, where the UI process speaks NDN
+## (incl. management) to the engine over the socketpair seam. Native-only.
+management = ["ndn-mobile/management"]
+## Operator identity + signing on the engine (`load_identity` / `sign`, NDNCERT
+## enrollment, and the RemoteSigner responder). Native-only — pulls
+## ndn-cert/ndn-safebag (not wasm-safe).
+identity = ["ndn-mobile/enroll", "ndn-security/custodian", "dep:ndn-identity", "dep:getrandom", "dep:async-trait", "dep:ndn-config"]
+## Operator console (`NdnDashboard`): poll a forwarder's management plane for
+## faces / routes / CS / strategies / status. Native-only — pulls
+## ndn-dashboard-core (not wasm-safe).
+dashboard = ["dep:ndn-dashboard-core", "dep:ndn-config", "dep:async-trait"]
+## Wi-Fi Aware (NAN) coordination face — the AP-independent peer-Wi-Fi bearer
+## (the real AirDrop transport). The radio lives behind a Kotlin-implemented
+## `NdnNanBackend` (Android `WifiAwareManager` via JNI); native-only.
+wifi-aware = ["ndn-mobile/wifi-aware", "dep:ndn-face-wifi-aware", "dep:async-trait"]
+## Connectionless BLE advertising face — the widest-support named-radio face
+## (BLE is near-universal). The radio lives behind a Kotlin-implemented
+## `NdnBleBackend` (Android BluetoothLeAdvertiser/Scanner via JNI); native-only.
+ble = ["ndn-mobile/ble", "dep:ndn-face-ble-adv", "dep:async-trait"]
+
+[dependencies]
+ndn-mobile      = { workspace = true }
+ndn-app         = { workspace = true }
+ndn-face       = { workspace = true }
+ndn-packet      = { workspace = true, features = ["std"] }
+ndn-security    = { workspace = true, features = ["custodian"] }
+ndn-trust-envelope = { workspace = true }
+ndn-identity    = { workspace = true, optional = true }
+getrandom       = { workspace = true, optional = true }
+# Operator console (`dashboard` feature): headless DashboardEngine + view-models.
+ndn-dashboard-core = { workspace = true, optional = true }
+ndn-config      = { workspace = true, optional = true }
+async-trait     = { workspace = true, optional = true }
+# Wi-Fi Aware (NAN) coordination face (`wifi-aware` feature).
+ndn-face-wifi-aware = { workspace = true, optional = true }
+# BLE advertising face (`ble` feature).
+ndn-face-ble-adv = { workspace = true, optional = true }
+# Remote backend (NdnClient): a bare client over a forwarder connection fd.
+ndn-ipc         = { workspace = true }
+tokio           = { workspace = true, features = ["rt-multi-thread"] }
+bytes           = { workspace = true, features = ["std"] }
+thiserror       = { workspace = true }
+tracing         = { workspace = true }
+boltffi         = "0.25"
+
+# Android: route the engine's `tracing` events to logcat so on-device face/dial/
+# drop diagnostics are visible. boltffi is the platform entry point on mobile —
+# no Rust binary owns the subscriber — so it installs one (once, android-only).
+[target.'cfg(target_os = "android")'.dependencies]
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
+paranoid-android   = "0.2"
+
+[dev-dependencies]
+# Host tests can opt into the engine's tracing via RUST_LOG.
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
+
+[build-dependencies]
+boltffi = "0.25"
