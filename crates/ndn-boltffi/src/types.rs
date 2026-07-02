@@ -308,6 +308,9 @@ impl NdnError {
             AppError::Unverified(why) => NdnError::Engine {
                 msg: format!("verification failed: {why}"),
             },
+            AppError::Unsupported(why) => NdnError::Engine {
+                msg: format!("unsupported: {why}"),
+            },
         }
     }
 
