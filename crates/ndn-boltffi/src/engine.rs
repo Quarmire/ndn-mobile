@@ -37,8 +37,13 @@ pub struct NdnEngine {
     pub(crate) rt: Arc<Runtime>,
     /// Primary handle from `builder.build()`; consumed by the first `fetch`.
     default_handle: Mutex<Option<InProcHandle>>,
-    /// Lazily-built shared consumer for `fetch` / `get` (serialized).
-    consumer: Mutex<Option<Consumer>>,
+    /// Shared consumer connection — one lazily-opened in-proc app face that
+    /// every consumer verb (`fetch` / `get` / `fetch_object*`) runs over. The
+    /// `ObjectFetch` builder consumes its `Consumer`, so consumers are per-call
+    /// wrappers over this one connection; holding this lock across each
+    /// blocking fetch keeps the verbs serialized, exactly as the pre-builder
+    /// shared-`Consumer` slot did (see [`Self::with_consumer`]).
+    consumer_conn: Mutex<Option<Arc<dyn Connection>>>,
     /// Identity + signing + trust-context state, run over an in-proc connection
     /// to this engine's own embedded forwarder. The shared core that both
     /// `NdnEngine` and `NdnClient` delegate identity operations to.
@@ -107,7 +112,7 @@ impl NdnEngine {
             inner: Mutex::new(Some(mobile_engine)),
             rt,
             default_handle: Mutex::new(Some(default_handle)),
-            consumer: Mutex::new(None),
+            consumer_conn: Mutex::new(None),
             identity_core,
             #[cfg(feature = "wifi-aware")]
             nan_seam: Mutex::new(None),
@@ -153,13 +158,7 @@ impl NdnEngine {
     /// app face — issue them from a background thread.
     pub fn fetch(&self, name: String) -> Result<NdnData, NdnError> {
         let parsed: Name = name.parse().map_err(|_| NdnError::invalid_name(&name))?;
-        let mut guard = self.consumer.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(Consumer::from_handle(self.take_consumer_handle()?));
-        }
-        let consumer = guard.as_mut().unwrap();
-        self.rt
-            .block_on(consumer.fetch(parsed))
+        self.with_consumer(|mut consumer| self.rt.block_on(consumer.fetch(parsed)))?
             .map(NdnData::from_packet)
             .map_err(|e| NdnError::from_app(e, &name))
     }
@@ -167,13 +166,7 @@ impl NdnEngine {
     /// Like [`Self::fetch`] but returns just the `Content` bytes.
     pub fn get(&self, name: String) -> Result<Vec<u8>, NdnError> {
         let parsed: Name = name.parse().map_err(|_| NdnError::invalid_name(&name))?;
-        let mut guard = self.consumer.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(Consumer::from_handle(self.take_consumer_handle()?));
-        }
-        let consumer = guard.as_mut().unwrap();
-        self.rt
-            .block_on(consumer.get(parsed))
+        self.with_consumer(|mut consumer| self.rt.block_on(consumer.get(parsed)))?
             .map(|b| b.to_vec())
             .map_err(|e| NdnError::from_app(e, &name))
     }
@@ -184,13 +177,7 @@ impl NdnEngine {
     /// run on a worker thread; serialized through the one shared consumer.
     pub fn fetch_object(&self, name: String) -> Result<Vec<u8>, NdnError> {
         let parsed: Name = name.parse().map_err(|_| NdnError::invalid_name(&name))?;
-        let mut guard = self.consumer.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(Consumer::from_handle(self.take_consumer_handle()?));
-        }
-        let consumer = guard.as_mut().unwrap();
-        self.rt
-            .block_on(consumer.fetch_object(parsed))
+        self.with_consumer(|mut consumer| self.rt.block_on(consumer.fetch_object(parsed)))?
             .map(|b| b.to_vec())
             .map_err(|e| NdnError::from_app(e, &name))
     }
@@ -202,15 +189,12 @@ impl NdnEngine {
     pub fn fetch_object_verified(&self, name: String) -> Result<Vec<u8>, NdnError> {
         let parsed: Name = name.parse().map_err(|_| NdnError::invalid_name(&name))?;
         let validator = std::sync::Arc::new(self.identity_core.build_validator());
-        let mut guard = self.consumer.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(Consumer::from_handle(self.take_consumer_handle()?));
-        }
-        let consumer = guard.as_mut().unwrap();
-        self.rt
-            .block_on(consumer.fetch_object_verified(parsed, validator))
-            .map(|b| b.to_vec())
-            .map_err(|e| NdnError::from_app(e, &name))
+        self.with_consumer(|consumer| {
+            self.rt
+                .block_on(consumer.object(parsed).verify(validator).fetch())
+        })?
+        .map(|b| b.to_vec())
+        .map_err(|e| NdnError::from_app(e, &name))
     }
 
     /// Verified bulk fetch that **streams to a descriptor, engine-side**. The
@@ -235,25 +219,23 @@ impl NdnEngine {
         let validator = std::sync::Arc::new(self.identity_core.build_validator());
         // SAFETY: caller detached ownership of a writable fd; we adopt it once.
         let file = unsafe { std::fs::File::from_raw_fd(fd) };
-        let mut guard = self.consumer.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(Consumer::from_handle(self.take_consumer_handle()?));
-        }
-        let consumer = guard.as_mut().unwrap();
-        self.fetch_received.store(0, Ordering::Relaxed);
-        self.fetch_total.store(0, Ordering::Relaxed);
         let received = Arc::clone(&self.fetch_received);
         let total = Arc::clone(&self.fetch_total);
-        let result = self.rt.block_on(consumer.fetch_object_to_file_hinted_progress(
-            parsed,
-            validator,
-            &[hint_name],
-            &file,
-            move |r, t| {
-                total.store(t, Ordering::Relaxed);
-                received.store(r, Ordering::Relaxed);
-            },
-        ));
+        let result = self.with_consumer(|consumer| {
+            self.fetch_received.store(0, Ordering::Relaxed);
+            self.fetch_total.store(0, Ordering::Relaxed);
+            self.rt.block_on(
+                consumer
+                    .object(parsed)
+                    .verify(validator)
+                    .hint([hint_name])
+                    .progress(move |r, t| {
+                        total.store(t, Ordering::Relaxed);
+                        received.store(r, Ordering::Relaxed);
+                    })
+                    .to_file(&file),
+            )
+        })?;
         tracing::debug!(
             target: "ndn_boltffi::engine",
             %name, %hint,
@@ -523,15 +505,17 @@ impl NdnEngine {
         let parsed: Name = name.parse().map_err(|_| NdnError::invalid_name(&name))?;
         let hint_name: Name = hint.parse().map_err(|_| NdnError::invalid_name(&hint))?;
         let validator = std::sync::Arc::new(self.identity_core.build_validator());
-        let mut guard = self.consumer.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(Consumer::new(self.identity_core.demux.clone() as Arc<dyn Connection>));
-        }
-        let consumer = guard.as_mut().unwrap();
-        self.rt
-            .block_on(consumer.fetch_object_verified_hinted(parsed, validator, &[hint_name]))
-            .map(|b| b.to_vec())
-            .map_err(|e| NdnError::from_app(e, &name))
+        self.with_consumer(|consumer| {
+            self.rt.block_on(
+                consumer
+                    .object(parsed)
+                    .verify(validator)
+                    .hint([hint_name])
+                    .fetch(),
+            )
+        })?
+        .map(|b| b.to_vec())
+        .map_err(|e| NdnError::from_app(e, &name))
     }
 
     // ── Tap-to-share offer board ────────────────────────────────────────────
@@ -1341,6 +1325,23 @@ impl NdnEngine {
                 self.infra_peers.lock().unwrap().remove(id);
             }
         }
+    }
+
+    /// Lock the shared consumer connection — opened over the primary in-proc
+    /// handle on first use — and hand `run` a fresh [`Consumer`] over it. The
+    /// lock is held across `run`, so the blocking consumer verbs stay
+    /// serialized; the connection (one app face) is shared, while the
+    /// `Consumer` wrapper is per-call because the `ObjectFetch` builder
+    /// consumes its consumer.
+    fn with_consumer<T>(&self, run: impl FnOnce(Consumer) -> T) -> Result<T, NdnError> {
+        let mut guard = self.consumer_conn.lock().unwrap();
+        if guard.is_none() {
+            let conn: Arc<dyn Connection> =
+                Arc::new(InProcConnection::new(self.take_consumer_handle()?));
+            *guard = Some(conn);
+        }
+        let consumer = Consumer::new(Arc::clone(guard.as_ref().unwrap()));
+        Ok(run(consumer))
     }
 
     /// First call returns the primary handle; later calls allocate fresh ones.

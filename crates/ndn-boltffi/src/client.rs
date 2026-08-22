@@ -161,13 +161,19 @@ impl NdnClient {
     pub fn fetch_object_verified(&self, name: String) -> Result<Vec<u8>, NdnError> {
         let parsed: Name = name.parse().map_err(|_| NdnError::invalid_name(&name))?;
         let validator = std::sync::Arc::new(self.identity_core.build_validator());
+        // The `ObjectFetch` builder consumes its `Consumer`: take the shared one
+        // (holding the lock across the fetch keeps calls serialized) and refill
+        // the slot with an equivalent — same demux, same congestion strategy.
         let mut guard = self.consumer.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(Consumer::new(self.identity_core.demux.clone() as Arc<dyn Connection>));
-        }
-        let consumer = guard.as_mut().unwrap();
-        self.rt
-            .block_on(consumer.fetch_object_verified(parsed, validator))
+        let consumer = guard.take().unwrap_or_else(|| {
+            Consumer::new(self.identity_core.demux.clone() as Arc<dyn Connection>)
+        });
+        let strategy = consumer.congestion_strategy();
+        let result = self
+            .rt
+            .block_on(consumer.object(parsed).verify(validator).fetch());
+        *guard = Some(self.demux_consumer(strategy));
+        result
             .map(|b| b.to_vec())
             .map_err(|e| NdnError::from_app(e, &name))
     }
@@ -239,27 +245,29 @@ impl NdnClient {
         let parsed: Name = name.parse().map_err(|_| NdnError::invalid_name(&name))?;
         let hint_name: Name = hint.parse().map_err(|_| NdnError::invalid_name(&hint))?;
         let validator = std::sync::Arc::new(self.identity_core.build_validator());
+        let strategy = *self.cc_strategy.lock().unwrap();
+        // Builder-consumed per-fetch consumer (see `fetch_object_verified`); the
+        // strategy is applied fresh from `cc_strategy`, as the pre-builder code
+        // did, and the shared slot is left carrying it.
         let mut guard = self.consumer.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(Consumer::new(self.identity_core.demux.clone() as Arc<dyn Connection>));
-        }
-        let consumer = guard.as_mut().unwrap();
-        consumer.set_congestion_strategy(*self.cc_strategy.lock().unwrap());
         use std::sync::atomic::Ordering;
         self.fetch_received.store(0, Ordering::Relaxed);
         self.fetch_total.store(0, Ordering::Relaxed);
         let received = Arc::clone(&self.fetch_received);
         let total = Arc::clone(&self.fetch_total);
-        self.rt
-            .block_on(consumer.fetch_object_verified_hinted_progress(
-                parsed,
-                validator,
-                &[hint_name],
-                move |r, t| {
+        let result = self.rt.block_on(
+            self.demux_consumer(strategy)
+                .object(parsed)
+                .verify(validator)
+                .hint([hint_name])
+                .progress(move |r, t| {
                     total.store(t, Ordering::Relaxed);
                     received.store(r, Ordering::Relaxed);
-                },
-            ))
+                })
+                .fetch(),
+        );
+        *guard = Some(self.demux_consumer(strategy));
+        result
             .map(|b| b.to_vec())
             .map_err(|e| NdnError::from_app(e, &name))
     }
@@ -299,29 +307,27 @@ impl NdnClient {
         let validator = std::sync::Arc::new(self.identity_core.build_validator());
         // SAFETY: caller detached ownership of a writable fd; we adopt it once.
         let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let strategy = *self.cc_strategy.lock().unwrap();
+        // Builder-consumed per-fetch consumer (see `fetch_object_verified`).
         let mut guard = self.consumer.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(Consumer::new(self.identity_core.demux.clone() as Arc<dyn Connection>));
-        }
-        let consumer = guard.as_mut().unwrap();
-        consumer.set_congestion_strategy(*self.cc_strategy.lock().unwrap());
         use std::sync::atomic::Ordering;
         self.fetch_received.store(0, Ordering::Relaxed);
         self.fetch_total.store(0, Ordering::Relaxed);
         let received = Arc::clone(&self.fetch_received);
         let total = Arc::clone(&self.fetch_total);
-        self.rt
-            .block_on(consumer.fetch_object_to_file_hinted_progress(
-                parsed,
-                validator,
-                &[hint_name],
-                &file,
-                move |r, t| {
+        let result = self.rt.block_on(
+            self.demux_consumer(strategy)
+                .object(parsed)
+                .verify(validator)
+                .hint([hint_name])
+                .progress(move |r, t| {
                     total.store(t, Ordering::Relaxed);
                     received.store(r, Ordering::Relaxed);
-                },
-            ))
-            .map_err(|e| NdnError::from_app(e, &name))
+                })
+                .to_file(&file),
+        );
+        *guard = Some(self.demux_consumer(strategy));
+        result.map_err(|e| NdnError::from_app(e, &name))
     }
 
     // ── Tap-to-share offer board ────────────────────────────────────────────
@@ -729,5 +735,16 @@ impl NdnClient {
     /// How many scoped-signing grants are live right now.
     pub fn active_signing_scopes(&self) -> u32 {
         self.identity_core.active_signing_scopes()
+    }
+}
+
+// Non-exported helpers (kept out of the `#[export]` block).
+impl NdnClient {
+    /// A `Consumer` over the shared demux with `strategy` applied. The
+    /// `ObjectFetch` builder consumes its `Consumer`, so the builder call sites
+    /// make one per fetch and refill the shared slot with an equivalent one.
+    fn demux_consumer(&self, strategy: ndn_app::CongestionStrategy) -> Consumer {
+        Consumer::new(self.identity_core.demux.clone() as Arc<dyn Connection>)
+            .with_congestion_strategy(strategy)
     }
 }
