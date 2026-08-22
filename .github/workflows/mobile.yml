@@ -22,9 +22,9 @@ jobs:
       - uses: actions/checkout@v4
         with: { path: ndn-mobile }
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: 445736a2dd8597be0e09b36a31abd15b21e673e3, path: ndn-rs } # pinned sibling; bump deliberately
+        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: 2f0d8cf5733fbcd5fcbecc66a38c4cbe9887e385, path: ndn-rs } # pinned sibling; bump deliberately
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-ext", ref: f979cb8d638fb79af6019f3583e42b12d087e3e8, path: ndn-ext } # pinned sibling; bump deliberately
+        with: { repository: "${{ github.repository_owner }}/ndn-ext", ref: c3a26aa755a5fce10bad3c391b22cc59f1326ad1, path: ndn-ext } # pinned sibling; bump deliberately
       - uses: dtolnay/rust-toolchain@stable
         with: { targets: aarch64-apple-ios }
       - uses: Swatinem/rust-cache@v2
@@ -40,9 +40,9 @@ jobs:
       - uses: actions/checkout@v4
         with: { path: ndn-mobile }
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: 445736a2dd8597be0e09b36a31abd15b21e673e3, path: ndn-rs } # pinned sibling; bump deliberately
+        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: 2f0d8cf5733fbcd5fcbecc66a38c4cbe9887e385, path: ndn-rs } # pinned sibling; bump deliberately
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/ndn-ext", ref: f979cb8d638fb79af6019f3583e42b12d087e3e8, path: ndn-ext } # pinned sibling; bump deliberately
+        with: { repository: "${{ github.repository_owner }}/ndn-ext", ref: c3a26aa755a5fce10bad3c391b22cc59f1326ad1, path: ndn-ext } # pinned sibling; bump deliberately
       - uses: dtolnay/rust-toolchain@stable
         with: { targets: aarch64-linux-android }
       - uses: Swatinem/rust-cache@v2
