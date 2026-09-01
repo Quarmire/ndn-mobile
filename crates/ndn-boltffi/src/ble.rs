@@ -19,7 +19,7 @@
 //!   neither returnable nor passable across exports).
 //!
 //! [`NdnEngine::attach_ble`](crate::NdnEngine::attach_ble) wires a
-//! [`BleAdvFace`](ndn_face_ble_adv::BleAdvFace) over this seam into the running
+//! [`BleAdvFace`](ndn_phy_ble::BleAdvFace) over this seam into the running
 //! engine and stores the [`BleSeam`] that receive method feeds.
 
 use boltffi::export;
@@ -35,7 +35,7 @@ pub trait NdnBleBackend: Send + Sync {
     fn broadcast(&self, frame: Vec<u8>);
 }
 
-// The adapter half needs the `ndn-face-ble-adv` face types, so it is gated on the
+// The adapter half needs the `ndn-phy-ble` face types, so it is gated on the
 // feature. The `NdnBleBackend` trait above carries only primitives and is always
 // compiled, so `attach_ble`'s signature (and its boltffi callback binding) exist
 // in every build — its body no-ops when the feature is off.
@@ -45,7 +45,7 @@ use std::sync::Arc;
 #[cfg(feature = "ble")]
 use bytes::Bytes;
 #[cfg(feature = "ble")]
-use ndn_face_ble_adv::{AdvBackend, FaceError, ScannedFrame};
+use ndn_phy_ble::{AdvBackend, FaceError, ScannedFrame};
 #[cfg(feature = "ble")]
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 

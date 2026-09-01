@@ -235,7 +235,7 @@ pub(crate) fn into_security_profile(p: NdnSecurityProfile) -> ndn_security::Secu
 /// These are the **self-contained** faces (no platform backend needed).
 /// Backend-requiring radio faces — **Wi-Fi Aware** (NAN) and **BLE advertising**
 /// — attach a platform radio backend (Android JNI: an
-/// `ndn_face_wifi_aware::NanBackend` / `ndn_face_ble_adv::AdvBackend`); they ride
+/// `ndn_face_wifi_aware::NanBackend` / `ndn_phy_ble::AdvBackend`); they ride
 /// a separate FFI backend-trait seam (cf. `NdnEnclaveBackend`) and land once that
 /// JNI glue exists. Named-radio / Ethernet-multicast are further faces on the
 /// same model. See the face roadmap.

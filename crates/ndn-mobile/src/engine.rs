@@ -269,7 +269,7 @@ pub struct MobileEngine {
     /// BLE advertising face (stable id + platform backend), rebuilt on resume.
     /// `None` unless `attach_ble`.
     #[cfg(feature = "ble")]
-    ble: Option<(FaceId, Arc<dyn ndn_face_ble_adv::AdvBackend>)>,
+    ble: Option<(FaceId, Arc<dyn ndn_phy_ble::AdvBackend>)>,
     /// Platform side of the VPN datapath face; `None` unless `with_tun` was
     /// called. Drive it from the native tun pump via [`MobileEngine::tun_handle`].
     #[cfg(feature = "tun")]
@@ -1195,7 +1195,7 @@ impl MobileEngine {
         #[cfg(feature = "ble")]
         if let Some((id, backend)) = &self.ble {
             self.engine.add_face(
-                ndn_face_ble_adv::BleAdvFace::new(*id, Arc::clone(backend)),
+                ndn_phy_ble::BleAdvFace::new(*id, Arc::clone(backend)),
                 self.network_cancel.child_token(),
             );
             tracing::debug!(face_id = %id, "BLE advertising face resumed");
@@ -1641,7 +1641,7 @@ impl MobileEngine {
     }
 
     /// Attach a connectionless **BLE advertising** face at runtime over a
-    /// platform-supplied [`AdvBackend`](ndn_face_ble_adv::AdvBackend), returning
+    /// platform-supplied [`AdvBackend`](ndn_phy_ble::AdvBackend), returning
     /// its stable face id. BLE is near-universal, so this is the widest-support
     /// named-radio face — the complement to Wi-Fi Aware (use both at once; they
     /// fill each other's gaps). Like [`Self::attach_wifi_aware`], the radio is
@@ -1650,13 +1650,13 @@ impl MobileEngine {
     /// and routes the default prefix so not-locally-served Interests advertise
     /// out. A second call replaces the backend and re-adds under the same id.
     #[cfg(feature = "ble")]
-    pub fn attach_ble(&mut self, backend: Arc<dyn ndn_face_ble_adv::AdvBackend>) -> FaceId {
+    pub fn attach_ble(&mut self, backend: Arc<dyn ndn_phy_ble::AdvBackend>) -> FaceId {
         let id = match &self.ble {
             Some((id, _)) => *id,
             None => self.engine.faces().alloc_id(),
         };
         self.engine.add_face(
-            ndn_face_ble_adv::BleAdvFace::new(id, Arc::clone(&backend)),
+            ndn_phy_ble::BleAdvFace::new(id, Arc::clone(&backend)),
             self.network_cancel.child_token(),
         );
         self.engine.fib().add_nexthop(&Name::root(), id, 0);
@@ -1793,7 +1793,7 @@ mod cost_route_tests {
     async fn note_peer_route_installs_cost_aware_routes() {
         let (mut engine, _h) = MobileEngine::builder().build().await.unwrap();
         let nan = ndn_face_wifi_aware::LoopbackNanBus::new();
-        let ble = ndn_face_ble_adv::LoopbackAdvBus::new();
+        let ble = ndn_phy_ble::LoopbackAdvBus::new();
         engine.attach_wifi_aware(Arc::new(nan.endpoint(1, [0u8; 6], -50)));
         engine.attach_ble(Arc::new(ble.endpoint(1, [0u8; 6], -60)));
 

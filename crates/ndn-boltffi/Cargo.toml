@@ -53,7 +53,7 @@ wifi-aware = ["ndn-mobile/wifi-aware", "dep:ndn-face-wifi-aware", "dep:async-tra
 ## Connectionless BLE advertising face — the widest-support named-radio face
 ## (BLE is near-universal). The radio lives behind a Kotlin-implemented
 ## `NdnBleBackend` (Android BluetoothLeAdvertiser/Scanner via JNI); native-only.
-ble = ["ndn-mobile/ble", "dep:ndn-face-ble-adv", "dep:async-trait"]
+ble = ["ndn-mobile/ble", "dep:ndn-phy-ble", "dep:async-trait"]
 
 [dependencies]
 ndn-mobile      = { workspace = true }
@@ -71,7 +71,7 @@ async-trait     = { workspace = true, optional = true }
 # Wi-Fi Aware (NAN) coordination face (`wifi-aware` feature).
 ndn-face-wifi-aware = { workspace = true, optional = true }
 # BLE advertising face (`ble` feature).
-ndn-face-ble-adv = { workspace = true, optional = true }
+ndn-phy-ble = { workspace = true, optional = true }
 # Remote backend (NdnClient): a bare client over a forwarder connection fd.
 ndn-ipc         = { workspace = true }
 tokio           = { workspace = true, features = ["rt-multi-thread"] }

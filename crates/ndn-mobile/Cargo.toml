@@ -70,7 +70,7 @@ wifi-aware = ["dep:ndn-face-wifi-aware"]
 ## Connectionless BLE **advertising** face (`attach_ble`) — the widest-support
 ## named-radio bearer (BLE is near-universal). The platform supplies the
 ## `AdvBackend` (Android BluetoothLeAdvertiser/Scanner via JNI).
-ble = ["dep:ndn-face-ble-adv"]
+ble = ["dep:ndn-phy-ble"]
 
 [dependencies]
 ndn-engine      = { workspace = true }
@@ -80,7 +80,7 @@ ndn-strategy-cclf = { workspace = true, optional = true, features = ["native"] }
 ndn-cert        = { workspace = true, optional = true }
 ndn-face-webtransport = { workspace = true, optional = true }
 ndn-face-wifi-aware = { workspace = true, optional = true }
-ndn-face-ble-adv    = { workspace = true, optional = true }
+ndn-phy-ble    = { workspace = true, optional = true }
 ndn-observability = { workspace = true, optional = true }
 serde_json      = { workspace = true, optional = true }
 getrandom       = { workspace = true, optional = true }

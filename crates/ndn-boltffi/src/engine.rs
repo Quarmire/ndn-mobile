@@ -373,7 +373,7 @@ impl NdnEngine {
     ) -> Result<bool, NdnError> {
         #[cfg(feature = "ble")]
         {
-            use ndn_face_ble_adv::AdvBackend;
+            use ndn_phy_ble::AdvBackend;
             let (ffi, seam) = crate::ble::make_seam(backend);
             let mut guard = self.inner.lock().unwrap();
             let engine = guard

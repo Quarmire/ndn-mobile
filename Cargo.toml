@@ -29,7 +29,7 @@ ndn-face             = { path = "../ndn-rs/crates/faces/ndn-face" }
 ndn-face-serial      = { path = "../ndn-ext/crates/faces/ndn-face-serial" }
 ndn-face-websocket   = { path = "../ndn-ext/crates/faces/ndn-face-websocket" }
 ndn-face-webtransport = { path = "../ndn-ext/crates/faces/ndn-face-webtransport" }
-ndn-face-ble-adv      = { path = "../ndn-ext/crates/faces/ndn-face-ble-adv" }
+ndn-phy-ble           = { path = "../ndn-radio/crates/faces/ndn-phy-ble" }
 ndn-face-wifi-aware   = { path = "../ndn-ext/crates/faces/ndn-face-wifi-aware" }
 ndn-strategy  = { path = "../ndn-rs/crates/forwarding/ndn-strategy" }
 ndn-security  = { path = "../ndn-rs/crates/security/ndn-security" }
@@ -45,7 +45,7 @@ ndn-identity = { path = "../ndn-rs/crates/security/ndn-identity" }
 ndn-mgmt     = { path = "../ndn-rs/crates/forwarding/ndn-mgmt" }
 ndn-observability = { path = "../ndn-rs/crates/platform/ndn-observability" }
 ndn-compute   = { path = "../ndn-ext/crates/compute/ndn-compute" }
-ndn-coding    = { path = "../ndn-ext/crates/coding/ndn-coding" }
+ndn-coding    = { path = "../ndn-radio/crates/coding/ndn-coding" }
 ndn-strategy-cclf = { path = "../ndn-ext/crates/strategies/ndn-strategy-cclf", default-features = false }
 ndn-ratelimit = { path = "../ndn-ext/crates/ratelimit/ndn-ratelimit" }
 ndn-mobile    = { path = "crates/ndn-mobile" }
