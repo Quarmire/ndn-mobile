@@ -45,7 +45,7 @@ ndn-identity = { path = "../ndn-rs/crates/security/ndn-identity" }
 ndn-mgmt     = { path = "../ndn-rs/crates/forwarding/ndn-mgmt" }
 ndn-observability = { path = "../ndn-rs/crates/platform/ndn-observability" }
 ndn-compute   = { path = "../ndn-ext/crates/compute/ndn-compute" }
-ndn-coding    = { path = "../ndn-radio/crates/coding/ndn-coding" }
+ndn-coding    = { path = "../ndn-radio/crates/coding/ndn-coding", features = ["endpoint", "mgmt"] }
 ndn-strategy-cclf = { path = "../ndn-ext/crates/strategies/ndn-strategy-cclf", default-features = false }
 ndn-ratelimit = { path = "../ndn-ext/crates/ratelimit/ndn-ratelimit" }
 ndn-mobile    = { path = "crates/ndn-mobile" }
