@@ -996,7 +996,7 @@ impl MobileEngineBuilder {
             ) = match self.secured_mgmt {
                 Some((validator, signer)) => (
                     Some(validator),
-                    Some(signer),
+                    Some(Arc::new(ndn_security::ActiveSigner::new(signer))),
                     true,
                     Some(Arc::new(std::sync::Mutex::new(
                         std::collections::HashMap::new(),
