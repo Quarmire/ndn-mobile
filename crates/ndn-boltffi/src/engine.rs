@@ -850,6 +850,32 @@ impl NdnEngine {
             .join_context(context_data, namespace, fingerprint)
     }
 
+    /// Adopt (join) the network a scanned `ndn-trust://anchor` link names —
+    /// including a link that carries only the namespace and the expected
+    /// fingerprint: the context is then fetched by name through this engine
+    /// (it needs a route toward the network), checked against the expected
+    /// fingerprint and the link's version, and adopted. Blocking. Requires
+    /// the `identity` feature (on by default).
+    pub fn join_context_link(&self, link_uri: String) -> Result<NdnContext, NdnError> {
+        #[cfg(feature = "identity")]
+        {
+            let engine = {
+                let guard = self.inner.lock().unwrap();
+                guard
+                    .as_ref()
+                    .ok_or_else(|| NdnError::engine("engine is shut down"))?
+                    .engine()
+                    .clone()
+            };
+            self.identity_core.join_context_link(&engine, link_uri)
+        }
+        #[cfg(not(feature = "identity"))]
+        {
+            let _ = link_uri;
+            Err(NdnError::engine("join_context_link requires the `identity` feature"))
+        }
+    }
+
     /// List the adopted trust contexts (§6 home: "what contexts am I in").
     pub fn list_contexts(&self) -> Vec<NdnContext> {
         self.identity_core.list_contexts()

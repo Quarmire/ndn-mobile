@@ -168,6 +168,34 @@ impl IdentityCore {
         Ok(NdnContext::from_ctx(&ctx))
     }
 
+    /// Adopt (join) the network a scanned `ndn-trust://anchor` link names,
+    /// the same way the `ndn-fwd` daemon does
+    /// (`ndn_identity::adopt_anchor_link_via_engine`): an inline context is
+    /// verified against the link's expected fingerprint; a fingerprint-only
+    /// link fetches the context by name through `engine` — whose validator
+    /// admits exactly the expected context meanwhile — and requires at least
+    /// the version the link names. Blocking (network round trips).
+    #[cfg(feature = "identity")]
+    pub(crate) fn join_context_link(
+        &self,
+        engine: &ndn_app::ForwarderEngine,
+        link_uri: String,
+    ) -> Result<NdnContext, NdnError> {
+        let refused = |e: ndn_cert::AdoptError| NdnError::Identity {
+            msg: format!("trust context refused: {e}"),
+        };
+        let link = ndn_cert::AnchorLink::from_uri(&link_uri).map_err(refused)?;
+        let adopted = self
+            .rt
+            .block_on(ndn_identity::adopt_anchor_link_via_engine(
+                engine,
+                &self.keyring,
+                &link,
+            ))
+            .map_err(refused)?;
+        Ok(NdnContext::from_ctx(&adopted.context))
+    }
+
     pub(crate) fn list_contexts(&self) -> Vec<NdnContext> {
         self.keyring
             .contexts()

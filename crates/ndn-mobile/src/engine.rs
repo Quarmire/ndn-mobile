@@ -1037,6 +1037,7 @@ impl MobileEngineBuilder {
                 webtransport_status_handler: None,
                 ble_handler: None,
                 approval_handler: None,
+                trust_context_handler: None,
                 runtime_policy,
             };
             let fut = ndn_mgmt::mount_management(&engine, cancel, config, None, handles);
