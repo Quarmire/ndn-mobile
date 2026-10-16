@@ -52,7 +52,8 @@ tun = []
 cclf = ["dep:ndn-strategy-cclf"]
 ## NDNCERT 0.3 identity enrollment (`MobileEngine::enroll_pin`) plus SafeBag
 ## identity export/import (`EnrolledIdentity::to_safebag` /
-## `MobileEngine::load_identity`). Pulls ndn-cert + ndn-safebag + serde_json.
+## `MobileEngine::load_identity`). Pulls ndn-cert + serde_json; SafeBag is
+## `ndn_security::safebag`.
 enroll = ["dep:ndn-cert", "dep:serde_json", "dep:getrandom", "ndn-security/custodian"]
 ## WebTransport (QUIC/HTTP3) dial-out face (`with_webtransport_peer`) — the
 ## NAT-friendliest way to reach a gateway over cellular. NATIVE ONLY: pulls the

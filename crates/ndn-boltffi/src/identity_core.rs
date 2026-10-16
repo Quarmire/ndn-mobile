@@ -141,18 +141,31 @@ impl IdentityCore {
 
     // ── Trust contexts (§6: the participant's memberships) ─────────────────
 
+    /// Adopt a scanned anchor envelope's signed context — only if its
+    /// signature verifies under the anchor `fingerprint` pins and it roots
+    /// `namespace` (TOFU; `ndn_cert::adopt_with_tofu`). A mismatched pin, a
+    /// tampered context, or an older version than the one held is an error.
     pub(crate) fn join_context(
         &self,
-        context_wire: Vec<u8>,
-        version: u64,
+        context_data: Vec<u8>,
+        namespace: String,
+        fingerprint: Vec<u8>,
     ) -> Result<NdnContext, NdnError> {
-        let ctx = ndn_security::SignedTrustContext::decode_content(&context_wire, version)
-            .map_err(|e| NdnError::Engine {
-                msg: format!("malformed trust context: {e}"),
-            })?;
-        let ns = ctx.namespace().clone();
-        self.keyring.adopt(Arc::new(ctx));
-        Ok(NdnContext::from_ctx(&self.keyring.context_for(&ns)))
+        let ns: Name = namespace
+            .parse()
+            .map_err(|_| NdnError::invalid_name(&namespace))?;
+        let fingerprint: [u8; 32] = fingerprint
+            .as_slice()
+            .try_into()
+            .map_err(|_| NdnError::engine("anchor fingerprint must be 32 bytes (SHA-256)"))?;
+        let data = ndn_packet::Data::decode(Bytes::from(context_data))
+            .map_err(|e| NdnError::engine(format!("malformed trust-context Data: {e}")))?;
+        let ctx = ndn_cert::adopt_with_tofu(&self.keyring, &data, &ns, &fingerprint).map_err(
+            |e| NdnError::Identity {
+                msg: format!("trust context refused: {e}"),
+            },
+        )?;
+        Ok(NdnContext::from_ctx(&ctx))
     }
 
     pub(crate) fn list_contexts(&self) -> Vec<NdnContext> {

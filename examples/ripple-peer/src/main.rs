@@ -87,7 +87,7 @@ async fn run() -> Result<()> {
     // this self-cert). NDN security travels with the data; this peer never
     // produces unsigned Data nor accepts unverified Data. To trust a *different*
     // peer's content, pin its cert via RIPPLE_TRUST=<cert.der> (the cross-peer
-    // anchor — in the full product that anchor is the operator's TrustContext).
+    // anchor — in the full product that anchor is the operator's SignedTrustContext).
     let id_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
         .join(".ripple-peer");
     std::fs::create_dir_all(&id_dir).ok();

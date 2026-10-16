@@ -3,8 +3,8 @@
 //!
 //! [`MobileEngine::enroll_pin`] drives the standard NDNCERT exchange — NEW →
 //! CHALLENGE (`pin`, trigger + submit) → best-effort cert fetch — over the
-//! engine's in-process app consumer, reusing the [`ndn_cert::EnrollmentSession`]
-//! state machine (the same one the `enroll-ndncert` tool drives). Interests for
+//! engine's in-process app consumer, via the shared [`ndn_cert::client::enroll`]
+//! driver (the same one the `enroll-ndncert` tool runs). Interests for
 //! the CA route out whatever face reaches it, so the caller must first install a
 //! route toward the CA prefix, e.g.:
 //!
@@ -35,10 +35,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use ndn_app::{Connection, Consumer, EngineAppExt};
-use ndn_cert::EnrollmentSession;
+use ndn_cert::{CaExchange, CertError, ChallengeRound};
+use ndn_packet::{Data, Name, SignatureType};
 use ndn_security::custodian::{Custodian, CustodianSigner, KeyId};
-use ndn_packet::encode::InterestBuilder;
-use ndn_packet::{Name, SignatureType};
 use ndn_security::safebag::SafeBag;
 use ndn_security::{EcdsaP256Signer, Ed25519Signer, Signer};
 
@@ -177,8 +176,6 @@ pub enum EnrollError {
     Sign(String),
     #[error("fetch from CA failed: {0}")]
     Fetch(String),
-    #[error("CA response missing content")]
-    EmptyResponse,
     #[error("enrollment did not complete after PIN submission")]
     Incomplete,
     #[error("no issued cert was fetched; SafeBag needs the certificate")]
@@ -189,25 +186,85 @@ pub enum EnrollError {
     SafeBag(String),
 }
 
-async fn sign_interest(
-    builder: InterestBuilder,
-    key_name: &Name,
+impl From<CertError> for EnrollError {
+    fn from(e: CertError) -> Self {
+        match e {
+            CertError::Transport(m) => EnrollError::Fetch(m),
+            CertError::Security(e) => EnrollError::Sign(e.to_string()),
+            CertError::ChallengePending(_) => EnrollError::Incomplete,
+            e => EnrollError::Cert(e.to_string()),
+        }
+    }
+}
+
+/// [`CaExchange`] over an app [`Consumer`] — an embedded engine's in-proc face
+/// or a cross-process forwarder connection.
+struct ConsumerExchange<'a>(&'a mut Consumer);
+
+impl CaExchange for ConsumerExchange<'_> {
+    async fn express(&mut self, interest: Bytes) -> Result<Data, CertError> {
+        self.0
+            .fetch_wire(interest, INTEREST_LIFETIME + Duration::from_millis(500))
+            .await
+            .map_err(|e| CertError::Transport(e.to_string()))
+    }
+}
+
+/// The NDNCERT exchange over an arbitrary [`Consumer`] — the connection-generic
+/// core of every enrollment flow here: the shared NEW → CHALLENGE driver
+/// signing with `signer`, then a best-effort fetch of the issued cert (served
+/// by a repo). Returns the issued cert name and its wire, if fetched.
+async fn run_ndncert_on<F, Fut>(
+    consumer: &mut Consumer,
+    cfg: &EnrollConfig,
     signer: &Arc<dyn Signer>,
-) -> Result<Bytes, EnrollError> {
-    let s: Arc<dyn Signer> = signer.clone();
-    let kn = key_name.clone();
-    builder
-        .sign_fallible(
-            SignatureType::SignatureSha256WithEcdsa,
-            Some(&kn),
-            move |region| {
-                let s = Arc::clone(&s);
-                let owned = region.to_vec();
-                async move { s.sign(&owned).await }
-            },
-        )
-        .await
-        .map_err(|e: ndn_security::TrustError| EnrollError::Sign(e.to_string()))
+    challenge_type: &str,
+    respond: F,
+) -> Result<(Name, Option<Bytes>), EnrollError>
+where
+    F: FnMut(ChallengeRound) -> Fut,
+    Fut: Future<Output = Result<Option<serde_json::Map<String, serde_json::Value>>, CertError>>,
+{
+    let mut exchange = ConsumerExchange(consumer);
+    let cert_name = ndn_cert::client::enroll(
+        &mut exchange,
+        &cfg.ca_prefix,
+        signer.clone(),
+        cfg.validity_secs,
+        challenge_type,
+        respond,
+    )
+    .await?;
+
+    let certificate = match ndn_cert::client::fetch_issued_cert(&mut exchange, &cert_name).await {
+        // The fetched Data IS the cert; embed its full wire (Data TLV 0x06)
+        // so the SafeBag round-trips — not its Content (the SPKI key, 0x30).
+        Ok(data) => Some(data.raw().clone()),
+        Err(e) => {
+            tracing::debug!(error = %e, "issued cert fetch skipped (no repo)");
+            None
+        }
+    };
+    Ok((cert_name, certificate))
+}
+
+/// NDNCERT `token` challenge: one round; the token is the proof.
+async fn run_ndncert_token_on(
+    consumer: &mut Consumer,
+    cfg: &EnrollConfig,
+    signer: &Arc<dyn Signer>,
+    token: &str,
+) -> Result<(Name, Option<Bytes>), EnrollError> {
+    let mut params = serde_json::Map::new();
+    params.insert(
+        "token".to_string(),
+        serde_json::Value::String(token.to_string()),
+    );
+    let mut params = Some(params);
+    run_ndncert_on(consumer, cfg, signer, "token", |_| {
+        std::future::ready(Ok(params.take()))
+    })
+    .await
 }
 
 impl MobileEngine {
@@ -235,7 +292,7 @@ impl MobileEngine {
         );
         let signer: Arc<dyn Signer> = ecdsa.clone();
 
-        let (cert_name, certificate) = self.run_ndncert(&cfg, &key_name, &signer, pin_cb).await?;
+        let (cert_name, certificate) = self.run_ndncert(&cfg, &signer, pin_cb).await?;
 
         // Re-stamp the issued cert name on a fresh software signer (`with_cert_name`
         // consumes self, and the original is shared with the session).
@@ -280,8 +337,7 @@ impl MobileEngine {
         );
         let signer: Arc<dyn Signer> = ecdsa.clone();
 
-        let (cert_name, certificate) =
-            self.run_ndncert_token(&cfg, &key_name, &signer, &token).await?;
+        let (cert_name, certificate) = self.run_ndncert_token(&cfg, &signer, &token).await?;
 
         // Re-stamp the issued cert name on a fresh software signer (as enroll_pin).
         let stamped = Arc::new(
@@ -357,13 +413,11 @@ impl MobileEngine {
         })
     }
 
-    /// NDNCERT NEW → CHALLENGE(`token`) → best-effort cert-fetch. The token is
-    /// submitted in a single challenge round (it is the proof). Structurally
-    /// mirrors [`run_ndncert`](Self::run_ndncert)'s pin path.
+    /// NDNCERT NEW → CHALLENGE(`token`) → best-effort cert-fetch over the
+    /// engine's in-process app consumer.
     async fn run_ndncert_token(
         &self,
         cfg: &EnrollConfig,
-        key_name: &Name,
         signer: &Arc<dyn Signer>,
         token: &str,
     ) -> Result<(Name, Option<Bytes>), EnrollError> {
@@ -371,98 +425,7 @@ impl MobileEngine {
         // self-cleans when `consumer` is dropped at the end of the call.
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut consumer = self.engine().app_consumer(cancel.child_token());
-        run_ndncert_token_on(&mut consumer, cfg, key_name, signer, token).await
-    }
-}
-
-/// The NDNCERT NEW → CHALLENGE(`token`) → best-effort cert-fetch exchange over an
-/// arbitrary [`Consumer`] — the connection-generic core of
-/// [`MobileEngine::run_ndncert_token`]. Lets the same enrollment run over an
-/// embedded engine's in-proc face *or* a cross-process forwarder connection.
-async fn run_ndncert_token_on(
-    consumer: &mut Consumer,
-    cfg: &EnrollConfig,
-    key_name: &Name,
-    signer: &Arc<dyn Signer>,
-    token: &str,
-) -> Result<(Name, Option<Bytes>), EnrollError> {
-    let mut session = EnrollmentSession::new(key_name.clone(), signer.clone(), cfg.validity_secs);
-
-    {
-        // Step 1: NEW
-        let new_params = session
-            .new_request_body()
-            .await
-            .map_err(|e| EnrollError::Cert(e.to_string()))?;
-        let new_name = cfg.ca_prefix.clone().append("CA").append("NEW");
-        let new_wire = sign_interest(
-            InterestBuilder::new(new_name).app_parameters(new_params),
-            key_name,
-            signer,
-        )
-        .await?;
-        let new_data = consumer
-            .fetch_wire(new_wire, INTEREST_LIFETIME + Duration::from_millis(500))
-            .await
-            .map_err(|e| EnrollError::Fetch(format!("NEW: {e}")))?;
-        session
-            .handle_new_response(new_data.content().ok_or(EnrollError::EmptyResponse)?)
-            .map_err(|e| EnrollError::Cert(e.to_string()))?;
-        let request_id_bytes = session
-            .request_id_bytes()
-            .ok_or_else(|| EnrollError::Cert("no request_id after NEW".into()))?
-            .to_vec();
-
-        // Step 2: CHALLENGE("token", {token}) — one round; the token is the proof.
-        let challenge_name = cfg
-            .ca_prefix
-            .clone()
-            .append("CA")
-            .append("CHALLENGE")
-            .append(&request_id_bytes);
-        let mut params = serde_json::Map::new();
-        params.insert(
-            "token".to_string(),
-            serde_json::Value::String(token.to_string()),
-        );
-        let challenge_params = session
-            .challenge_request_body("token", params)
-            .map_err(|e| EnrollError::Cert(e.to_string()))?;
-        let challenge_wire = sign_interest(
-            InterestBuilder::new(challenge_name).app_parameters(challenge_params),
-            key_name,
-            signer,
-        )
-        .await?;
-        let challenge_data = consumer
-            .fetch_wire(challenge_wire, INTEREST_LIFETIME + Duration::from_millis(500))
-            .await
-            .map_err(|e| EnrollError::Fetch(format!("CHALLENGE token: {e}")))?;
-        session
-            .handle_challenge_response(challenge_data.content().ok_or(EnrollError::EmptyResponse)?)
-            .map_err(|e| EnrollError::Cert(e.to_string()))?;
-
-        if !session.is_complete() {
-            return Err(EnrollError::Incomplete);
-        }
-
-        let cert_name = session
-            .issued_cert_name()
-            .ok_or_else(|| EnrollError::Cert("no issued cert name".into()))?
-            .clone();
-
-        // Step 3 (best-effort): fetch the issued cert (served by a repo).
-        let certificate = match consumer.fetch(cert_name.clone()).await {
-            // The fetched Data IS the cert; embed its full wire (Data TLV 0x06)
-            // so the SafeBag round-trips — not its Content (the SPKI key, 0x30).
-            Ok(data) => Some(data.raw().clone()),
-            Err(e) => {
-                tracing::debug!(error = %e, "issued cert fetch skipped (no repo)");
-                None
-            }
-        };
-
-        Ok((cert_name, certificate))
+        run_ndncert_token_on(&mut consumer, cfg, signer, token).await
     }
 }
 
@@ -487,8 +450,7 @@ pub async fn enroll_token_conn(
     let signer: Arc<dyn Signer> = ecdsa.clone();
 
     let mut consumer = Consumer::new(conn);
-    let (cert_name, certificate) =
-        run_ndncert_token_on(&mut consumer, &cfg, &key_name, &signer, &token).await?;
+    let (cert_name, certificate) = run_ndncert_token_on(&mut consumer, &cfg, &signer, &token).await?;
 
     // Re-stamp the issued cert name on a fresh software signer (as enroll_token).
     let stamped = Arc::new(
@@ -536,8 +498,7 @@ pub async fn enroll_token_custodian_conn(
     let signer: Arc<dyn Signer> = Arc::new(make_signer());
 
     let mut consumer = Consumer::new(conn);
-    let (cert_name, certificate) =
-        run_ndncert_token_on(&mut consumer, &cfg, &key_name, &signer, &token).await?;
+    let (cert_name, certificate) = run_ndncert_token_on(&mut consumer, &cfg, &signer, &token).await?;
 
     let stamped: Arc<dyn Signer> = Arc::new(make_signer().with_cert_name(cert_name.clone()));
     Ok(EnrolledIdentity {
@@ -581,7 +542,7 @@ impl MobileEngine {
         };
         let signer: Arc<dyn Signer> = Arc::new(make_signer());
 
-        let (cert_name, certificate) = self.run_ndncert(&cfg, &key_name, &signer, pin_cb).await?;
+        let (cert_name, certificate) = self.run_ndncert(&cfg, &signer, pin_cb).await?;
 
         let stamped: Arc<dyn Signer> = Arc::new(make_signer().with_cert_name(cert_name.clone()));
         Ok(EnrolledIdentity {
@@ -617,8 +578,7 @@ impl MobileEngine {
         };
         let signer: Arc<dyn Signer> = Arc::new(make_signer());
 
-        let (cert_name, certificate) =
-            self.run_ndncert_token(&cfg, &key_name, &signer, &token).await?;
+        let (cert_name, certificate) = self.run_ndncert_token(&cfg, &signer, &token).await?;
 
         let stamped: Arc<dyn Signer> = Arc::new(make_signer().with_cert_name(cert_name.clone()));
         Ok(EnrolledIdentity {
@@ -630,125 +590,48 @@ impl MobileEngine {
         })
     }
 
-    /// The shared NDNCERT NEW → CHALLENGE(pin) → best-effort cert-fetch exchange,
-    /// signing every request with `signer` (software or custodian). Returns the
-    /// issued cert name and its wire (if a repo served it).
+    /// NDNCERT NEW → CHALLENGE(`pin`: trigger round, then the code `pin_cb`
+    /// returns) → best-effort cert-fetch over the engine's in-process app
+    /// consumer, signing every request with `signer` (software or custodian).
+    /// Some CAs auto-complete after the trigger round; `pin_cb` is then never
+    /// called.
     async fn run_ndncert<F, Fut>(
         &self,
         cfg: &EnrollConfig,
-        key_name: &Name,
         signer: &Arc<dyn Signer>,
         pin_cb: F,
     ) -> Result<(Name, Option<Bytes>), EnrollError>
     where
         F: FnOnce(PinRequest) -> Fut,
-        Fut: std::future::Future<Output = String>,
+        Fut: Future<Output = String>,
     {
         // A standalone token bounds the enrollment app face; the face also
         // self-cleans when `consumer` is dropped at the end of the call.
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut consumer = self.engine().app_consumer(cancel.child_token());
-        let mut session =
-            EnrollmentSession::new(key_name.clone(), signer.clone(), cfg.validity_secs);
-
-        // Step 1: NEW
-        let new_params = session
-            .new_request_body()
-            .await
-            .map_err(|e| EnrollError::Cert(e.to_string()))?;
-        let new_name = cfg.ca_prefix.clone().append("CA").append("NEW");
-        let new_wire = sign_interest(
-            InterestBuilder::new(new_name).app_parameters(new_params),
-            key_name,
-            signer,
-        )
-        .await?;
-        let new_data = consumer
-            .fetch_wire(new_wire, INTEREST_LIFETIME + Duration::from_millis(500))
-            .await
-            .map_err(|e| EnrollError::Fetch(format!("NEW: {e}")))?;
-        session
-            .handle_new_response(new_data.content().ok_or(EnrollError::EmptyResponse)?)
-            .map_err(|e| EnrollError::Cert(e.to_string()))?;
-        let request_id_bytes = session
-            .request_id_bytes()
-            .ok_or_else(|| EnrollError::Cert("no request_id after NEW".into()))?
-            .to_vec();
-
-        // Step 2a: CHALLENGE trigger (select "pin", no code yet)
-        let challenge_name = cfg
-            .ca_prefix
-            .clone()
-            .append("CA")
-            .append("CHALLENGE")
-            .append(&request_id_bytes);
-        let trigger_params = session
-            .challenge_request_body("pin", serde_json::Map::new())
-            .map_err(|e| EnrollError::Cert(e.to_string()))?;
-        let trigger_wire = sign_interest(
-            InterestBuilder::new(challenge_name.clone()).app_parameters(trigger_params),
-            key_name,
-            signer,
-        )
-        .await?;
-        let trigger_data = consumer
-            .fetch_wire(trigger_wire, INTEREST_LIFETIME + Duration::from_millis(500))
-            .await
-            .map_err(|e| EnrollError::Fetch(format!("CHALLENGE trigger: {e}")))?;
-        session
-            .handle_challenge_response(trigger_data.content().ok_or(EnrollError::EmptyResponse)?)
-            .map_err(|e| EnrollError::Cert(e.to_string()))?;
-
-        // Some CAs auto-complete (no PIN); otherwise collect the code.
-        if !session.is_complete() {
-            let pin = pin_cb(PinRequest {
-                request_id: hex_encode(&request_id_bytes),
-                status_message: session.challenge_status_message().map(str::to_string),
-            })
-            .await;
-
-            // Step 2b: CHALLENGE submit (the PIN code)
-            let mut code = serde_json::Map::new();
-            code.insert("code".to_string(), serde_json::Value::String(pin));
-            let submit_params = session
-                .challenge_request_body("pin", code)
-                .map_err(|e| EnrollError::Cert(e.to_string()))?;
-            let submit_wire = sign_interest(
-                InterestBuilder::new(challenge_name).app_parameters(submit_params),
-                key_name,
-                signer,
-            )
-            .await?;
-            let submit_data = consumer
-                .fetch_wire(submit_wire, INTEREST_LIFETIME + Duration::from_millis(500))
-                .await
-                .map_err(|e| EnrollError::Fetch(format!("CHALLENGE submit: {e}")))?;
-            session
-                .handle_challenge_response(submit_data.content().ok_or(EnrollError::EmptyResponse)?)
-                .map_err(|e| EnrollError::Cert(e.to_string()))?;
-        }
-
-        if !session.is_complete() {
-            return Err(EnrollError::Incomplete);
-        }
-
-        let cert_name = session
-            .issued_cert_name()
-            .ok_or_else(|| EnrollError::Cert("no issued cert name".into()))?
-            .clone();
-
-        // ── Step 3 (best-effort): fetch the issued cert (served by a repo). ─
-        let certificate = match consumer.fetch(cert_name.clone()).await {
-            // The fetched Data IS the cert; embed its full wire (Data TLV 0x06)
-            // so the SafeBag round-trips — not its Content (the SPKI key, 0x30).
-            Ok(data) => Some(data.raw().clone()),
-            Err(e) => {
-                tracing::debug!(error = %e, "issued cert fetch skipped (no repo)");
-                None
+        let mut pin_cb = Some(pin_cb);
+        run_ndncert_on(&mut consumer, cfg, signer, "pin", |round| {
+            // Round 0 is the trigger (select "pin", no code yet); round 1
+            // submits the code; anything further is incomplete.
+            let cb = if round.round == 1 { pin_cb.take() } else { None };
+            async move {
+                match (round.round, cb) {
+                    (0, _) => Ok(Some(serde_json::Map::new())),
+                    (_, Some(cb)) => {
+                        let pin = cb(PinRequest {
+                            request_id: round.request_id,
+                            status_message: round.status_message,
+                        })
+                        .await;
+                        let mut code = serde_json::Map::new();
+                        code.insert("code".to_string(), serde_json::Value::String(pin));
+                        Ok(Some(code))
+                    }
+                    (_, None) => Ok(None),
+                }
             }
-        };
-
-        Ok((cert_name, certificate))
+        })
+        .await
     }
 
     /// Restore an identity persisted as a [`SafeBag`] (the inverse of
@@ -787,14 +670,6 @@ impl MobileEngine {
         };
         Ok(signer)
     }
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes.iter().fold(String::new(), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
 }
 
 #[cfg(test)]

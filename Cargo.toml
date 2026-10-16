@@ -24,7 +24,7 @@ name = "ndn-mobile"
 ndn-packet    = { path = "../ndn-rs/crates/core/ndn-packet", default-features = false }
 ndn-transport = { path = "../ndn-rs/crates/core/ndn-transport" }
 ndn-store     = { path = "../ndn-rs/crates/forwarding/ndn-store" }
-ndn-trust-envelope = { path = "../ndn-ext/crates/onboarding/ndn-trust-envelope" }
+ndn-trust-envelope = { path = "../ndn-rs/crates/security/ndn-trust-envelope" }
 ndn-face             = { path = "../ndn-rs/crates/faces/ndn-face" }
 ndn-face-serial      = { path = "../ndn-ext/crates/faces/ndn-face-serial" }
 ndn-face-websocket   = { path = "../ndn-ext/crates/faces/ndn-face-websocket" }

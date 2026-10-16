@@ -170,10 +170,20 @@ pub struct NdnDelegationScope {
 #[data]
 #[derive(Debug, Clone)]
 pub enum NdnTrustEnvelope {
-    /// Adopt a trust context — feed to `join_context(context_content, version)`.
+    /// Adopt a trust context carried inline as root-signed Data — feed to
+    /// `join_context(context_data, namespace, fingerprint)`, which verifies
+    /// the signature against the pinned anchor (TOFU) before adopting.
     Anchor {
-        version: u64,
-        context_content: Vec<u8>,
+        /// The context namespace the envelope pins (NDN URI).
+        namespace: String,
+        /// SHA-256 of the root anchor's public key (32 bytes) — the TOFU pin;
+        /// show it for out-of-band confirmation.
+        fingerprint: Vec<u8>,
+        /// The context version, when the envelope states it (informational;
+        /// the signed Data's name is authoritative).
+        version: Option<u64>,
+        /// The signed context Data wire.
+        context_data: Vec<u8>,
     },
     /// NDNCERT enrollment invitation — drive token-enroll against `ca_prefix`.
     Invite {
@@ -181,6 +191,9 @@ pub enum NdnTrustEnvelope {
         identity_namespace: String,
         token: String,
         ttl_secs: Option<u64>,
+        /// SHA-256 of the CA's root anchor public key (32 bytes), pinning the
+        /// CA to trust, when the invite carries one.
+        anchor_fingerprint: Option<Vec<u8>>,
     },
     /// A signed delegation to import (sponsorship) — verify + use via the
     /// delegated-signing path.
@@ -194,7 +207,7 @@ pub enum NdnTrustEnvelope {
     Bag { key_name: String, safebag: Vec<u8> },
     /// An ephemeral scoped capability (pairing). `is_grant` distinguishes a
     /// peer's request (false) from an issued grant (true); `grant` carries the
-    /// signed capability wire on a grant.
+    /// operator's certificate (signed NDN Data wire) on a grant.
     Capability {
         is_grant: bool,
         namespace: String,

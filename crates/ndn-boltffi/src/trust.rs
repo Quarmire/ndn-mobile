@@ -19,10 +19,14 @@ impl NdnTrust {
     /// Parse an `ndn-trust://<kind>/<base64url>` URI (also accepts the legacy
     /// `ndn-ctx:1:…` anchor form and the `https://…/t/<kind>#…` universal-link
     /// mirror) into a typed [`NdnTrustEnvelope`]. Errors with
-    /// [`NdnError::Engine`] on a malformed or unrecognized payload.
+    /// [`NdnError::Engine`] on a malformed or unrecognized payload; on an
+    /// anchor that does not pin a namespace + fingerprint; on a by-reference
+    /// anchor (fingerprint only, no inline context) — this binding adopts
+    /// inline contexts only; and on an unsigned legacy anchor (`ndn-ctx:1:`
+    /// or bare content), which cannot be verified and is never adopted.
     pub fn parse(uri: String) -> Result<NdnTrustEnvelope, NdnError> {
         let env = TrustEnvelope::from_uri(&uri).map_err(NdnError::engine)?;
-        Ok(convert(env))
+        convert(env)
     }
 
     /// Build an `ndn-trust://delegation/…` URI a sponsor shows to a device: the
@@ -50,8 +54,9 @@ impl NdnTrust {
 
     /// Build an `ndn-trust://capability/…` URI for pairing. `is_grant=false` is a
     /// peer's *request* (what it wants + a TTL); `is_grant=true` is the operator's
-    /// *grant* acknowledgement, with `grant` carrying the operator's public key so
-    /// the peer can verify the signatures it later receives.
+    /// *grant* acknowledgement, with `grant` carrying the operator's certificate
+    /// (signed NDN Data wire) so the peer can learn and verify the key behind the
+    /// signatures it later receives.
     pub fn build_capability(
         is_grant: bool,
         namespace: String,
@@ -72,25 +77,53 @@ impl NdnTrust {
     }
 }
 
-fn convert(e: TrustEnvelope) -> NdnTrustEnvelope {
-    match e {
+fn convert(e: TrustEnvelope) -> Result<NdnTrustEnvelope, NdnError> {
+    Ok(match e {
         TrustEnvelope::Anchor {
+            namespace,
+            fingerprint,
             version,
+            context_data,
             context_content,
-        } => NdnTrustEnvelope::Anchor {
-            version,
-            context_content: context_content.to_vec(),
-        },
+        } => {
+            let context_data = match (context_data, context_content) {
+                (Some(data), _) => data,
+                (None, Some(_)) => {
+                    return Err(NdnError::engine(
+                        "anchor envelope carries an unsigned legacy context, which cannot be \
+                         verified (ask for a re-issued, signed envelope)",
+                    ));
+                }
+                (None, None) => {
+                    return Err(NdnError::engine(
+                        "anchor envelope carries no inline context (by-reference anchors are not supported)",
+                    ));
+                }
+            };
+            let (Some(namespace), Some(fingerprint)) = (namespace, fingerprint) else {
+                return Err(NdnError::engine(
+                    "anchor envelope pins no namespace + anchor fingerprint, so it cannot be TOFU-verified",
+                ));
+            };
+            NdnTrustEnvelope::Anchor {
+                namespace,
+                fingerprint: fingerprint.to_vec(),
+                version,
+                context_data: context_data.to_vec(),
+            }
+        }
         TrustEnvelope::Invite {
             ca_prefix,
             identity_namespace,
             token,
             ttl_secs,
+            anchor_fingerprint,
         } => NdnTrustEnvelope::Invite {
             ca_prefix,
             identity_namespace,
             token,
             ttl_secs,
+            anchor_fingerprint: anchor_fingerprint.map(|fp| fp.to_vec()),
         },
         TrustEnvelope::Delegation {
             signed_delegation,
@@ -114,5 +147,5 @@ fn convert(e: TrustEnvelope) -> NdnTrustEnvelope {
             nonce: c.nonce.to_vec(),
             grant: c.grant.map(|b| b.to_vec()),
         },
-    }
+    })
 }

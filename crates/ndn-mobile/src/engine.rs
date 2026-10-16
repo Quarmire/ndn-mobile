@@ -839,6 +839,12 @@ impl MobileEngineBuilder {
         let (engine, shutdown) = builder.build().await?;
         let network_cancel = shutdown.cancel_token().child_token();
 
+        // Fetch signing certs the phone hasn't cached (a peer device enrolled
+        // after this one) through the engine, so their Data validates rather
+        // than being dropped. No-op under `SecurityProfile::Disabled` or when a
+        // custom validator already carries a fetcher.
+        ndn_app::install_engine_cert_fetcher(&engine, shutdown.cancel_token().child_token());
+
         if let Some(face_id) = multicast_face_id {
             let iface = self.multicast_iface.unwrap();
             match MulticastUdpFace::ndn_default(iface, face_id).await {

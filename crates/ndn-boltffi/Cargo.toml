@@ -40,7 +40,7 @@ sqlite-cs = ["ndn-mobile/sqlite-cs"]
 management = ["ndn-mobile/management"]
 ## Operator identity + signing on the engine (`load_identity` / `sign`, NDNCERT
 ## enrollment, and the RemoteSigner responder). Native-only — pulls
-## ndn-cert/ndn-safebag (not wasm-safe).
+## ndn-cert (not wasm-safe).
 identity = ["ndn-mobile/enroll", "ndn-security/custodian", "dep:ndn-identity", "dep:getrandom", "dep:async-trait", "dep:ndn-config"]
 ## Operator console (`NdnDashboard`): poll a forwarder's management plane for
 ## faces / routes / CS / strategies / status. Native-only — pulls
@@ -62,6 +62,8 @@ ndn-face       = { workspace = true }
 ndn-packet      = { workspace = true, features = ["std"] }
 ndn-security    = { workspace = true, features = ["custodian"] }
 ndn-trust-envelope = { workspace = true }
+# Verified, TOFU-gated trust-context adoption (`join_context`).
+ndn-cert        = { workspace = true }
 ndn-identity    = { workspace = true, optional = true }
 getrandom       = { workspace = true, optional = true }
 # Operator console (`dashboard` feature): headless DashboardEngine + view-models.
