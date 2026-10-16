@@ -456,16 +456,16 @@ impl NdnClient {
     // seam) exactly as `NdnEngine`'s identity methods run over its embedded
     // engine. Same names / signatures / feature gates as `NdnEngine`.
 
-    /// Adopt (join) a scanned anchor envelope's signed trust context, verified
-    /// against the anchor `fingerprint` it pins (see `NdnEngine::join_context`).
-    pub fn join_context(
+    /// Adopt a scanned anchor envelope's signed trust context, verified
+    /// against the anchor `fingerprint` it pins (see `NdnEngine::adopt_context`).
+    pub fn adopt_context(
         &self,
         context_data: Vec<u8>,
         namespace: String,
         fingerprint: Vec<u8>,
     ) -> Result<NdnContext, NdnError> {
         self.identity_core
-            .join_context(context_data, namespace, fingerprint)
+            .adopt_context(context_data, namespace, fingerprint)
     }
 
     /// List the adopted trust contexts.

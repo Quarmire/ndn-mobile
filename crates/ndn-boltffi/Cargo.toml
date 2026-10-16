@@ -62,7 +62,7 @@ ndn-face       = { workspace = true }
 ndn-packet      = { workspace = true, features = ["std"] }
 ndn-security    = { workspace = true, features = ["custodian"] }
 ndn-trust-envelope = { workspace = true }
-# Verified, TOFU-gated trust-context adoption (`join_context`).
+# Verified, TOFU-gated trust-context adoption (`adopt_context`).
 ndn-cert        = { workspace = true }
 ndn-identity    = { workspace = true, optional = true }
 getrandom       = { workspace = true, optional = true }

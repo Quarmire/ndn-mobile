@@ -833,30 +833,30 @@ impl NdnEngine {
 
     // ── Trust contexts (§6: the participant's memberships) ─────────────────
 
-    /// Adopt (join) a trust context from a scanned anchor envelope
+    /// Adopt a trust context from a scanned anchor envelope
     /// ([`NdnTrustEnvelope::Anchor`](crate::types::NdnTrustEnvelope::Anchor)):
     /// its signed `context_data`, the `namespace` and anchor `fingerprint` it
     /// pins. The context is adopted only if its signature verifies under the
     /// pinned anchor and it roots `namespace` (TOFU); its anchors then become
     /// trusted for that namespace. A mismatched pin, a tampered context, or a
     /// version strictly older than one already held is an error.
-    pub fn join_context(
+    pub fn adopt_context(
         &self,
         context_data: Vec<u8>,
         namespace: String,
         fingerprint: Vec<u8>,
     ) -> Result<NdnContext, NdnError> {
         self.identity_core
-            .join_context(context_data, namespace, fingerprint)
+            .adopt_context(context_data, namespace, fingerprint)
     }
 
-    /// Adopt (join) the network a scanned `ndn-trust://anchor` link names —
+    /// Adopt the namespace a scanned `ndn-trust://anchor` link names —
     /// including a link that carries only the namespace and the expected
     /// fingerprint: the context is then fetched by name through this engine
-    /// (it needs a route toward the network), checked against the expected
+    /// (it needs a link and a route toward a node serving the context), checked against the expected
     /// fingerprint and the link's version, and adopted. Blocking. Requires
     /// the `identity` feature (on by default).
-    pub fn join_context_link(&self, link_uri: String) -> Result<NdnContext, NdnError> {
+    pub fn adopt_context_link(&self, link_uri: String) -> Result<NdnContext, NdnError> {
         #[cfg(feature = "identity")]
         {
             let engine = {
@@ -867,12 +867,12 @@ impl NdnEngine {
                     .engine()
                     .clone()
             };
-            self.identity_core.join_context_link(&engine, link_uri)
+            self.identity_core.adopt_context_link(&engine, link_uri)
         }
         #[cfg(not(feature = "identity"))]
         {
             let _ = link_uri;
-            Err(NdnError::engine("join_context_link requires the `identity` feature"))
+            Err(NdnError::engine("adopt_context_link requires the `identity` feature"))
         }
     }
 
@@ -1133,7 +1133,7 @@ impl NdnEngine {
     /// engine; the default route carries it one hop to the gateway. The command
     /// is signed by the loaded identity; the gateway validates it against its
     /// localhop trust anchors (a CA-issued operator cert validates against the
-    /// CA anchor `ndn-fwd` auto-installs for a `[demo_ca]`). Returns true on a
+    /// CA anchor `ndn-fwd` auto-installs for a `[ca]`). Returns true on a
     /// 2xx `ControlResponse`. Without this, a served `<id>/signer` responder is
     /// only reachable if the operator adds the route on the gateway by hand.
     /// Requires the `identity` feature, a loaded identity, and a gateway peer.
@@ -1643,7 +1643,7 @@ mod identity_tests {
         engine.shutdown();
     }
 
-    /// The full Android Anchor topology on host: two engines joined by a
+    /// The full Android Anchor topology on host: two engines linked by a
     /// loopback NAN bearer; engine A serves a SIGNED RDR object via a `NdnClient`
     /// over its seam (the producer the phone runs in its UI process), and engine
     /// B fetches it — the Interest egresses B over NAN, reaches A, must route to
@@ -1751,7 +1751,7 @@ mod identity_tests {
         engine_b.shutdown();
     }
 
-    /// BLE counterpart of the two-engine NAN round-trip: two engines joined by a
+    /// BLE counterpart of the two-engine NAN round-trip: two engines linked by a
     /// loopback BLE advertising face; A serves a SIGNED RDR object over its seam,
     /// B fetches and VERIFIES it across the BLE link. Proves the BLE face carries
     /// the full secure object plane the same as Wi-Fi Aware — the two faces are
@@ -2587,9 +2587,9 @@ mod context_tests {
         }
     }
 
-    /// A hub's root-signed context at `version`, as the `ndn-trust://anchor`
-    /// URI it would show in a QR (namespace + fingerprint pin + signed Data).
-    fn hub_envelope(mgr: &SecurityManager, ns: &str, version: u64) -> String {
+    /// A namespace's root-signed context at `version`, as the
+    /// `ndn-trust://anchor` URI it would show in a QR (namespace + fingerprint pin + signed Data).
+    fn namespace_envelope(mgr: &SecurityManager, ns: &str, version: u64) -> String {
         let key: ndn_packet::Name = format!("{ns}/KEY/root").parse().unwrap();
         if mgr.get_signer_sync(&key).is_err() {
             mgr.generate_ed25519(key.clone()).unwrap();
@@ -2611,8 +2611,8 @@ mod context_tests {
         .to_uri()
     }
 
-    /// What a host does with a scanned QR: parse, then join with the pins.
-    fn scan_and_join(engine: &NdnEngine, uri: &str) -> Result<NdnContext, NdnError> {
+    /// What a host does with a scanned QR: parse, then adopt with the pins.
+    fn scan_and_adopt(engine: &NdnEngine, uri: &str) -> Result<NdnContext, NdnError> {
         let NdnTrustEnvelope::Anchor {
             namespace,
             fingerprint,
@@ -2622,21 +2622,21 @@ mod context_tests {
         else {
             panic!("expected an anchor envelope");
         };
-        engine.join_context(context_data, namespace, fingerprint)
+        engine.adopt_context(context_data, namespace, fingerprint)
     }
 
-    /// The participant model: join contexts, list memberships, anti-rollback on
-    /// re-join, and forget.
+    /// The participant model: adopt contexts, list them, anti-rollback on
+    /// re-adoption, and forget.
     #[test]
-    fn join_list_forget_contexts() {
+    fn adopt_list_forget_contexts() {
         let engine = NdnEngine::new(cfg()).unwrap();
         assert!(engine.list_contexts().is_empty());
         let bob = SecurityManager::new();
 
-        let joined = scan_and_join(&engine, &hub_envelope(&bob, "/home/bob", 2)).unwrap();
-        assert_eq!(joined.namespace, "/home/bob");
-        assert_eq!(joined.version, 2);
-        assert!(joined.enforces_hierarchy);
+        let adopted = scan_and_adopt(&engine, &namespace_envelope(&bob, "/home/bob", 2)).unwrap();
+        assert_eq!(adopted.namespace, "/home/bob");
+        assert_eq!(adopted.version, 2);
+        assert!(adopted.enforces_hierarchy);
 
         let list = engine.list_contexts();
         assert_eq!(list.len(), 1);
@@ -2644,11 +2644,11 @@ mod context_tests {
 
         // Adopting a second context is additive.
         let acme = SecurityManager::new();
-        scan_and_join(&engine, &hub_envelope(&acme, "/work/acme", 1)).unwrap();
+        scan_and_adopt(&engine, &namespace_envelope(&acme, "/work/acme", 1)).unwrap();
         assert_eq!(engine.list_contexts().len(), 2);
 
         // Anti-rollback: a strictly older version is refused (an error); held stays 2.
-        assert!(scan_and_join(&engine, &hub_envelope(&bob, "/home/bob", 1)).is_err());
+        assert!(scan_and_adopt(&engine, &namespace_envelope(&bob, "/home/bob", 1)).is_err());
         let held = engine.list_contexts();
         let bob_ctx = held.iter().find(|c| c.namespace == "/home/bob").unwrap();
         assert_eq!(bob_ctx.version, 2);
@@ -2661,19 +2661,19 @@ mod context_tests {
         engine.shutdown();
     }
 
-    /// `join_context` used to adopt any decodable content with no TOFU check
+    /// `adopt_context` used to adopt any decodable content with no TOFU check
     /// and ignore a refused adoption. Now a mismatched pin, a wrong namespace,
     /// a context signed by a key other than the pinned anchor, and an unsigned
     /// legacy payload are all refused and nothing is adopted.
     #[test]
-    fn join_context_refuses_mismatches() {
+    fn adopt_context_refuses_mismatches() {
         let engine = NdnEngine::new(cfg()).unwrap();
         let NdnTrustEnvelope::Anchor {
             namespace,
             fingerprint,
             context_data,
             ..
-        } = crate::NdnTrust::parse(hub_envelope(&SecurityManager::new(), "/home/bob", 1))
+        } = crate::NdnTrust::parse(namespace_envelope(&SecurityManager::new(), "/home/bob", 1))
             .unwrap()
         else {
             unreachable!()
@@ -2681,36 +2681,36 @@ mod context_tests {
 
         // Wrong fingerprint (another root's pin).
         assert!(matches!(
-            engine.join_context(context_data.clone(), namespace.clone(), vec![0u8; 32]),
+            engine.adopt_context(context_data.clone(), namespace.clone(), vec![0u8; 32]),
             Err(NdnError::Identity { .. })
         ));
         // Wrong namespace.
         assert!(matches!(
-            engine.join_context(context_data.clone(), "/home/eve".into(), fingerprint.clone()),
+            engine.adopt_context(context_data.clone(), "/home/eve".into(), fingerprint.clone()),
             Err(NdnError::Identity { .. })
         ));
         // A context signed by an impostor, presented with Bob's real pin.
         let NdnTrustEnvelope::Anchor {
             context_data: forged,
             ..
-        } = crate::NdnTrust::parse(hub_envelope(&SecurityManager::new(), "/home/bob", 1))
+        } = crate::NdnTrust::parse(namespace_envelope(&SecurityManager::new(), "/home/bob", 1))
             .unwrap()
         else {
             unreachable!()
         };
         assert!(matches!(
-            engine.join_context(forged, namespace.clone(), fingerprint.clone()),
+            engine.adopt_context(forged, namespace.clone(), fingerprint.clone()),
             Err(NdnError::Identity { .. })
         ));
         // Truncated pin.
         assert!(
             engine
-                .join_context(context_data.clone(), namespace.clone(), vec![1, 2, 3])
+                .adopt_context(context_data.clone(), namespace.clone(), vec![1, 2, 3])
                 .is_err()
         );
         assert!(engine.list_contexts().is_empty(), "nothing adopted");
 
-        // Unsigned legacy content never reaches join_context.
+        // Unsigned legacy content never reaches adopt_context.
         let legacy = TrustEnvelope::Anchor {
             namespace: Some("/home/bob".into()),
             fingerprint: Some([0u8; 32]),
@@ -2723,7 +2723,7 @@ mod context_tests {
         assert!(crate::NdnTrust::parse(legacy.to_uri()).is_err());
 
         // The genuine triple is adopted.
-        engine.join_context(context_data, namespace, fingerprint).unwrap();
+        engine.adopt_context(context_data, namespace, fingerprint).unwrap();
         assert_eq!(engine.list_contexts().len(), 1);
         engine.shutdown();
     }

@@ -171,7 +171,7 @@ pub struct NdnDelegationScope {
 #[derive(Debug, Clone)]
 pub enum NdnTrustEnvelope {
     /// Adopt a trust context carried inline as root-signed Data — feed to
-    /// `join_context(context_data, namespace, fingerprint)`, which verifies
+    /// `adopt_context(context_data, namespace, fingerprint)`, which verifies
     /// the signature against the pinned anchor (TOFU) before adopting.
     Anchor {
         /// The context namespace the envelope pins (NDN URI).

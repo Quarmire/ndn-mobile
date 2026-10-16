@@ -127,7 +127,7 @@ impl IdentityCore {
             v.add_trust_anchor(cert.clone());
         }
         // F20 (NDF D-45): verify via held context. Seed the validator with every
-        // adopted trust context (joined via `join_context` / context-sync), so a
+        // adopted trust context (adopted via `adopt_context` / context-sync), so a
         // peer's content named under a context we hold verifies against that
         // context's anchors + schema — no per-transfer `pin_trust_anchor` (TOFU).
         // Validation dispatches per-namespace (longest-prefix `context_for`), with
@@ -145,7 +145,7 @@ impl IdentityCore {
     /// signature verifies under the anchor `fingerprint` pins and it roots
     /// `namespace` (TOFU; `ndn_cert::adopt_with_tofu`). A mismatched pin, a
     /// tampered context, or an older version than the one held is an error.
-    pub(crate) fn join_context(
+    pub(crate) fn adopt_context(
         &self,
         context_data: Vec<u8>,
         namespace: String,
@@ -168,7 +168,7 @@ impl IdentityCore {
         Ok(NdnContext::from_ctx(&ctx))
     }
 
-    /// Adopt (join) the network a scanned `ndn-trust://anchor` link names,
+    /// Adopt the namespace a scanned `ndn-trust://anchor` link names,
     /// the same way the `ndn-fwd` daemon does
     /// (`ndn_identity::adopt_anchor_link_via_engine`): an inline context is
     /// verified against the link's expected fingerprint; a fingerprint-only
@@ -176,7 +176,7 @@ impl IdentityCore {
     /// admits exactly the expected context meanwhile — and requires at least
     /// the version the link names. Blocking (network round trips).
     #[cfg(feature = "identity")]
-    pub(crate) fn join_context_link(
+    pub(crate) fn adopt_context_link(
         &self,
         engine: &ndn_app::ForwarderEngine,
         link_uri: String,
