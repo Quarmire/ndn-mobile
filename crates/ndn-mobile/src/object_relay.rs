@@ -1,6 +1,6 @@
 //! Engine-side **producer of record** for a node-signed object whose segment
 //! content is streamed from a keyless source — the producer half of "bulk off
-//! the seam" (see `.claude/notes/vpn/` + the substrate-extension PIT doctrine).
+//! the seam".
 //!
 //! A leaf app (e.g. a share UI) holds a file but no key. Instead of the leaf
 //! answering one signed Interest per segment across the process seam (the

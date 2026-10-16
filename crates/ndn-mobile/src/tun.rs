@@ -2,8 +2,7 @@
 //!
 //! Evolves the tap-tunnel pull model onto persistent Interests (the
 //! `SubscriptionRequest` extension) so the downlink is idle-cheap — no Interest
-//! re-expression while quiet. See the prior-art survey and the efficiency
-//! discussion in `.claude/notes/vpn/`.
+//! re-expression while quiet.
 //!
 //! Each endpoint runs both roles against the engine (over whatever real network
 //! face — UDP/TCP/WS — reaches the peer):
