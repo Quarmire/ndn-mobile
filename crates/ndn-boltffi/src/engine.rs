@@ -876,6 +876,42 @@ impl NdnEngine {
         }
     }
 
+    /// Enroll this device with the CA a scanned `ndn-trust://invite` link
+    /// names, as `<namespace>/<role>/<device>` (`device`: 1–63 letters,
+    /// digits, `-`, `_`, `.`). The namespace's trust context is adopted first
+    /// if it is not held (checked against the invite's root fingerprint); a
+    /// fresh key is generated on this device, certified with the invite's
+    /// token, and the certificate's chain to the root is checked. On success
+    /// the identity is installed (subsequent [`sign`](Self::sign) works) and
+    /// the result carries a password-encrypted SafeBag for the host to
+    /// persist. The engine needs a face and a route for the namespace toward
+    /// a forwarder that serves it. Blocking; requires the `identity` feature.
+    pub fn enroll_with_invite(
+        &self,
+        invite_uri: String,
+        device: String,
+        persist_password: Vec<u8>,
+    ) -> Result<NdnEnrolledIdentity, NdnError> {
+        #[cfg(feature = "identity")]
+        {
+            let engine = {
+                let guard = self.inner.lock().unwrap();
+                guard
+                    .as_ref()
+                    .ok_or_else(|| NdnError::engine("engine is shut down"))?
+                    .engine()
+                    .clone()
+            };
+            self.identity_core
+                .enroll_with_invite(&engine, invite_uri, device, persist_password)
+        }
+        #[cfg(not(feature = "identity"))]
+        {
+            let _ = (invite_uri, device, persist_password);
+            Err(NdnError::engine("enroll_with_invite requires the `identity` feature"))
+        }
+    }
+
     /// List the adopted trust contexts (§6 home: "what contexts am I in").
     pub fn list_contexts(&self) -> Vec<NdnContext> {
         self.identity_core.list_contexts()

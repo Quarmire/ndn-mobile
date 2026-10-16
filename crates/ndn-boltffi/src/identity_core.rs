@@ -196,6 +196,69 @@ impl IdentityCore {
         Ok(NdnContext::from_ctx(&adopted.context))
     }
 
+    /// Enroll this device with the CA an `ndn-trust://invite` link names, as
+    /// `<ns>/<role>/<device>`, the same way the `ndn-fwd` daemon does
+    /// (`ndn_identity::enroll_with_invite_via_engine`): adopt the
+    /// namespace's trust context if it is not held (checked against the
+    /// invite's root fingerprint), generate a fresh ECDSA-P256 key here,
+    /// obtain a certificate for it with the invite's token and check its chain
+    /// to the root. On success the identity is installed for signing and the
+    /// result carries a password-encrypted SafeBag (key + issued certificate)
+    /// for the host to persist. Blocking (network round trips); `engine`
+    /// needs a face and a route for the namespace.
+    #[cfg(feature = "identity")]
+    pub(crate) fn enroll_with_invite(
+        &self,
+        engine: &ndn_app::ForwarderEngine,
+        invite_uri: String,
+        device: String,
+        persist_password: Vec<u8>,
+    ) -> Result<NdnEnrolledIdentity, NdnError> {
+        use ndn_security::EcdsaP256Signer;
+
+        let refused = |e: &dyn std::fmt::Display| NdnError::Identity {
+            msg: format!("enrollment refused: {e}"),
+        };
+        let key_error = |e: &dyn std::fmt::Display| NdnError::Identity {
+            msg: format!("device key: {e}"),
+        };
+        let invite = ndn_cert::InviteLink::from_uri(&invite_uri).map_err(|e| refused(&e))?;
+        let identity = invite.device_identity(&device).map_err(|e| refused(&e))?;
+        let key_name = ndn_cert::new_device_key_name(&identity);
+        let key = EcdsaP256Signer::generate(key_name.clone()).map_err(|e| key_error(&e))?;
+        let pkcs8 = key.to_pkcs8_der().map_err(|e| key_error(&e))?;
+        let enrollment = self
+            .rt
+            .block_on(ndn_identity::enroll_with_invite_via_engine(
+                engine,
+                &self.keyring,
+                &invite,
+                Arc::new(key),
+                ndn_cert::INVITE_CERT_VALIDITY_SECS,
+            ))
+            .map_err(|failure| refused(&failure.error))?;
+
+        let cert_name = (*enrollment.issued.cert.name).clone();
+        let cert_wire = enrollment.issued.data.raw().clone();
+        let bag = ndn_security::safebag::SafeBag::encrypt(
+            cert_wire.clone(),
+            &pkcs8,
+            &persist_password,
+        )
+        .map_err(|e| key_error(&e))?;
+        let signer = EcdsaP256Signer::from_pkcs8_der(&pkcs8, key_name.clone())
+            .map_err(|e| key_error(&e))?
+            .with_cert_name(cert_name.clone());
+        *self.cert_wire.lock().unwrap() = Some(cert_wire.clone());
+        *self.identity.lock().unwrap() = Some(Arc::new(signer));
+        Ok(NdnEnrolledIdentity {
+            key_name: key_name.to_string(),
+            cert_name: cert_name.to_string(),
+            certificate: Some(cert_wire.to_vec()),
+            safebag: bag.encode().to_vec(),
+        })
+    }
+
     pub(crate) fn list_contexts(&self) -> Vec<NdnContext> {
         self.keyring
             .contexts()
