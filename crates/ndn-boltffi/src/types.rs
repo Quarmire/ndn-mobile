@@ -69,6 +69,9 @@ pub struct NdnEnrolledIdentity {
     pub certificate: Option<Vec<u8>>,
     /// Password-encrypted SafeBag to persist (App Group / Keychain).
     pub safebag: Vec<u8>,
+    /// The trust context adopted on the way (`None` when it was already
+    /// held), with its signed Data: persist it and adopt it again at launch.
+    pub adopted_context: Option<NdnContext>,
 }
 
 /// A class of management action for a §7 scoped-signing grant
@@ -117,6 +120,12 @@ pub struct NdnRecoveredIdentity {
 /// ([`NdnEngine::list_contexts`](crate::NdnEngine::list_contexts)). `namespace`
 /// is the relationship's name (e.g. `/home/bob`, `/work/acme`); `anchor_count`
 /// is how many trust anchors it carries.
+///
+/// Right after an adoption (`adopt_context`, `adopt_context_link`, an
+/// enrollment that adopted) `context_data` and `expected_fingerprint` are
+/// set: the engine keeps the context in memory only, so the host persists
+/// them and calls `adopt_context(context_data, namespace,
+/// expected_fingerprint)` at every launch. `list_contexts` leaves them `None`.
 #[data]
 #[derive(Debug, Clone)]
 pub struct NdnContext {
@@ -124,6 +133,10 @@ pub struct NdnContext {
     pub version: u64,
     pub anchor_count: u64,
     pub enforces_hierarchy: bool,
+    /// The signed context Data wire, as adopted.
+    pub context_data: Option<Vec<u8>>,
+    /// SHA-256 of the root anchor's public key it was checked against.
+    pub expected_fingerprint: Option<Vec<u8>>,
 }
 
 impl NdnContext {
@@ -133,6 +146,22 @@ impl NdnContext {
             version: c.version(),
             anchor_count: c.anchors().len() as u64,
             enforces_hierarchy: c.enforces_hierarchy(),
+            context_data: None,
+            expected_fingerprint: None,
+        }
+    }
+
+    /// A context just adopted from `data`, checked against `fingerprint`:
+    /// carries what the host persists to adopt it again at launch.
+    pub(crate) fn adopted(
+        c: &ndn_security::SignedTrustContext,
+        data: &ndn_packet::Data,
+        fingerprint: &[u8; 32],
+    ) -> Self {
+        Self {
+            context_data: Some(data.raw().to_vec()),
+            expected_fingerprint: Some(fingerprint.to_vec()),
+            ..Self::from_ctx(c)
         }
     }
 }
@@ -170,9 +199,11 @@ pub struct NdnDelegationScope {
 #[data]
 #[derive(Debug, Clone)]
 pub enum NdnTrustEnvelope {
-    /// Adopt a trust context carried inline as root-signed Data — feed to
-    /// `adopt_context(context_data, namespace, fingerprint)`, which verifies
-    /// the signature against the pinned anchor (TOFU) before adopting.
+    /// Adopt a namespace's trust context. With `context_data` (root-signed
+    /// Data inline) feed it to `adopt_context(context_data, namespace,
+    /// fingerprint)`, which verifies the signature against the pinned anchor
+    /// (TOFU) before adopting. Without it (a fingerprint-only link) pass the
+    /// scanned URI to `adopt_context_link`, which fetches the context by name.
     Anchor {
         /// The context namespace the envelope pins (NDN URI).
         namespace: String,
@@ -182,8 +213,8 @@ pub enum NdnTrustEnvelope {
         /// The context version, when the envelope states it (informational;
         /// the signed Data's name is authoritative).
         version: Option<u64>,
-        /// The signed context Data wire.
-        context_data: Vec<u8>,
+        /// The signed context Data wire, when the link carries it inline.
+        context_data: Option<Vec<u8>>,
     },
     /// NDNCERT enrollment invitation — drive token-enroll against `ca_prefix`.
     Invite {
@@ -299,6 +330,15 @@ pub enum NdnError {
     InvalidAddress { addr: String },
     #[error("identity error: {msg}")]
     Identity { msg: String },
+    /// An enrollment that produced no certificate. When it adopted the
+    /// namespace's trust context on the way, that context stays adopted (it
+    /// passed the fingerprint check by itself): persist `adopted_context`
+    /// as after `adopt_context`.
+    #[error("identity error: {msg}")]
+    EnrollmentFailed {
+        msg: String,
+        adopted_context: Option<NdnContext>,
+    },
 }
 
 impl NdnError {

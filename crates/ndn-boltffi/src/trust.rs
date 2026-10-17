@@ -18,12 +18,12 @@ pub struct NdnTrust;
 impl NdnTrust {
     /// Parse an `ndn-trust://<kind>/<base64url>` URI (also accepts the legacy
     /// `ndn-ctx:1:…` anchor form and the `https://…/t/<kind>#…` universal-link
-    /// mirror) into a typed [`NdnTrustEnvelope`]. Errors with
     /// [`NdnError::Engine`] on a malformed or unrecognized payload; on an
-    /// anchor that does not pin a namespace + fingerprint; on a by-reference
-    /// anchor (fingerprint only, no inline context) — this binding adopts
-    /// inline contexts only; and on an unsigned legacy anchor (`ndn-ctx:1:`
-    /// or bare content), which cannot be verified and is never adopted.
+    /// anchor that does not pin a namespace + fingerprint; and on an unsigned
+    /// legacy anchor (`ndn-ctx:1:` or bare content), which cannot be verified
+    /// and is never adopted. An anchor without an inline context (fingerprint
+    /// only) parses with `context_data: None`: hand the URI to
+    /// `adopt_context_link`, which fetches the context by name.
     pub fn parse(uri: String) -> Result<NdnTrustEnvelope, NdnError> {
         let env = TrustEnvelope::from_uri(&uri).map_err(NdnError::engine)?;
         convert(env)
@@ -87,18 +87,14 @@ fn convert(e: TrustEnvelope) -> Result<NdnTrustEnvelope, NdnError> {
             context_content,
         } => {
             let context_data = match (context_data, context_content) {
-                (Some(data), _) => data,
+                (Some(data), _) => Some(data.to_vec()),
                 (None, Some(_)) => {
                     return Err(NdnError::engine(
                         "anchor envelope carries an unsigned legacy context, which cannot be \
                          verified (ask for a re-issued, signed envelope)",
                     ));
                 }
-                (None, None) => {
-                    return Err(NdnError::engine(
-                        "anchor envelope carries no inline context (by-reference anchors are not supported)",
-                    ));
-                }
+                (None, None) => None,
             };
             let (Some(namespace), Some(fingerprint)) = (namespace, fingerprint) else {
                 return Err(NdnError::engine(
@@ -109,7 +105,7 @@ fn convert(e: TrustEnvelope) -> Result<NdnTrustEnvelope, NdnError> {
                 namespace,
                 fingerprint: fingerprint.to_vec(),
                 version,
-                context_data: context_data.to_vec(),
+                context_data,
             }
         }
         TrustEnvelope::Invite {

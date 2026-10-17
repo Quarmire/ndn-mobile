@@ -165,7 +165,7 @@ impl IdentityCore {
                 msg: format!("trust context refused: {e}"),
             },
         )?;
-        Ok(NdnContext::from_ctx(&ctx))
+        Ok(NdnContext::adopted(&ctx, &data, &fingerprint))
     }
 
     /// Adopt the namespace a scanned `ndn-trust://anchor` link names,
@@ -174,7 +174,8 @@ impl IdentityCore {
     /// verified against the link's expected fingerprint; a fingerprint-only
     /// link fetches the context by name through `engine` — whose validator
     /// admits exactly the expected context meanwhile — and requires at least
-    /// the version the link names. Blocking (network round trips).
+    /// the version the link names. Blocking (network round trips). The
+    /// result carries the signed context for the host to persist.
     #[cfg(feature = "identity")]
     pub(crate) fn adopt_context_link(
         &self,
@@ -193,7 +194,11 @@ impl IdentityCore {
                 &link,
             ))
             .map_err(refused)?;
-        Ok(NdnContext::from_ctx(&adopted.context))
+        Ok(NdnContext::adopted(
+            &adopted.context,
+            &adopted.data,
+            &link.expected_fingerprint,
+        ))
     }
 
     /// Enroll this device with the CA an `ndn-trust://invite` link names, as
@@ -204,8 +209,10 @@ impl IdentityCore {
     /// obtain a certificate for it with the invite's token and check its chain
     /// to the root. On success the identity is installed for signing and the
     /// result carries a password-encrypted SafeBag (key + issued certificate)
-    /// for the host to persist. Blocking (network round trips); `engine`
-    /// needs a face and a route for the namespace.
+    /// and any trust context adopted on the way for the host to persist; a
+    /// failure that adopted the context reports it in
+    /// [`NdnError::EnrollmentFailed`]. Blocking (network round trips);
+    /// `engine` needs a face and a route for the namespace.
     #[cfg(feature = "identity")]
     pub(crate) fn enroll_with_invite(
         &self,
@@ -227,6 +234,11 @@ impl IdentityCore {
         let key_name = ndn_cert::new_device_key_name(&identity);
         let key = EcdsaP256Signer::generate(key_name.clone()).map_err(|e| key_error(&e))?;
         let pkcs8 = key.to_pkcs8_der().map_err(|e| key_error(&e))?;
+        let adopted_context = |adopted: &Option<ndn_cert::LinkAdoption>| {
+            adopted.as_ref().zip(invite.expected_fingerprint.as_ref()).map(|(a, fp)| {
+                NdnContext::adopted(&a.context, &a.data, fp)
+            })
+        };
         let enrollment = self
             .rt
             .block_on(ndn_identity::enroll_with_invite_via_engine(
@@ -234,9 +246,11 @@ impl IdentityCore {
                 &self.keyring,
                 &invite,
                 Arc::new(key),
-                ndn_cert::INVITE_CERT_VALIDITY_SECS,
             ))
-            .map_err(|failure| refused(&failure.error))?;
+            .map_err(|failure| NdnError::EnrollmentFailed {
+                msg: format!("enrollment refused: {}", failure.error),
+                adopted_context: adopted_context(&failure.adopted),
+            })?;
 
         let cert_name = (*enrollment.issued.cert.name).clone();
         let cert_wire = enrollment.issued.data.raw().clone();
@@ -256,6 +270,7 @@ impl IdentityCore {
             cert_name: cert_name.to_string(),
             certificate: Some(cert_wire.to_vec()),
             safebag: bag.encode().to_vec(),
+            adopted_context: adopted_context(&enrollment.adopted),
         })
     }
 
@@ -458,6 +473,7 @@ impl IdentityCore {
                 cert_name: enrolled.cert_name().to_string(),
                 certificate: enrolled.certificate().map(|b| b.to_vec()),
                 safebag: bag.encode().to_vec(),
+                adopted_context: None,
             };
             *self.cert_wire.lock().unwrap() = enrolled.certificate().cloned();
             *self.identity.lock().unwrap() = Some(enrolled.signer());
@@ -525,6 +541,7 @@ impl IdentityCore {
                 cert_name: enrolled.cert_name().to_string(),
                 certificate: enrolled.certificate().map(|b| b.to_vec()),
                 safebag: Vec::new(),
+                adopted_context: None,
             };
             *self.cert_wire.lock().unwrap() = enrolled.certificate().cloned();
             *self.identity.lock().unwrap() = Some(enrolled.signer());
@@ -563,6 +580,7 @@ impl IdentityCore {
                 cert_name: generated.cert_name().to_string(),
                 certificate: generated.certificate().map(|b| b.to_vec()),
                 safebag: bag.encode().to_vec(),
+                adopted_context: None,
             };
             *self.cert_wire.lock().unwrap() = generated.certificate().cloned();
             *self.identity.lock().unwrap() = Some(generated.signer());
@@ -647,6 +665,7 @@ impl IdentityCore {
                 cert_name: cert_name.to_string(),
                 certificate: Some(cert_wire.to_vec()),
                 safebag: Vec::new(),
+                adopted_context: None,
             };
             *self.identity.lock().unwrap() = Some(stamped);
             Ok(result)

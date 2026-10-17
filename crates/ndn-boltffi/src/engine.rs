@@ -854,8 +854,10 @@ impl NdnEngine {
     /// including a link that carries only the namespace and the expected
     /// fingerprint: the context is then fetched by name through this engine
     /// (it needs a link and a route toward a node serving the context), checked against the expected
-    /// fingerprint and the link's version, and adopted. Blocking. Requires
-    /// the `identity` feature (on by default).
+    /// fingerprint and the link's version, and adopted. The engine holds it
+    /// in memory only: persist the returned `context_data` and
+    /// `expected_fingerprint` and pass them to [`adopt_context`](Self::adopt_context)
+    /// at every launch. Blocking. Requires the `identity` feature (on by default).
     pub fn adopt_context_link(&self, link_uri: String) -> Result<NdnContext, NdnError> {
         #[cfg(feature = "identity")]
         {
@@ -883,9 +885,13 @@ impl NdnEngine {
     /// fresh key is generated on this device, certified with the invite's
     /// token, and the certificate's chain to the root is checked. On success
     /// the identity is installed (subsequent [`sign`](Self::sign) works) and
-    /// the result carries a password-encrypted SafeBag for the host to
-    /// persist. The engine needs a face and a route for the namespace toward
-    /// a forwarder that serves it. Blocking; requires the `identity` feature.
+    /// the result carries a password-encrypted SafeBag and, when the context
+    /// was adopted on the way, `adopted_context` — both for the host to
+    /// persist (re-adopt the context with [`adopt_context`](Self::adopt_context)
+    /// at launch). A failure that still adopted the context is
+    /// `NdnError::EnrollmentFailed` carrying it. The engine needs a face and a
+    /// route for the namespace toward a forwarder that serves it. Blocking;
+    /// requires the `identity` feature.
     pub fn enroll_with_invite(
         &self,
         invite_uri: String,
@@ -1008,6 +1014,7 @@ impl NdnEngine {
                 cert_name: enrolled.cert_name().to_string(),
                 certificate: enrolled.certificate().map(|b| b.to_vec()),
                 safebag: bag.encode().to_vec(),
+                adopted_context: None,
             };
             self.identity_core.set_identity(enrolled.signer());
             Ok(result)
@@ -2622,7 +2629,7 @@ mod context_tests {
         else {
             panic!("expected an anchor envelope");
         };
-        engine.adopt_context(context_data, namespace, fingerprint)
+        engine.adopt_context(context_data.expect("inline context"), namespace, fingerprint)
     }
 
     /// The participant model: adopt contexts, list them, anti-rollback on
@@ -2671,7 +2678,7 @@ mod context_tests {
         let NdnTrustEnvelope::Anchor {
             namespace,
             fingerprint,
-            context_data,
+            context_data: Some(context_data),
             ..
         } = crate::NdnTrust::parse(namespace_envelope(&SecurityManager::new(), "/home/bob", 1))
             .unwrap()
@@ -2691,7 +2698,7 @@ mod context_tests {
         ));
         // A context signed by an impostor, presented with Bob's real pin.
         let NdnTrustEnvelope::Anchor {
-            context_data: forged,
+            context_data: Some(forged),
             ..
         } = crate::NdnTrust::parse(namespace_envelope(&SecurityManager::new(), "/home/bob", 1))
             .unwrap()
@@ -2726,5 +2733,59 @@ mod context_tests {
         engine.adopt_context(context_data, namespace, fingerprint).unwrap();
         assert_eq!(engine.list_contexts().len(), 1);
         engine.shutdown();
+    }
+
+    /// The engine keeps adopted contexts in memory only: every adoption
+    /// hands the host the signed context and the fingerprint it was checked
+    /// against, and a fresh engine (the next launch) adopts them again.
+    #[test]
+    fn an_adopted_context_can_be_persisted_and_adopted_at_launch() {
+        let bob = SecurityManager::new();
+        let uri = namespace_envelope(&bob, "/home/bob", 3);
+        let adopts: [fn(&NdnEngine, &str) -> Result<NdnContext, NdnError>; 2] = [
+            |e, uri| scan_and_adopt(e, uri),
+            |e, uri| e.adopt_context_link(uri.to_string()),
+        ];
+        for adopt in adopts {
+            let engine = NdnEngine::new(cfg()).unwrap();
+            let adopted = adopt(&engine, &uri).unwrap();
+            engine.shutdown();
+
+            let next_launch = NdnEngine::new(cfg()).unwrap();
+            let again = next_launch
+                .adopt_context(
+                    adopted.context_data.expect("signed context returned"),
+                    adopted.namespace,
+                    adopted.expected_fingerprint.expect("fingerprint returned"),
+                )
+                .unwrap();
+            assert_eq!((again.namespace.as_str(), again.version), ("/home/bob", 3));
+            next_launch.shutdown();
+        }
+    }
+
+    /// A fingerprint-only anchor link parses (without inline context) so the
+    /// host can route it to `adopt_context_link`.
+    #[test]
+    fn a_fingerprint_only_anchor_parses() {
+        let link = TrustEnvelope::Anchor {
+            namespace: Some("/home/bob".into()),
+            fingerprint: Some([7u8; 32]),
+            version: Some(2),
+            context_data: None,
+            context_content: None,
+        };
+        let NdnTrustEnvelope::Anchor {
+            namespace,
+            fingerprint,
+            context_data,
+            ..
+        } = crate::NdnTrust::parse(link.to_uri()).unwrap()
+        else {
+            panic!("expected an anchor envelope");
+        };
+        assert_eq!(namespace, "/home/bob");
+        assert_eq!(fingerprint, vec![7u8; 32]);
+        assert!(context_data.is_none());
     }
 }
