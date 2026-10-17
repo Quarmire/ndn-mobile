@@ -21,8 +21,8 @@ use tokio::runtime::Runtime;
 
 use crate::handlers::{NdnApprovalGate, NdnEnclaveBackend, NdnRecoverySigner};
 use crate::types::{
-    NdnActionClass, NdnContext, NdnDelegationScope, NdnEnrollConfig, NdnEnrolledIdentity, NdnError,
-    NdnRecoveredIdentity,
+    NdnActionClass, NdnCertValidity, NdnContext, NdnDelegationScope, NdnEnrollConfig,
+    NdnEnrolledIdentity, NdnError, NdnRecoveredIdentity,
 };
 
 /// The signing identity + trust state shared by both FFI backends. Holds the
@@ -354,6 +354,81 @@ impl IdentityCore {
             safebag: bag.encode().to_vec(),
             adopted_context: adopted_context(&enrollment.adopted),
         })
+    }
+
+    /// Renew the certificate in `safebag` at the CA that issued it (same
+    /// key, proof of the current certificate, no invite), load the identity
+    /// with the new certificate, and return a new SafeBag (same key, same
+    /// `password`) to persist. Blocking (network round trips).
+    #[cfg(feature = "identity")]
+    pub(crate) fn renew_certificate(
+        &self,
+        engine: &ndn_app::ForwarderEngine,
+        safebag: Vec<u8>,
+        password: Vec<u8>,
+    ) -> Result<NdnEnrolledIdentity, NdnError> {
+        use ndn_security::safebag::SafeBag;
+
+        let refused = |e: &dyn std::fmt::Display| NdnError::Identity {
+            msg: format!("renewal refused: {e}"),
+        };
+        let bag = SafeBag::decode(&safebag).map_err(NdnError::identity)?;
+        let current = ndn_packet::Data::decode(bag.certificate.clone())
+            .map_err(|e| refused(&format!("the SafeBag's certificate is not a Data packet: {e}")))?;
+        let key_name = ndn_cert::key_name_of(&current.name)
+            .ok_or_else(|| refused(&format!("{} names no key", current.name)))?;
+        let signer = ndn_mobile::MobileEngine::load_identity(&bag, &password, key_name.clone())
+            .map_err(NdnError::identity)?;
+        let issued = self
+            .rt
+            .block_on(ndn_identity::renew_via_engine(
+                engine,
+                &self.keyring,
+                &current,
+                Arc::clone(&signer),
+            ))
+            .map_err(|e| refused(&e))?;
+        let pkcs8 = bag.decrypt_pkcs8(&password).map_err(NdnError::identity)?;
+        let cert_wire = issued.data.raw().clone();
+        let renewed =
+            SafeBag::encrypt(cert_wire.clone(), &pkcs8, &password).map_err(NdnError::identity)?;
+        *self.cert_wire.lock().unwrap() = Some(cert_wire.clone());
+        *self.identity.lock().unwrap() = Some(signer);
+        Ok(NdnEnrolledIdentity {
+            key_name: key_name.to_string(),
+            cert_name: issued.cert.name.to_string(),
+            certificate: Some(cert_wire.to_vec()),
+            safebag: renewed.encode().to_vec(),
+            adopted_context: None,
+        })
+    }
+
+    /// The validity of the loaded identity's CA-issued certificate, with
+    /// when to renew it (a third of the lifetime left).
+    pub(crate) fn certificate_validity(&self) -> Result<NdnCertValidity, NdnError> {
+        #[cfg(feature = "identity")]
+        {
+            let wire = self.cert_wire.lock().unwrap().clone().ok_or_else(|| NdnError::Identity {
+                msg: "no identity with a certificate is loaded".into(),
+            })?;
+            let data = ndn_packet::Data::decode(wire).map_err(NdnError::identity)?;
+            let cert = ndn_security::Certificate::decode(&data).map_err(NdnError::identity)?;
+            let renew_at = ndn_identity::RenewBefore::ONE_THIRD
+                .renew_at(cert.valid_from, cert.valid_until);
+            const NS: u64 = 1_000_000_000;
+            Ok(NdnCertValidity {
+                cert_name: cert.name.to_string(),
+                valid_from_secs: cert.valid_from / NS,
+                valid_until_secs: cert.valid_until / NS,
+                renew_at_secs: renew_at / NS,
+            })
+        }
+        #[cfg(not(feature = "identity"))]
+        {
+            Err(NdnError::Identity {
+                msg: "identity feature not enabled in this build".into(),
+            })
+        }
     }
 
     pub(crate) fn list_contexts(&self) -> Vec<NdnContext> {

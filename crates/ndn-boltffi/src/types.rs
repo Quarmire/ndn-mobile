@@ -74,6 +74,23 @@ pub struct NdnEnrolledIdentity {
     pub adopted_context: Option<NdnContext>,
 }
 
+/// The validity of the loaded identity's certificate, so the host can
+/// schedule its renewal with `renew_certificate` (before `renew_at_secs`,
+/// and well before `valid_until_secs`: an expired certificate is never
+/// renewed — the device then needs a new invite).
+#[data]
+#[derive(Debug, Clone)]
+pub struct NdnCertValidity {
+    pub cert_name: String,
+    /// Unix seconds.
+    pub valid_from_secs: u64,
+    /// Unix seconds.
+    pub valid_until_secs: u64,
+    /// When to renew, Unix seconds: once a third of the lifetime is left
+    /// (the `ndn-fwd` daemon's default).
+    pub renew_at_secs: u64,
+}
+
 /// A class of management action for a §7 scoped-signing grant
 /// ([`NdnEngine::grant_signing_scope`](crate::NdnEngine::grant_signing_scope)).
 /// `Any` covers every non-sensitive class; the others narrow the grant.

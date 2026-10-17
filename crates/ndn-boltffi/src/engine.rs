@@ -18,7 +18,8 @@ use crate::handlers::{
 };
 use crate::identity_core::IdentityCore;
 use crate::types::{
-    NdnActionClass, NdnContext, NdnData, NdnDelegationScope, NdnEngineConfig, NdnEnrollConfig,
+    NdnActionClass, NdnCertValidity, NdnContext, NdnData, NdnDelegationScope, NdnEngineConfig,
+    NdnEnrollConfig,
     NdnEnrolledIdentity, NdnError, NdnFaceSpec, NdnRecoveredIdentity, NdnRevocation, NdnSample,
     into_security_profile,
 };
@@ -951,6 +952,51 @@ impl NdnEngine {
             let _ = (invite_uri, device, persist_password);
             Err(NdnError::engine("enroll_with_invite requires the `identity` feature"))
         }
+    }
+
+    /// Renew the certificate in `safebag` (the bag the host persisted from
+    /// an enrollment or an earlier renewal) at the CA that issued it, before
+    /// it expires: the CA re-certifies the same key on proof of the current
+    /// certificate — no invite. On success the identity is loaded with the
+    /// new certificate and the result carries a new SafeBag (same key, same
+    /// `password`) for the host to persist in place of the old one. Refused
+    /// for an expired certificate, a key the CA revoked or a role it does not
+    /// renew (guests, by default): the device then needs a new invite. The
+    /// namespace's trust context must be adopted (the new certificate's
+    /// chain is checked) and the engine needs a route toward the CA. Schedule
+    /// it with [`certificate_validity`](Self::certificate_validity). Blocking;
+    /// requires the `identity` feature.
+    pub fn renew_certificate(
+        &self,
+        safebag: Vec<u8>,
+        password: Vec<u8>,
+    ) -> Result<NdnEnrolledIdentity, NdnError> {
+        #[cfg(feature = "identity")]
+        {
+            let engine = {
+                let guard = self.inner.lock().unwrap();
+                guard
+                    .as_ref()
+                    .ok_or_else(|| NdnError::engine("engine is shut down"))?
+                    .engine()
+                    .clone()
+            };
+            self.identity_core
+                .renew_certificate(&engine, safebag, password)
+        }
+        #[cfg(not(feature = "identity"))]
+        {
+            let _ = (safebag, password);
+            Err(NdnError::engine("renew_certificate requires the `identity` feature"))
+        }
+    }
+
+    /// The validity of the loaded identity's CA-issued certificate — when it
+    /// expires and when to renew it — so the host can schedule
+    /// [`renew_certificate`](Self::renew_certificate). Errors when no
+    /// identity with a certificate is loaded.
+    pub fn certificate_validity(&self) -> Result<NdnCertValidity, NdnError> {
+        self.identity_core.certificate_validity()
     }
 
     /// List the adopted trust contexts (§6 home: "what contexts am I in").

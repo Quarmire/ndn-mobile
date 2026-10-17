@@ -92,8 +92,8 @@ pub use handlers::{
     NdnSampleHandler,
 };
 pub use types::{
-    NdnActionClass, NdnContext, NdnContextRefresh, NdnData, NdnDelegationScope, NdnEngineConfig,
-    NdnEnrollConfig,
+    NdnActionClass, NdnCertValidity, NdnContext, NdnContextRefresh, NdnData, NdnDelegationScope,
+    NdnEngineConfig, NdnEnrollConfig,
     NdnEnrolledIdentity, NdnError, NdnFaceSpec, NdnRecoveredIdentity, NdnRevocation, NdnSample,
     NdnSecurityProfile, NdnTrustEnvelope,
 };

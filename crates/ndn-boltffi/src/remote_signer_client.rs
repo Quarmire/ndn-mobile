@@ -14,11 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use ndn_app::DemuxConnection;
+use ndn_app::{Consumer, DemuxConnection};
 use ndn_security::custodian::{WireSignRequest, WireSignResponse};
 use ndn_packet::encode::InterestBuilder;
-use ndn_packet::lp::{LpPacket, is_lp_packet};
-use ndn_packet::{Data, Interest, Name, SignatureType};
+use ndn_packet::{Interest, Name, SignatureType};
 use ndn_security::{Signer, TrustError};
 
 type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
@@ -72,19 +71,6 @@ impl RemoteSignerClient {
     }
 }
 
-/// Decode a reply wire as Data, unwrapping an NDNLP fragment if present.
-fn decode_reply(reply: Bytes) -> Result<Data, String> {
-    let raw = if is_lp_packet(&reply) {
-        LpPacket::decode(reply.clone())
-            .map_err(|e| format!("lp decode: {e:?}"))?
-            .fragment
-            .ok_or_else(|| "lp packet had no fragment".to_string())?
-    } else {
-        reply
-    };
-    Data::decode(raw).map_err(|e| format!("data decode: {e:?}"))
-}
-
 /// `<identity>/KEY/<key-id>` from a full cert name
 /// `<identity>/KEY/<key-id>/<issuer>/<version>`; falls back to the whole name.
 fn key_name_from_cert(cert_name: &Name) -> Name {
@@ -126,9 +112,10 @@ impl Signer for RemoteSignerClient {
             // The ParametersSha256Digest over (req_id, region) makes each Interest
             // name unique, so distinct requests neither collapse in the PIT nor
             // serve a stale signature from the CS. The responder echoes that name
-            // as the Data name, and we fetch by that exact name over the demux so
-            // concurrent segment signs never receive each other's signatures (the
-            // bare recv FIFO does — the bug this replaces).
+            // as the Data name; over the demux each fetch receives exactly the
+            // reply to its own Interest, so concurrent segment signs never
+            // receive each other's signatures (the bare recv FIFO did — the bug
+            // this replaces).
             let wire = InterestBuilder::new(prefix)
                 .must_be_fresh()
                 .lifetime(SIGN_TIMEOUT)
@@ -137,16 +124,13 @@ impl Signer for RemoteSignerClient {
             let expected = Interest::decode(wire.clone())
                 .map_err(|e| TrustError::KeyStore(format!("remote signer: own interest: {e:?}")))?
                 .name;
-            let reply = conn
-                .fetch_correlated((*expected).clone(), wire, SIGN_TIMEOUT + Duration::from_secs(1))
+            let data = Consumer::new(conn)
+                .fetch_wire(wire, SIGN_TIMEOUT + Duration::from_secs(1))
                 .await
                 .map_err(|e| {
                     tracing::warn!(target: "ndn_boltffi::remote_signer", req_id, error = %e, "remote sign: no reply");
                     TrustError::KeyStore(format!("remote signer: no reply: {e}"))
                 })?;
-            let data = decode_reply(reply).map_err(|e| {
-                TrustError::KeyStore(format!("remote signer: undecodable Data: {e}"))
-            })?;
             let got_name = (*data.name).clone();
             if got_name != *expected {
                 tracing::error!(

@@ -231,7 +231,14 @@ async fn backward_refetch(refetch: Refetch, source_versioned: Name, seg: u64, re
     let stale_at = now_ns() + SEGMENT_FRESHNESS.as_nanos() as u64;
     refetch
         .cs
-        .insert_erased(wire.clone(), Arc::new(pub_seg), CsMeta { stale_at })
+        .insert_erased(
+            wire.clone(),
+            Arc::new(pub_seg),
+            CsMeta {
+                stale_at,
+                revocation_epoch: None,
+            },
+        )
         .await;
     responder.respond_bytes(wire).await.ok();
 }
@@ -336,8 +343,11 @@ async fn run_relay(inp: RelayInputs) {
                         sign_t += sign_t0.elapsed();
                         let stale_at = now_ns() + SEGMENT_FRESHNESS.as_nanos() as u64;
                         let ins_t0 = std::time::Instant::now();
-                        cs.insert_erased(wire.clone(), Arc::new(name), CsMeta { stale_at })
-                            .await;
+                        let meta = CsMeta {
+                            stale_at,
+                            revocation_epoch: None,
+                        };
+                        cs.insert_erased(wire.clone(), Arc::new(name), meta).await;
                         insert_t += ins_t0.elapsed();
                         let pub_t0 = std::time::Instant::now();
                         producer.publish(wire).await.ok();
