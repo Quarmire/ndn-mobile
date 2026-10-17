@@ -236,15 +236,20 @@ where
     )
     .await?;
 
-    let certificate = match ndn_cert::client::fetch_issued_cert(&mut exchange, &cert_name).await {
-        // The fetched Data IS the cert; embed its full wire (Data TLV 0x06)
-        // so the SafeBag round-trips — not its Content (the SPKI key, 0x30).
-        Ok(data) => Some(data.raw().clone()),
-        Err(e) => {
-            tracing::debug!(error = %e, "issued cert fetch skipped (no repo)");
-            None
-        }
-    };
+    // Steered to the CA by a ForwardingHint: a relay routing this device's
+    // prefix toward the device would otherwise send the fetch back here.
+    let certificate =
+        match ndn_cert::client::fetch_issued_cert_via(&mut exchange, &cfg.ca_prefix, &cert_name)
+            .await
+        {
+            // The fetched Data IS the cert; embed its full wire (Data TLV 0x06)
+            // so the SafeBag round-trips — not its Content (the SPKI key, 0x30).
+            Ok(data) => Some(data.raw().clone()),
+            Err(e) => {
+                tracing::debug!(error = %e, "issued cert fetch skipped (no repo)");
+                None
+            }
+        };
     Ok((cert_name, certificate))
 }
 

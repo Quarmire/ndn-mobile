@@ -201,6 +201,88 @@ impl IdentityCore {
         ))
     }
 
+    /// Check each held trust context (only `namespace`, when given) for a
+    /// newer version through `engine`, the way the `ndn-fwd` daemon does
+    /// (`ndn_identity::refresh_context_via_engine`): the newest version's name
+    /// by RDR metadata, then the signed context, adopted only if it is newer
+    /// and signed by an anchor of the version held (continuity). A refused or
+    /// failed check changes nothing. Blocking (network round trips).
+    #[cfg(feature = "identity")]
+    pub(crate) fn refresh_contexts(
+        &self,
+        engine: &ndn_app::ForwarderEngine,
+        namespace: Option<String>,
+    ) -> Result<Vec<crate::types::NdnContextRefresh>, NdnError> {
+        use crate::types::NdnContextRefresh;
+        use ndn_cert::ContextRefresh;
+
+        let held = self.keyring.contexts();
+        let targets = match namespace {
+            Some(ns) => {
+                let name: Name = ns.parse().map_err(|_| NdnError::invalid_name(&ns))?;
+                let ctx = held
+                    .into_iter()
+                    .find(|c| *c.namespace() == name)
+                    .ok_or_else(|| NdnError::Identity {
+                        msg: format!("no trust context is held for {ns}; adopt it first"),
+                    })?;
+                vec![ctx]
+            }
+            None => held,
+        };
+        let mut results = Vec::with_capacity(targets.len());
+        for ctx in targets {
+            let ns = ctx.namespace().clone();
+            let entry = |state: &str, version, revoked, detail, context| NdnContextRefresh {
+                namespace: ns.to_string(),
+                state: state.to_string(),
+                held_version: ctx.version(),
+                version,
+                revoked,
+                detail,
+                context,
+            };
+            let outcome = self.rt.block_on(ndn_identity::refresh_context_via_engine(
+                engine,
+                &self.keyring,
+                &ns,
+            ));
+            results.push(match outcome {
+                Ok(ContextRefresh::Current { version }) => entry(
+                    "current",
+                    version,
+                    Vec::new(),
+                    format!("the namespace serves v{version}, the version held"),
+                    None,
+                ),
+                Ok(ContextRefresh::UpstreamOlder { held, offered }) => entry(
+                    "upstream-older",
+                    held,
+                    Vec::new(),
+                    format!("what answered serves v{offered}, older than the held v{held}"),
+                    None,
+                ),
+                Ok(ContextRefresh::Updated(update)) => {
+                    let fingerprint = ndn_cert::anchor_fingerprint(&update.signer);
+                    entry(
+                        "updated",
+                        update.context.version(),
+                        update.revoked.iter().map(Name::to_string).collect(),
+                        format!(
+                            "adopted v{} signed by {}, an anchor of v{}",
+                            update.context.version(),
+                            update.signer.name,
+                            update.previous
+                        ),
+                        Some(NdnContext::adopted(&update.context, &update.data, &fingerprint)),
+                    )
+                }
+                Err(e) => entry("failed", ctx.version(), Vec::new(), e.to_string(), None),
+            });
+        }
+        Ok(results)
+    }
+
     /// Enroll this device with the CA an `ndn-trust://invite` link names, as
     /// `<ns>/<role>/<device>`, the same way the `ndn-fwd` daemon does
     /// (`ndn_identity::enroll_with_invite_via_engine`): adopt the

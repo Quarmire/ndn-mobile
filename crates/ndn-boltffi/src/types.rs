@@ -166,6 +166,30 @@ impl NdnContext {
     }
 }
 
+/// What [`NdnEngine::refresh_contexts`](crate::NdnEngine::refresh_contexts)
+/// found for one held trust context. `state` is `updated` (a newer version,
+/// signed by an anchor of the held one, is now held), `current`,
+/// `upstream-older` (what answered serves an older version; nothing changed)
+/// or `failed` (`detail` says why; the held version stays in force).
+///
+/// For `updated`, `context` carries the new signed context and the
+/// fingerprint of the root that signed it: persist both in place of the
+/// stored ones, and pass them to `adopt_context` at every launch.
+#[data]
+#[derive(Debug, Clone)]
+pub struct NdnContextRefresh {
+    pub namespace: String,
+    pub state: String,
+    /// The version held before the check.
+    pub held_version: u64,
+    /// The version held now.
+    pub version: u64,
+    /// Revocation entries (key names) the new version adds.
+    pub revoked: Vec<String>,
+    pub detail: String,
+    pub context: Option<NdnContext>,
+}
+
 /// A verified revocation
 /// ([`NdnEngine::verify_revocation`](crate::NdnEngine::verify_revocation)): a
 /// signed statement that `revoked` is dead. Feed `revoked` into a verifier's

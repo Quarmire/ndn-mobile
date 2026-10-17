@@ -878,6 +878,41 @@ impl NdnEngine {
         }
     }
 
+    /// Check the held trust contexts (only `namespace`, when given) for a
+    /// newer version — how a revocation made on the namespace's root device
+    /// reaches this app — through this engine (it needs a link and a route
+    /// for the namespace toward a forwarder that holds it). A version is
+    /// adopted only if it is newer and signed by an anchor of the version
+    /// held; a refused or failed check changes nothing. For each `updated`
+    /// entry, persist its `context` (signed context + root fingerprint) in
+    /// place of the stored one and re-adopt it with
+    /// [`adopt_context`](Self::adopt_context) at launch. Call it when the app
+    /// comes to the foreground or periodically (the `ndn-fwd` daemon checks
+    /// every `[security] context_refresh_secs`). Blocking. Requires the
+    /// `identity` feature (on by default).
+    pub fn refresh_contexts(
+        &self,
+        namespace: Option<String>,
+    ) -> Result<Vec<crate::types::NdnContextRefresh>, NdnError> {
+        #[cfg(feature = "identity")]
+        {
+            let engine = {
+                let guard = self.inner.lock().unwrap();
+                guard
+                    .as_ref()
+                    .ok_or_else(|| NdnError::engine("engine is shut down"))?
+                    .engine()
+                    .clone()
+            };
+            self.identity_core.refresh_contexts(&engine, namespace)
+        }
+        #[cfg(not(feature = "identity"))]
+        {
+            let _ = namespace;
+            Err(NdnError::engine("refresh_contexts requires the `identity` feature"))
+        }
+    }
+
     /// Enroll this device with the CA a scanned `ndn-trust://invite` link
     /// names, as `<namespace>/<role>/<device>` (`device`: 1–63 letters,
     /// digits, `-`, `_`, `.`). The namespace's trust context is adopted first
@@ -1449,6 +1484,9 @@ impl NdnEngine {
         let engine = engine_guard
             .as_ref()
             .ok_or_else(|| NdnError::engine("engine is shut down"))?;
+        // Registering spawns the producer face's I/O task, which needs the
+        // ambient runtime; `serve` is called from a host thread outside it.
+        let _rt = self.rt.enter();
         Ok(engine.register_producer(name))
     }
 }
@@ -2594,9 +2632,15 @@ mod context_tests {
         }
     }
 
-    /// A namespace's root-signed context at `version`, as the
-    /// `ndn-trust://anchor` URI it would show in a QR (namespace + fingerprint pin + signed Data).
-    fn namespace_envelope(mgr: &SecurityManager, ns: &str, version: u64) -> String {
+    /// A namespace's context at `version` revoking `revoked`, signed by the
+    /// root key `<ns>/KEY/root` in `mgr` (generated on first use), and the
+    /// root anchor it lists.
+    fn signed_context(
+        mgr: &SecurityManager,
+        ns: &str,
+        version: u64,
+        revoked: &[&str],
+    ) -> (ndn_packet::Data, ndn_security::Certificate) {
         let key: ndn_packet::Name = format!("{ns}/KEY/root").parse().unwrap();
         if mgr.get_signer_sync(&key).is_err() {
             mgr.generate_ed25519(key.clone()).unwrap();
@@ -2605,9 +2649,18 @@ mod context_tests {
         let anchor = mgr
             .issue_self_signed(&key, signer.public_key().unwrap(), u64::MAX)
             .unwrap();
-        let ctx = SignedTrustContext::hierarchical(ns.parse().unwrap()).with_version(version);
+        let mut ctx = SignedTrustContext::hierarchical(ns.parse().unwrap()).with_version(version);
+        for r in revoked {
+            ctx = ctx.with_revocation(r.parse().unwrap());
+        }
         ctx.add_anchor(anchor.clone());
-        let data = ctx.sign_into_data(signer.as_ref()).unwrap();
+        (ctx.sign_into_data(signer.as_ref()).unwrap(), anchor)
+    }
+
+    /// A namespace's root-signed context at `version`, as the
+    /// `ndn-trust://anchor` URI it would show in a QR (namespace + fingerprint pin + signed Data).
+    fn namespace_envelope(mgr: &SecurityManager, ns: &str, version: u64) -> String {
+        let (data, anchor) = signed_context(mgr, ns, version, &[]);
         TrustEnvelope::Anchor {
             namespace: Some(ns.to_string()),
             fingerprint: Some(ndn_cert::anchor_fingerprint(&anchor)),
@@ -2787,5 +2840,121 @@ mod context_tests {
         assert_eq!(namespace, "/home/bob");
         assert_eq!(fingerprint, vec![7u8; 32]);
         assert!(context_data.is_none());
+    }
+
+    /// `refresh_contexts` adopts an update signed by the held root and hands
+    /// the host its signed bytes to persist; a higher version signed by
+    /// another key claiming the namespace is refused and the held version
+    /// stays.
+    #[test]
+    fn refresh_adopts_only_updates_signed_by_the_held_root() {
+        use crate::handlers::NdnInterestHandler;
+        use ndn_packet::encode::DataBuilder;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        const NS: &str = "/home/bob";
+        let revoked = "/home/bob/member/phone/KEY/k1";
+        let bob = SecurityManager::new();
+        let (v2, anchor) = signed_context(&bob, NS, 2, &[revoked]);
+        // Another root whose key is also named /home/bob/KEY/root.
+        let (forged_v3, _) = signed_context(&SecurityManager::new(), NS, 3, &[]);
+
+        /// What a forwarder holding the namespace serves: the RDR metadata
+        /// naming its newest version, and that signed context.
+        fn serving(context: &ndn_packet::Data) -> Vec<(String, Vec<u8>)> {
+            let versioned = (*context.name).clone();
+            let version = versioned.components().last().unwrap().as_version().unwrap();
+            let meta_name = ndn_cert::rdr_metadata_name(&NS.parse().unwrap());
+            let meta = DataBuilder::new(
+                meta_name.clone().append_version(version).append_segment(0),
+                &versioned.encode_to_tlv(),
+            )
+            .build();
+            vec![
+                (meta_name.to_string(), meta.to_vec()),
+                (versioned.to_string(), context.raw().to_vec()),
+            ]
+        }
+        struct Upstream {
+            phase: Arc<AtomicUsize>,
+            phases: Vec<Vec<(String, Vec<u8>)>>,
+        }
+        impl NdnInterestHandler for Upstream {
+            fn handle_interest(&self, name: String) -> Option<Vec<u8>> {
+                self.phases[self.phase.load(Ordering::SeqCst)]
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, wire)| wire.clone())
+            }
+        }
+
+        let engine = Arc::new(NdnEngine::new(cfg()).unwrap());
+        scan_and_adopt(&engine, &namespace_envelope(&bob, NS, 1)).unwrap();
+        let phase = Arc::new(AtomicUsize::new(0));
+        let upstream = Upstream {
+            phase: Arc::clone(&phase),
+            phases: vec![serving(&v2), serving(&forged_v3)],
+        };
+        let producer = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            let _ = producer.serve(NS.to_string(), Box::new(upstream));
+        });
+        std::thread::sleep(Duration::from_millis(500));
+
+        // The root's v2 is adopted; the host gets the signed bytes.
+        let refreshed = engine.refresh_contexts(Some(NS.to_string())).unwrap();
+        let [r] = refreshed.as_slice() else {
+            panic!("one namespace checked: {refreshed:?}")
+        };
+        assert_eq!(
+            (r.state.as_str(), r.held_version, r.version),
+            ("updated", 1, 2),
+            "{}",
+            r.detail
+        );
+        assert_eq!(r.revoked, vec![revoked.to_string()]);
+        let persisted = r.context.clone().expect("updated context returned");
+        assert_eq!(persisted.context_data.as_deref(), Some(v2.raw().as_ref()));
+        assert_eq!(
+            persisted.expected_fingerprint.as_deref(),
+            Some(ndn_cert::anchor_fingerprint(&anchor).as_slice())
+        );
+        assert_eq!(engine.list_contexts()[0].version, 2);
+
+        // A higher version signed by another root is refused.
+        phase.store(1, Ordering::SeqCst);
+        let refreshed = engine.refresh_contexts(None).unwrap();
+        let [r] = refreshed.as_slice() else {
+            panic!("one namespace checked: {refreshed:?}")
+        };
+        assert_eq!(
+            (r.state.as_str(), r.held_version, r.version),
+            ("failed", 2, 2),
+            "{}",
+            r.detail
+        );
+        // Refused (by the forwarder's expectation or the continuity check),
+        // not merely unreachable.
+        assert!(
+            r.detail.contains("refused a trust-context update for /home/bob"),
+            "{}",
+            r.detail
+        );
+        assert!(r.context.is_none());
+        assert_eq!(engine.list_contexts()[0].version, 2, "the held version stays");
+        engine.shutdown();
+
+        // The next launch re-adopts what the host persisted.
+        let next_launch = NdnEngine::new(cfg()).unwrap();
+        let again = next_launch
+            .adopt_context(
+                persisted.context_data.unwrap(),
+                persisted.namespace,
+                persisted.expected_fingerprint.unwrap(),
+            )
+            .unwrap();
+        assert_eq!(again.version, 2);
+        next_launch.shutdown();
     }
 }
