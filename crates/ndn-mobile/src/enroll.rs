@@ -140,7 +140,8 @@ impl EnrolledIdentity {
         self.certificate.as_ref()
     }
 
-    /// The signing identity, with its `KeyLocator` set to the issued cert name,
+    /// The signing identity, its `KeyLocator` naming the key (NDN Certificate
+    /// Format v2: verifiers resolve it to the newest valid certificate),
     /// ready to sign subscriptions / management commands. For a custodian key
     /// this signs *through* the custodian (enclave biometric per use).
     pub fn signer(&self) -> Arc<dyn Signer> {
@@ -299,22 +300,11 @@ impl MobileEngine {
 
         let (cert_name, certificate) = self.run_ndncert(&cfg, &signer, pin_cb).await?;
 
-        // Re-stamp the issued cert name on a fresh software signer (`with_cert_name`
-        // consumes self, and the original is shared with the session).
-        let stamped = Arc::new(
-            EcdsaP256Signer::from_pkcs8_der(
-                &ecdsa
-                    .to_pkcs8_der()
-                    .map_err(|e| EnrollError::Key(e.to_string()))?,
-                key_name.clone(),
-            )
-            .map_err(|e| EnrollError::Key(e.to_string()))?
-            .with_cert_name(cert_name.clone()),
-        );
-
-        let exportable = stamped.to_pkcs8_der().map_err(|e| EnrollError::Key(e.to_string()))?;
+        // The KeyLocator names the key; verifiers resolve it to the newest
+        // valid certificate (this one, or a renewed one later).
+        let exportable = ecdsa.to_pkcs8_der().map_err(|e| EnrollError::Key(e.to_string()))?;
         Ok(EnrolledIdentity {
-            signer: stamped,
+            signer: ecdsa,
             key_name,
             cert_name,
             certificate,
@@ -344,21 +334,10 @@ impl MobileEngine {
 
         let (cert_name, certificate) = self.run_ndncert_token(&cfg, &signer, &token).await?;
 
-        // Re-stamp the issued cert name on a fresh software signer (as enroll_pin).
-        let stamped = Arc::new(
-            EcdsaP256Signer::from_pkcs8_der(
-                &ecdsa
-                    .to_pkcs8_der()
-                    .map_err(|e| EnrollError::Key(e.to_string()))?,
-                key_name.clone(),
-            )
-            .map_err(|e| EnrollError::Key(e.to_string()))?
-            .with_cert_name(cert_name.clone()),
-        );
-
-        let exportable = stamped.to_pkcs8_der().map_err(|e| EnrollError::Key(e.to_string()))?;
+        // The KeyLocator names the key (as enroll_pin).
+        let exportable = ecdsa.to_pkcs8_der().map_err(|e| EnrollError::Key(e.to_string()))?;
         Ok(EnrolledIdentity {
-            signer: stamped,
+            signer: ecdsa,
             key_name,
             cert_name,
             certificate,
@@ -395,22 +374,20 @@ impl MobileEngine {
             .unwrap_or_default()
             .as_nanos() as u64;
         let until_ns = now_ns.saturating_add(validity_secs.saturating_mul(1_000_000_000));
-        // The self-signed cert is named EXACTLY the key name (KeyChain convention)
-        // so a verifier resolving the Data's KeyLocator finds it.
-        let cert_name = key_name.clone();
+        // A self-signed certificate `<key>/self/<version>` (NDN Certificate
+        // Format v2); the KeyLocator names the key, which resolves to it.
+        let cert_name = ndn_security::cert_name::new_cert_name(
+            &key_name,
+            ndn_security::cert_name::SELF_ISSUER,
+        );
         let cert_wire =
             ndn_security::encode_cert_data(&cert_name, &pubkey, key.as_ref(), now_ns, until_ns)
                 .await
                 .map_err(|e| EnrollError::Cert(e.to_string()))?;
 
         let pkcs8 = key.to_pkcs8_der().map_err(|e| EnrollError::Key(e.to_string()))?;
-        let stamped: Arc<dyn Signer> = Arc::new(
-            Ed25519Signer::from_pkcs8_der(&pkcs8, key_name.clone())
-                .map_err(|e| EnrollError::Key(e.to_string()))?
-                .with_cert_name(cert_name.clone()),
-        );
         Ok(EnrolledIdentity {
-            signer: stamped,
+            signer: key,
             key_name,
             cert_name,
             certificate: Some(cert_wire),
@@ -457,21 +434,10 @@ pub async fn enroll_token_conn(
     let mut consumer = Consumer::new(conn);
     let (cert_name, certificate) = run_ndncert_token_on(&mut consumer, &cfg, &signer, &token).await?;
 
-    // Re-stamp the issued cert name on a fresh software signer (as enroll_token).
-    let stamped = Arc::new(
-        EcdsaP256Signer::from_pkcs8_der(
-            &ecdsa
-                .to_pkcs8_der()
-                .map_err(|e| EnrollError::Key(e.to_string()))?,
-            key_name.clone(),
-        )
-        .map_err(|e| EnrollError::Key(e.to_string()))?
-        .with_cert_name(cert_name.clone()),
-    );
-
-    let exportable = stamped.to_pkcs8_der().map_err(|e| EnrollError::Key(e.to_string()))?;
+    // The KeyLocator names the key (as enroll_token).
+    let exportable = ecdsa.to_pkcs8_der().map_err(|e| EnrollError::Key(e.to_string()))?;
     Ok(EnrolledIdentity {
-        signer: stamped,
+        signer: ecdsa,
         key_name,
         cert_name,
         certificate,
@@ -492,22 +458,20 @@ pub async fn enroll_token_custodian_conn(
     token: String,
 ) -> Result<EnrolledIdentity, EnrollError> {
     let key_name = key_id.as_name().clone();
-    let make_signer = || {
-        CustodianSigner::new(
-            custodian.clone(),
-            key_id.clone(),
-            SignatureType::SignatureSha256WithEcdsa,
-            Some(public_key.clone()),
-        )
-    };
-    let signer: Arc<dyn Signer> = Arc::new(make_signer());
+    // The KeyLocator names the key: verifiers resolve it to the newest valid
+    // certificate, so the signer is the same before and after issuance.
+    let signer: Arc<dyn Signer> = Arc::new(CustodianSigner::new(
+        custodian,
+        key_id,
+        SignatureType::SignatureSha256WithEcdsa,
+        Some(public_key),
+    ));
 
     let mut consumer = Consumer::new(conn);
     let (cert_name, certificate) = run_ndncert_token_on(&mut consumer, &cfg, &signer, &token).await?;
 
-    let stamped: Arc<dyn Signer> = Arc::new(make_signer().with_cert_name(cert_name.clone()));
     Ok(EnrolledIdentity {
-        signer: stamped,
+        signer,
         key_name,
         cert_name,
         certificate,
@@ -537,21 +501,18 @@ impl MobileEngine {
         Fut: std::future::Future<Output = String>,
     {
         let key_name = key_id.as_name().clone();
-        let make_signer = || {
-            CustodianSigner::new(
-                custodian.clone(),
-                key_id.clone(),
-                SignatureType::SignatureSha256WithEcdsa,
-                Some(public_key.clone()),
-            )
-        };
-        let signer: Arc<dyn Signer> = Arc::new(make_signer());
+        let signer: Arc<dyn Signer> = Arc::new(CustodianSigner::new(
+            custodian,
+            key_id,
+            SignatureType::SignatureSha256WithEcdsa,
+            Some(public_key),
+        ));
 
         let (cert_name, certificate) = self.run_ndncert(&cfg, &signer, pin_cb).await?;
 
-        let stamped: Arc<dyn Signer> = Arc::new(make_signer().with_cert_name(cert_name.clone()));
+        // The KeyLocator names the key (as enroll_token_custodian_conn).
         Ok(EnrolledIdentity {
-            signer: stamped,
+            signer,
             key_name,
             cert_name,
             certificate,
@@ -573,21 +534,18 @@ impl MobileEngine {
         token: String,
     ) -> Result<EnrolledIdentity, EnrollError> {
         let key_name = key_id.as_name().clone();
-        let make_signer = || {
-            CustodianSigner::new(
-                custodian.clone(),
-                key_id.clone(),
-                SignatureType::SignatureSha256WithEcdsa,
-                Some(public_key.clone()),
-            )
-        };
-        let signer: Arc<dyn Signer> = Arc::new(make_signer());
+        let signer: Arc<dyn Signer> = Arc::new(CustodianSigner::new(
+            custodian,
+            key_id,
+            SignatureType::SignatureSha256WithEcdsa,
+            Some(public_key),
+        ));
 
         let (cert_name, certificate) = self.run_ndncert_token(&cfg, &signer, &token).await?;
 
-        let stamped: Arc<dyn Signer> = Arc::new(make_signer().with_cert_name(cert_name.clone()));
+        // The KeyLocator names the key (as enroll_pin_custodian).
         Ok(EnrolledIdentity {
-            signer: stamped,
+            signer,
             key_name,
             cert_name,
             certificate,

@@ -1166,18 +1166,17 @@ impl NdnEngine {
     }
 
     /// Re-bind a previously generated hardware identity after restart: rebuild
-    /// the enclave-backed signer for the persisted `key_name` / `cert_name` (no
-    /// new key, no self-sign, **no biometric**) and install it. The enclave key
-    /// persists in hardware; the host passes the same backend. Requires the
-    /// `identity` feature.
+    /// the enclave-backed signer for the persisted `key_name` (no new key, no
+    /// self-sign, **no biometric**) and install it. Its KeyLocator names the
+    /// key, so verifiers resolve the newest valid certificate — a renewed
+    /// certificate needs no re-bind. The enclave key persists in hardware; the
+    /// host passes the same backend. Requires the `identity` feature.
     pub fn load_identity_enclave(
         &self,
         key_name: String,
-        cert_name: String,
         enclave: Box<dyn NdnEnclaveBackend>,
     ) -> Result<bool, NdnError> {
-        self.identity_core
-            .load_identity_enclave(key_name, cert_name, enclave)
+        self.identity_core.load_identity_enclave(key_name, enclave)
     }
 
     /// Serve **one** RemoteSigner request (the phone-as-second-factor): decode the
@@ -2160,9 +2159,9 @@ mod identity_tests {
     /// Secure object plane: with an identity loaded, `publish_object` SIGNS every
     /// segment, and `fetch_object_verified` reassembles it only after verifying
     /// each against the node's own self-cert anchor — the secure-by-default file
-    /// path, end to end over an in-proc engine. (Resolution fix: generate_identity
-    /// now names its self-cert == key_name, matching the KeyLocator sign_with_sync
-    /// writes, so the chain anchors instead of returning Pending.)
+    /// path, end to end over an in-proc engine. (generate_identity's self-cert
+    /// is `<key>/self/<version>`; the KeyLocator names the key, which the
+    /// validator resolves to that anchor.)
     #[test]
     fn signed_publish_object_round_trips_through_verified_fetch() {
         use std::sync::Arc;
@@ -3001,6 +3000,108 @@ mod context_tests {
             )
             .unwrap();
         assert_eq!(again.version, 2);
+        next_launch.shutdown();
+    }
+}
+
+#[cfg(all(test, feature = "identity"))]
+mod enclave_identity_tests {
+    use super::*;
+    use crate::handlers::{NdnEnclaveBackend, NdnInterestHandler};
+    use crate::types::NdnSecurityProfile;
+    use ndn_security::{EcdsaP256Signer, SecurityManager, Signer};
+    use std::time::Duration;
+
+    fn cfg() -> NdnEngineConfig {
+        NdnEngineConfig {
+            cs_capacity_mb: 1,
+            security_profile: NdnSecurityProfile::Default,
+            faces: Vec::new(),
+            node_name: None,
+            pipeline_threads: 1,
+            persistent_cs_path: None,
+        }
+    }
+
+    /// A device enclave in software: the key lives in `0`.
+    struct SoftEnclave(Arc<EcdsaP256Signer>);
+    impl NdnEnclaveBackend for SoftEnclave {
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn public_key(&self) -> Vec<u8> {
+            self.0.public_key().unwrap().to_vec()
+        }
+        fn sign(&self, region: Vec<u8>) -> Vec<u8> {
+            self.0.sign_sync(&region).unwrap().to_vec()
+        }
+    }
+
+    /// The CA, serving the certificate it issued by name (CanBePrefix).
+    struct Ca {
+        cert_name: Name,
+        wire: Vec<u8>,
+    }
+    impl NdnInterestHandler for Ca {
+        fn handle_interest(&self, name: String) -> Option<Vec<u8>> {
+            let name: Name = name.parse().ok()?;
+            self.cert_name.has_prefix(&name).then(|| self.wire.clone())
+        }
+    }
+
+    /// An enclave identity's certificate is the one recorded for its key:
+    /// right after generation its own self-certificate (not a fresh one per
+    /// call), and once a CA has certified the key, the CA-issued certificate —
+    /// resolved by key name when the identity is loaded at the next launch.
+    #[test]
+    fn principal_cert_wire_is_the_enclave_identitys_real_certificate() {
+        let key = Arc::new(EcdsaP256Signer::generate("/lab/enclave/KEY/hw".parse().unwrap()).unwrap());
+        let engine = NdnEngine::new(cfg()).unwrap();
+        let generated = engine
+            .generate_identity_enclave("/lab/alice".into(), Box::new(SoftEnclave(Arc::clone(&key))))
+            .unwrap();
+        let self_cert = generated.certificate.clone().expect("a self-certificate");
+        assert_eq!(engine.principal_cert_wire().unwrap(), self_cert);
+        assert_eq!(engine.principal_cert_wire().unwrap(), self_cert, "minted once");
+        engine.shutdown();
+
+        // Enrollment: the namespace CA certifies the enclave key.
+        let key_name: Name = generated.key_name.parse().unwrap();
+        let ca = SecurityManager::new();
+        let ca_key: Name = "/lab/KEY/ca".parse().unwrap();
+        ca.generate_ecdsa_p256(ca_key.clone()).unwrap();
+        let issued = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(ca.certify_as(
+                &key_name,
+                key.public_key().unwrap(),
+                &ca_key,
+                3_600_000,
+                ndn_security::cert_name::NDNCERT_ISSUER,
+                None,
+            ))
+            .unwrap();
+        let issued_wire = issued.data_wire().unwrap().to_vec();
+
+        // The next launch loads the enclave key by name; the CA is reachable.
+        let next_launch = Arc::new(NdnEngine::new(cfg()).unwrap());
+        let producer = Arc::clone(&next_launch);
+        let served = Ca {
+            cert_name: (*issued.name).clone(),
+            wire: issued_wire.clone(),
+        };
+        std::thread::spawn(move || {
+            let _ = producer.serve("/lab/alice".into(), Box::new(served));
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        next_launch
+            .load_identity_enclave(generated.key_name.clone(), Box::new(SoftEnclave(key)))
+            .unwrap();
+        assert_eq!(next_launch.principal_cert_wire().unwrap(), issued_wire);
+        assert_eq!(
+            next_launch.certificate_validity().unwrap().cert_name,
+            issued.name.to_string()
+        );
         next_launch.shutdown();
     }
 }

@@ -41,12 +41,13 @@ pub(crate) struct IdentityCore {
     /// The loaded operator identity (signs management commands / RemoteSigner
     /// responses). Set by `load_identity`; used by `sign`.
     identity: Mutex<Option<Arc<dyn ndn_security::Signer>>>,
-    /// The CA-issued certificate (Data wire) for the loaded identity, retained
-    /// so the node can serve it to a gateway that fetches it reflexively while
-    /// authorising a `/localhop` prefix registration. Distinct from the
-    /// self-signed `principal_cert_wire()` — only this one chains to the CA's
-    /// localhop anchor. `None` until a cert-bearing identity is loaded.
-    cert_wire: Mutex<Option<bytes::Bytes>>,
+    /// The certificates of this core's identities (CA-issued, renewed, or
+    /// self-signed), by key. The loaded identity's *current* certificate —
+    /// the one its key-name KeyLocator resolves to, served to a gateway that
+    /// fetches it reflexively while authorising a `/localhop` registration
+    /// and returned by `principal_cert_wire()` — is the newest valid one
+    /// recorded for its key ([`Self::current_cert`]).
+    certs: ndn_security::CertCache,
     /// §7 scoped-signing grants consulted by `respond_to_sign_request` before
     /// the biometric gate.
     #[cfg(feature = "identity")]
@@ -77,7 +78,7 @@ impl IdentityCore {
             conn: demux.clone(),
             demux,
             identity: Mutex::new(None),
-            cert_wire: Mutex::new(None),
+            certs: ndn_security::CertCache::new(),
             #[cfg(feature = "identity")]
             sign_policy: Mutex::new(ndn_security::custodian::ScopedSigningPolicy::new()),
             keyring: Arc::new(ndn_security::Keyring::new()),
@@ -114,10 +115,7 @@ impl IdentityCore {
         // by generate_identity / enroll / load) — so content we published chains.
         // (Not a reconstruction: a fabricated self-cert wouldn't match KeyLocator
         // and the chain wouldn't resolve.)
-        if let Some(cert_wire) = self.cert_wire.lock().unwrap().clone()
-            && let Ok(data) = ndn_packet::Data::decode(cert_wire)
-            && let Ok(cert) = ndn_security::Certificate::decode(&data)
-        {
+        if let Some(cert) = self.current_cert() {
             // add_trust_anchor (not just cert_cache.insert): the cert must be a
             // recognized ROOT, else the hierarchical walk never finds an anchor
             // and returns Pending ("certificate chain not resolved").
@@ -342,10 +340,11 @@ impl IdentityCore {
             &persist_password,
         )
         .map_err(|e| key_error(&e))?;
+        // The KeyLocator names the key; verifiers resolve it to the newest
+        // valid certificate (this one, a renewed one after renew_certificate).
         let signer = EcdsaP256Signer::from_pkcs8_der(&pkcs8, key_name.clone())
-            .map_err(|e| key_error(&e))?
-            .with_cert_name(cert_name.clone());
-        *self.cert_wire.lock().unwrap() = Some(cert_wire.clone());
+            .map_err(|e| key_error(&e))?;
+        self.record_cert(&cert_wire);
         *self.identity.lock().unwrap() = Some(Arc::new(signer));
         Ok(NdnEnrolledIdentity {
             key_name: key_name.to_string(),
@@ -392,7 +391,7 @@ impl IdentityCore {
         let cert_wire = issued.data.raw().clone();
         let renewed =
             SafeBag::encrypt(cert_wire.clone(), &pkcs8, &password).map_err(NdnError::identity)?;
-        *self.cert_wire.lock().unwrap() = Some(cert_wire.clone());
+        self.record_cert(&cert_wire);
         *self.identity.lock().unwrap() = Some(signer);
         Ok(NdnEnrolledIdentity {
             key_name: key_name.to_string(),
@@ -408,11 +407,13 @@ impl IdentityCore {
     pub(crate) fn certificate_validity(&self) -> Result<NdnCertValidity, NdnError> {
         #[cfg(feature = "identity")]
         {
-            let wire = self.cert_wire.lock().unwrap().clone().ok_or_else(|| NdnError::Identity {
-                msg: "no identity with a certificate is loaded".into(),
-            })?;
-            let data = ndn_packet::Data::decode(wire).map_err(NdnError::identity)?;
-            let cert = ndn_security::Certificate::decode(&data).map_err(NdnError::identity)?;
+            let cert = self
+                .resolve_cert_wire()
+                .and_then(|wire| ndn_packet::Data::decode(wire).ok())
+                .and_then(|data| ndn_security::Certificate::decode(&data).ok())
+                .ok_or_else(|| NdnError::Identity {
+                    msg: "no identity with a certificate is loaded".into(),
+                })?;
             let renew_at = ndn_identity::RenewBefore::ONE_THIRD
                 .renew_at(cert.valid_from, cert.valid_until);
             const NS: u64 = 1_000_000_000;
@@ -473,7 +474,7 @@ impl IdentityCore {
         )
         .map_err(|e| NdnError::engine(format!("remote signer setup: {e}")))?;
         *self.identity.lock().unwrap() = Some(Arc::new(signer));
-        *self.cert_wire.lock().unwrap() = Some(Bytes::from(cert_wire));
+        self.record_cert(&Bytes::from(cert_wire));
         Ok(true)
     }
 
@@ -555,7 +556,7 @@ impl IdentityCore {
                 .map_err(NdnError::identity)?;
             // Retain the CA-issued cert (inside the bag) so we can serve it to a
             // gateway that fetches it reflexively during localhop registration.
-            *self.cert_wire.lock().unwrap() = Some(bag.certificate.clone());
+            self.record_cert(&bag.certificate);
             *self.identity.lock().unwrap() = Some(signer);
             Ok(self.loaded_identity()?.did())
         }
@@ -632,7 +633,9 @@ impl IdentityCore {
                 safebag: bag.encode().to_vec(),
                 adopted_context: None,
             };
-            *self.cert_wire.lock().unwrap() = enrolled.certificate().cloned();
+            if let Some(wire) = enrolled.certificate() {
+                self.record_cert(wire);
+            }
             *self.identity.lock().unwrap() = Some(enrolled.signer());
             Ok(result)
         }
@@ -700,7 +703,11 @@ impl IdentityCore {
                 safebag: Vec::new(),
                 adopted_context: None,
             };
-            *self.cert_wire.lock().unwrap() = enrolled.certificate().cloned();
+            // A CA that pairs no repo returns no certificate: the current one
+            // is then fetched by key name when first needed.
+            if let Some(wire) = enrolled.certificate() {
+                self.record_cert(wire);
+            }
             *self.identity.lock().unwrap() = Some(enrolled.signer());
             Ok(result)
         }
@@ -739,7 +746,9 @@ impl IdentityCore {
                 safebag: bag.encode().to_vec(),
                 adopted_context: None,
             };
-            *self.cert_wire.lock().unwrap() = generated.certificate().cloned();
+            if let Some(wire) = generated.certificate() {
+                self.record_cert(wire);
+            }
             *self.identity.lock().unwrap() = Some(generated.signer());
             Ok(result)
         }
@@ -786,37 +795,33 @@ impl IdentityCore {
             let key_name: Name = id_name.append("KEY").append_version(ts_ms);
             let key_id = KeyId(key_name.clone());
 
-            let signer = CustodianSigner::new(
-                custodian.clone(),
-                key_id.clone(),
+            // The KeyLocator names the key; verifiers resolve it to the newest
+            // valid certificate (this self-cert, or a later one for the key).
+            let signer: Arc<dyn ndn_security::Signer> = Arc::new(CustodianSigner::new(
+                custodian,
+                key_id,
                 SignatureType::SignatureSha256WithEcdsa,
                 Some(pubkey.clone()),
-            );
+            ));
             let now_ns = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as u64;
             const VALIDITY_SECS: u64 = 10 * 365 * 24 * 60 * 60;
             let until_ns = now_ns.saturating_add(VALIDITY_SECS.saturating_mul(1_000_000_000));
-            let cert_name = key_name.clone().append("self").append_version(0);
+            let cert_name = ndn_security::cert_name::new_cert_name(
+                &key_name,
+                ndn_security::cert_name::SELF_ISSUER,
+            );
             let cert_wire = self
                 .rt
                 .block_on(ndn_security::encode_cert_data(
-                    &cert_name, &pubkey, &signer, now_ns, until_ns,
+                    &cert_name, &pubkey, &*signer, now_ns, until_ns,
                 ))
                 .map_err(|e| NdnError::Identity {
                     msg: format!("enclave self-cert failed: {e}"),
                 })?;
 
-            let stamped: Arc<dyn ndn_security::Signer> = Arc::new(
-                CustodianSigner::new(
-                    custodian,
-                    key_id,
-                    SignatureType::SignatureSha256WithEcdsa,
-                    Some(pubkey),
-                )
-                .with_cert_name(cert_name.clone()),
-            );
             let result = NdnEnrolledIdentity {
                 key_name: key_name.to_string(),
                 cert_name: cert_name.to_string(),
@@ -824,7 +829,8 @@ impl IdentityCore {
                 safebag: Vec::new(),
                 adopted_context: None,
             };
-            *self.identity.lock().unwrap() = Some(stamped);
+            self.record_cert(&cert_wire);
+            *self.identity.lock().unwrap() = Some(signer);
             Ok(result)
         }
         #[cfg(not(feature = "identity"))]
@@ -839,7 +845,6 @@ impl IdentityCore {
     pub(crate) fn load_identity_enclave(
         &self,
         key_name: String,
-        cert_name: String,
         enclave: Box<dyn NdnEnclaveBackend>,
     ) -> Result<bool, NdnError> {
         #[cfg(feature = "identity")]
@@ -850,9 +855,6 @@ impl IdentityCore {
             let kname: Name = key_name
                 .parse()
                 .map_err(|_| NdnError::invalid_name(&key_name))?;
-            let cname: Name = cert_name
-                .parse()
-                .map_err(|_| NdnError::invalid_name(&cert_name))?;
             let backend: Arc<dyn ndn_security::custodian::EnclaveBackend> =
                 Arc::new(CallbackEnclaveBackend { callback: enclave });
             if !backend.is_available() {
@@ -868,21 +870,22 @@ impl IdentityCore {
             }
             let custodian: Arc<dyn Custodian> =
                 Arc::new(EnclaveCustodian::new(backend, key_name));
-            let signer: Arc<dyn ndn_security::Signer> = Arc::new(
-                CustodianSigner::new(
-                    custodian,
-                    KeyId(kname),
-                    SignatureType::SignatureSha256WithEcdsa,
-                    Some(pubkey),
-                )
-                .with_cert_name(cname),
-            );
+            // The KeyLocator names the key: verifiers resolve it to the newest
+            // valid certificate, so a renewal needs no re-bind here. The
+            // certificate itself (the CA-issued one) is fetched by key name
+            // when first needed ([`Self::resolve_cert_wire`]).
+            let signer: Arc<dyn ndn_security::Signer> = Arc::new(CustodianSigner::new(
+                custodian,
+                KeyId(kname),
+                SignatureType::SignatureSha256WithEcdsa,
+                Some(pubkey),
+            ));
             *self.identity.lock().unwrap() = Some(signer);
             Ok(true)
         }
         #[cfg(not(feature = "identity"))]
         {
-            let _ = (key_name, cert_name, enclave);
+            let _ = (key_name, enclave);
             Err(NdnError::Identity {
                 msg: "identity feature not enabled in this build".into(),
             })
@@ -1045,9 +1048,9 @@ impl IdentityCore {
         let key_loc = signer.cert_name().or_else(|| Some(signer.key_name())).cloned();
         // The CA-issued cert to serve to the gateway over the reflexive reverse
         // path (so it validates the command against its localhop anchor without a
-        // FIB cert-fetch). `None` for a self-signed/recovered identity — the pull
+        // FIB cert-fetch). `None` for an identity with no certificate — the pull
         // then returns empty and the gateway falls back to its FIB fetcher.
-        let cert_wire = self.cert_wire.lock().unwrap().clone();
+        let cert_wire = self.resolve_cert_wire();
 
         self.rt.block_on(async move {
             use ndn_packet::encode::{DataBuilder, random_reflexive_name};
@@ -1179,12 +1182,12 @@ impl IdentityCore {
 
     #[cfg(feature = "identity")]
     pub(crate) fn principal_cert_wire(&self) -> Result<Vec<u8>, NdnError> {
-        // Prefer the ACTUAL signing cert (set on load/generate/enroll) — its name
-        // is what our Data's KeyLocator references, so a peer that pins it can
-        // resolve our signatures. Re-encoding a fresh self-cert below would name
-        // it `<key>/self/v=0`, which does NOT match the key-name KeyLocator
-        // sign_with_sync writes → the peer's chain stays unresolved.
-        if let Some(cert_wire) = self.cert_wire.lock().unwrap().clone() {
+        // Prefer the ACTUAL signing cert: the one our Data's key-name
+        // KeyLocator resolves to (recorded on load/generate/enroll, else
+        // fetched by key name — e.g. the CA-issued certificate of an enclave
+        // key loaded at startup). A self-cert is only for an identity with no
+        // certificate anywhere; it is recorded, so it is minted once.
+        if let Some(cert_wire) = self.resolve_cert_wire() {
             return Ok(cert_wire.to_vec());
         }
         let signer = self
@@ -1199,7 +1202,10 @@ impl IdentityCore {
             msg: "loaded identity has no exportable public key".into(),
         })?;
         let cert_name = signer.cert_name().cloned().unwrap_or_else(|| {
-            signer.key_name().clone().append("self").append_version(0)
+            ndn_security::cert_name::new_cert_name(
+                signer.key_name(),
+                ndn_security::cert_name::SELF_ISSUER,
+            )
         });
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1215,7 +1221,91 @@ impl IdentityCore {
             .map_err(|e| NdnError::Identity {
                 msg: format!("encode operator cert: {e}"),
             })?;
+        self.record_cert(&cert_wire);
         Ok(cert_wire.to_vec())
+    }
+
+    /// Record `wire`, a certificate (Data) of one of this core's identities.
+    #[cfg(feature = "identity")]
+    fn record_cert(&self, wire: &Bytes) {
+        let cert = ndn_packet::Data::decode(wire.clone())
+            .map_err(|e| e.to_string())
+            .and_then(|data| ndn_security::Certificate::decode(&data).map_err(|e| e.to_string()));
+        match cert {
+            Ok(cert) => self.certs.insert(cert),
+            Err(e) => tracing::warn!(
+                target: "ndn_boltffi::identity",
+                error = %e,
+                "not recording an undecodable identity certificate"
+            ),
+        }
+    }
+
+    /// The loaded identity's current certificate among those recorded: the
+    /// newest valid one of its key, else the newest.
+    fn current_cert(&self) -> Option<ndn_security::Certificate> {
+        let key = Arc::new(self.identity.lock().unwrap().as_ref()?.key_name().clone());
+        self.certs.get(&key)
+    }
+
+    /// The loaded identity's current certificate (Data wire). With no valid
+    /// one recorded, fetch the newest certificate of its key by key name
+    /// (CanBePrefix — the CA serves the certificates it issued) and record
+    /// it when it certifies the identity's public key. `None` with no
+    /// identity, or no certificate recorded or reachable.
+    #[cfg(feature = "identity")]
+    fn resolve_cert_wire(&self) -> Option<Bytes> {
+        let signer = self.identity.lock().unwrap().clone()?;
+        if self.certs.get_valid(signer.key_name()).is_none()
+            && let Some(wire) = self.fetch_cert(signer.as_ref())
+        {
+            self.record_cert(&wire);
+        }
+        self.current_cert()?.data_wire()
+    }
+
+    /// The newest certificate of `signer`'s key reachable over the
+    /// connection, when it is valid and certifies `signer`'s public key.
+    #[cfg(feature = "identity")]
+    fn fetch_cert(&self, signer: &dyn ndn_security::Signer) -> Option<Bytes> {
+        use ndn_packet::encode::InterestBuilder;
+        const CERT_FETCH_LIFETIME: std::time::Duration = std::time::Duration::from_secs(2);
+
+        let key = signer.key_name();
+        let interest = InterestBuilder::new(key.clone())
+            .can_be_prefix()
+            .lifetime(CERT_FETCH_LIFETIME);
+        let data = match self
+            .rt
+            .block_on(Consumer::new(self.conn.clone()).fetch_with(interest))
+        {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::debug!(
+                    target: "ndn_boltffi::identity",
+                    key = %key,
+                    error = %e,
+                    "no certificate of the identity's key reachable"
+                );
+                return None;
+            }
+        };
+        let cert = ndn_security::Certificate::decode(&data).ok()?;
+        // The enclave reports its key as SPKI DER or as the raw SEC1 point
+        // SPKI ends with; a certificate carries what the CSR held.
+        let certifies = signer.public_key().is_none_or(|pk| {
+            cert.public_key == pk || cert.public_key.ends_with(&pk) || pk.ends_with(&cert.public_key)
+        });
+        if cert.key_name() != *key || !certifies || !cert.is_valid_now() {
+            tracing::warn!(
+                target: "ndn_boltffi::identity",
+                key = %key,
+                certificate = %cert.name,
+                "ignoring a fetched certificate that does not certify the identity's key now"
+            );
+            return None;
+        }
+        Some(data.raw().clone())
     }
 
     pub(crate) fn recovery_public_key(
@@ -1622,6 +1712,7 @@ impl IdentityCore {
             ))
             .map_err(NdnError::identity)?;
 
+        self.record_cert(&cert_wire);
         let safebag = ndn_security::safebag::SafeBag::encrypt(cert_wire, &pkcs8, persist_password)
             .map_err(|e| NdnError::Identity {
                 msg: format!("safebag: {e}"),

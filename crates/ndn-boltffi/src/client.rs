@@ -557,17 +557,15 @@ impl NdnClient {
         self.identity_core.generate_identity_enclave(name, enclave)
     }
 
-    /// Re-bind a previously generated hardware identity after restart.
-    /// Requires the `identity` feature.
+    /// Re-bind a previously generated hardware identity (by its key name)
+    /// after restart. Requires the `identity` feature.
     #[cfg(feature = "identity")]
     pub fn load_identity_enclave(
         &self,
         key_name: String,
-        cert_name: String,
         enclave: Box<dyn NdnEnclaveBackend>,
     ) -> Result<bool, NdnError> {
-        self.identity_core
-            .load_identity_enclave(key_name, cert_name, enclave)
+        self.identity_core.load_identity_enclave(key_name, enclave)
     }
 
     /// Serve one RemoteSigner request (the single-shot core).

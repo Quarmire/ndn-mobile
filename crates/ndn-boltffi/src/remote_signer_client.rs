@@ -26,7 +26,8 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 const SIGN_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// A [`Signer`] that signs over the RemoteSigner seam. It reports the signing
-/// node's identity metadata (so produced Data carry the node's KeyLocator) but
+/// node's identity metadata (so produced Data carry the node's KeyLocator — its
+/// key name, which verifiers resolve to the node's newest valid certificate) but
 /// performs no local cryptography — each `sign` is an Interest/Data exchange with
 /// the responder served at `prefix`.
 pub(crate) struct RemoteSignerClient {
@@ -34,15 +35,14 @@ pub(crate) struct RemoteSignerClient {
     prefix: Name,
     sig_type: SignatureType,
     key_name: Name,
-    cert_name: Option<Name>,
     public_key: Option<Bytes>,
     req_seq: AtomicU64,
 }
 
 impl RemoteSignerClient {
     /// Build from the served `prefix` and the signing node's certificate wire.
-    /// The KeyLocator metadata (key/cert name, algorithm, public key) is read
-    /// from the cert; the cert itself is what a peer pins to verify produced Data.
+    /// The KeyLocator metadata (key name, algorithm, public key) is read from
+    /// the cert; the cert itself is what a peer pins to verify produced Data.
     pub(crate) fn from_cert(
         conn: Arc<DemuxConnection>,
         prefix: Name,
@@ -52,7 +52,7 @@ impl RemoteSignerClient {
             .map_err(|e| TrustError::KeyStore(format!("remote signer cert decode: {e:?}")))?;
         let cert = ndn_security::Certificate::decode(&data)?;
         let cert_name: Name = (*cert.name).clone();
-        let key_name = key_name_from_cert(&cert_name);
+        let key_name = cert.key_name();
         tracing::debug!(
             target: "ndn_boltffi::remote_signer",
             %cert_name, %key_name, sig_type = ?cert.sig_type,
@@ -64,22 +64,10 @@ impl RemoteSignerClient {
             prefix,
             sig_type: cert.sig_type,
             key_name,
-            cert_name: Some(cert_name),
             public_key: Some(cert.public_key),
             req_seq: AtomicU64::new(1),
         })
     }
-}
-
-/// `<identity>/KEY/<key-id>` from a full cert name
-/// `<identity>/KEY/<key-id>/<issuer>/<version>`; falls back to the whole name.
-fn key_name_from_cert(cert_name: &Name) -> Name {
-    let comps = cert_name.components();
-    if let Some(key_idx) = comps.iter().position(|c| c.value.as_ref() == b"KEY") {
-        let end = (key_idx + 2).min(comps.len());
-        return Name::from_components(comps[..end].iter().cloned());
-    }
-    cert_name.clone()
 }
 
 impl Signer for RemoteSignerClient {
@@ -88,9 +76,6 @@ impl Signer for RemoteSignerClient {
     }
     fn key_name(&self) -> &Name {
         &self.key_name
-    }
-    fn cert_name(&self) -> Option<&Name> {
-        self.cert_name.as_ref()
     }
     fn public_key(&self) -> Option<Bytes> {
         self.public_key.clone()
