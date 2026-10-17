@@ -20,7 +20,8 @@ use crate::identity_core::IdentityCore;
 use crate::types::{
     NdnActionClass, NdnCertValidity, NdnContext, NdnData, NdnDelegationScope, NdnEngineConfig,
     NdnEnrollConfig,
-    NdnEnrolledIdentity, NdnError, NdnFaceSpec, NdnRecoveredIdentity, NdnRevocation, NdnSample,
+    NdnEnrolledIdentity, NdnError, NdnFaceSpec, NdnRecoveredIdentity, NdnRenewal, NdnRevocation,
+    NdnSample,
     into_security_profile,
 };
 
@@ -963,22 +964,28 @@ impl NdnEngine {
     /// skipped): after the namespace's root device is replaced through a
     /// recovery kit, the namespace's CA runs a later CA key, nobody else may
     /// serve the CA certificate that issued this one, and the new CA renews it
-    /// only with this chain. On success the identity is loaded with the new
-    /// certificate and the result carries a new SafeBag (same key, same
-    /// `password`) and the new certificate's `issuers` for the host to persist
-    /// in place of the old ones. Refused for an expired certificate, a key the
-    /// CA revoked or a role it does not renew (guests, by default): the device
-    /// then needs a new invite. The namespace's trust context must be adopted
-    /// (the new certificate's chain is checked) and the engine needs a route
-    /// toward the CA. Schedule it with
-    /// [`certificate_validity`](Self::certificate_validity). Blocking;
-    /// requires the `identity` feature.
+    /// only with this chain. The outcome:
+    /// - [`NdnRenewal::Renewed`]: the identity is loaded with the new
+    ///   certificate; persist its SafeBag (same key, same `password`) and
+    ///   `issuers` in place of the old ones.
+    /// - [`NdnRenewal::Refused`]: retrying cannot help — an expired
+    ///   certificate, a key the CA revoked or a role it does not renew
+    ///   (guests, by default); the device then needs a new invite.
+    /// - [`NdnRenewal::Failed`]: the CA was unreachable or the device key
+    ///   could not sign; retry later.
+    ///
+    /// An `Err` means the arguments cannot be used (an unreadable SafeBag, a
+    /// wrong password): retrying with the same ones cannot help. The
+    /// namespace's trust context must be adopted (the new certificate's
+    /// chain is checked) and the engine needs a route toward the CA.
+    /// Schedule it with [`certificate_validity`](Self::certificate_validity).
+    /// Blocking; requires the `identity` feature.
     pub fn renew_certificate(
         &self,
         safebag: Vec<u8>,
         password: Vec<u8>,
         issuers: Vec<Vec<u8>>,
-    ) -> Result<NdnEnrolledIdentity, NdnError> {
+    ) -> Result<NdnRenewal, NdnError> {
         #[cfg(feature = "identity")]
         {
             let engine = {
@@ -999,10 +1006,11 @@ impl NdnEngine {
         }
     }
 
-    /// The validity of the loaded identity's CA-issued certificate — when it
+    /// The validity of the loaded identity's current certificate — when it
     /// expires and when to renew it — so the host can schedule
-    /// [`renew_certificate`](Self::renew_certificate). Errors when no
-    /// identity with a certificate is loaded.
+    /// [`renew_certificate`](Self::renew_certificate). Errors, saying what
+    /// to do, when no identity is loaded or no certificate of its key is
+    /// held or reachable.
     pub fn certificate_validity(&self) -> Result<NdnCertValidity, NdnError> {
         self.identity_core.certificate_validity()
     }
@@ -1106,7 +1114,8 @@ impl NdnEngine {
                 adopted_context: None,
                 issuers: Vec::new(),
             };
-            self.identity_core.set_identity(enrolled.signer());
+            self.identity_core
+                .set_identity(enrolled.signer(), enrolled.certificate());
             Ok(result)
         }
         #[cfg(not(feature = "identity"))]
@@ -1174,18 +1183,27 @@ impl NdnEngine {
         self.identity_core.generate_identity_enclave(name, enclave)
     }
 
-    /// Re-bind a previously generated hardware identity after restart: rebuild
-    /// the enclave-backed signer for the persisted `key_name` (no new key, no
-    /// self-sign, **no biometric**) and install it. Its KeyLocator names the
-    /// key, so verifiers resolve the newest valid certificate — a renewed
-    /// certificate needs no re-bind. The enclave key persists in hardware; the
-    /// host passes the same backend. Requires the `identity` feature.
+    /// Re-bind a hardware identity after restart: rebuild the enclave-backed
+    /// signer for the persisted `key_name` (no new key, no self-sign, **no
+    /// biometric**) and install it with `certificate`, the certificate the
+    /// host persisted for it (`NdnEnrolledIdentity::certificate` of its
+    /// generation, enrollment or renewal; refused when it is not a
+    /// certificate of `key_name` certifying the enclave's public key). Its
+    /// KeyLocator names the key, so verifiers resolve the newest valid
+    /// certificate — a renewed certificate needs no re-bind. With no
+    /// certificate, or once it has expired, the newest one is fetched by key
+    /// name when first needed and taken only when it chains to an adopted
+    /// trust context; none is ever minted here. The enclave key persists in
+    /// hardware; the host passes the same backend. Requires the `identity`
+    /// feature.
     pub fn load_identity_enclave(
         &self,
         key_name: String,
         enclave: Box<dyn NdnEnclaveBackend>,
+        certificate: Option<Vec<u8>>,
     ) -> Result<bool, NdnError> {
-        self.identity_core.load_identity_enclave(key_name, enclave)
+        self.identity_core
+            .load_identity_enclave(key_name, enclave, certificate)
     }
 
     /// Serve **one** RemoteSigner request (the phone-as-second-factor): decode the
@@ -1277,12 +1295,15 @@ impl NdnEngine {
         self.identity_core.principal_public_key()
     }
 
-    /// A certificate for the loaded identity — the unit a paired operator console
-    /// imports to provision a **remote signer** (`provision_remote_signer_from_cert`):
-    /// it carries the operator name, public key, and algorithm, and doubles as the
-    /// TOFU trust anchor for the signatures the console will receive. Re-signed by
-    /// the identity itself over its existing cert name (or a `…/self` name if none),
-    /// so it can be produced without the original CA exchange. Requires the
+    /// The loaded identity's current certificate — the unit a paired operator
+    /// console imports to provision a **remote signer**
+    /// (`provision_remote_signer_from_cert`): it carries the operator name,
+    /// public key, and algorithm, and doubles as the TOFU trust anchor for the
+    /// signatures the console will receive. It is the certificate the identity
+    /// was installed with (a self-issued identity's own self-certificate, a
+    /// CA-issued or renewed one), else the newest one of its key fetched by key
+    /// name that chains to an adopted trust context; it is never minted here.
+    /// Errors, saying what to do, when none is held or reachable. Requires the
     /// `identity` feature + a loaded identity.
     #[cfg(feature = "identity")]
     pub fn principal_cert_wire(&self) -> Result<Vec<u8>, NdnError> {
@@ -3017,8 +3038,8 @@ mod context_tests {
 mod enclave_identity_tests {
     use super::*;
     use crate::handlers::{NdnEnclaveBackend, NdnInterestHandler};
-    use crate::types::NdnSecurityProfile;
-    use ndn_security::{EcdsaP256Signer, SecurityManager, Signer};
+    use crate::types::{NdnRenewal, NdnSecurityProfile};
+    use ndn_security::{Certificate, EcdsaP256Signer, SecurityManager, Signer, SignedTrustContext};
     use std::time::Duration;
 
     fn cfg() -> NdnEngineConfig {
@@ -3046,71 +3067,252 @@ mod enclave_identity_tests {
         }
     }
 
-    /// The CA, serving the certificate it issued by name (CanBePrefix).
-    struct Ca {
-        cert_name: Name,
-        wire: Vec<u8>,
-    }
-    impl NdnInterestHandler for Ca {
+    /// Serves the certificates it holds by name (CanBePrefix).
+    struct Serving(Vec<Certificate>);
+    impl NdnInterestHandler for Serving {
         fn handle_interest(&self, name: String) -> Option<Vec<u8>> {
             let name: Name = name.parse().ok()?;
-            self.cert_name.has_prefix(&name).then(|| self.wire.clone())
+            let cert = self.0.iter().find(|c| c.name.has_prefix(&name))?;
+            Some(cert.data_wire()?.to_vec())
         }
     }
 
-    /// An enclave identity's certificate is the one recorded for its key:
-    /// right after generation its own self-certificate (not a fresh one per
-    /// call), and once a CA has certified the key, the CA-issued certificate —
-    /// resolved by key name when the identity is loaded at the next launch.
+    /// The namespace `/lab`: its root key `/lab/KEY/root` (Ed25519, in the
+    /// returned manager), its anchor, and its signed trust context.
+    struct Lab {
+        root: SecurityManager,
+        root_key: Name,
+        anchor: Certificate,
+        context: ndn_packet::Data,
+    }
+
+    impl Lab {
+        fn new() -> Self {
+            let root = SecurityManager::new();
+            let root_key: Name = "/lab/KEY/root".parse().unwrap();
+            root.generate_ed25519(root_key.clone()).unwrap();
+            let signer = root.get_signer_sync(&root_key).unwrap();
+            let anchor = root
+                .issue_self_signed(&root_key, signer.public_key().unwrap(), u64::MAX)
+                .unwrap();
+            let ctx = SignedTrustContext::hierarchical("/lab".parse().unwrap()).with_version(1);
+            ctx.add_anchor(anchor.clone());
+            let context = ctx.sign_into_data(signer.as_ref()).unwrap();
+            Self {
+                root,
+                root_key,
+                anchor,
+                context,
+            }
+        }
+
+        fn adopt(&self, engine: &NdnEngine) {
+            engine
+                .adopt_context(
+                    self.context.raw().to_vec(),
+                    "/lab".into(),
+                    ndn_cert::anchor_fingerprint(&self.anchor).to_vec(),
+                )
+                .unwrap();
+        }
+    }
+
+    /// A certificate for `subject` certifying `public_key`, signed by
+    /// `issuer` (a key in `mgr`), valid for `validity_ms`.
+    fn certify(
+        mgr: &SecurityManager,
+        subject: &Name,
+        public_key: bytes::Bytes,
+        issuer: &Name,
+        validity_ms: u64,
+    ) -> Certificate {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(mgr.certify_as(
+                subject,
+                public_key,
+                issuer,
+                validity_ms,
+                ndn_security::cert_name::NDNCERT_ISSUER,
+                None,
+            ))
+            .unwrap()
+    }
+
+    /// An engine serving `certs` under `/lab` (the namespace's CA and repo).
+    fn launch_serving(certs: Vec<Certificate>) -> Arc<NdnEngine> {
+        let engine = Arc::new(NdnEngine::new(cfg()).unwrap());
+        let producer = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            let _ = producer.serve("/lab".into(), Box::new(Serving(certs)));
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        engine
+    }
+
+    fn enclave_key() -> Arc<EcdsaP256Signer> {
+        Arc::new(EcdsaP256Signer::generate("/lab/enclave/KEY/hw".parse().unwrap()).unwrap())
+    }
+
+    /// A certificate fetched by key name is taken only when it certifies the
+    /// key and chains to the root of an adopted trust context: an impostor's
+    /// certificate, one certifying another public key, or a genuine one with
+    /// no context adopted is not recorded — and nothing is minted instead.
     #[test]
-    fn principal_cert_wire_is_the_enclave_identitys_real_certificate() {
-        let key = Arc::new(EcdsaP256Signer::generate("/lab/enclave/KEY/hw".parse().unwrap()).unwrap());
+    fn a_fetched_certificate_is_taken_only_when_it_chains_to_an_adopted_context() {
+        let lab = Lab::new();
+        let key = enclave_key();
+        let key_name: Name = "/lab/alice/KEY/hw".parse().unwrap();
+        let public_key = key.public_key().unwrap();
+        let genuine = certify(&lab.root, &key_name, public_key.clone(), &lab.root_key, 3_600_000);
+
+        let eve = SecurityManager::new();
+        let eve_key: Name = "/lab/KEY/eve".parse().unwrap();
+        eve.generate_ecdsa_p256(eve_key.clone()).unwrap();
+        let eve_cert = eve
+            .issue_self_signed(&eve_key, eve.get_signer_sync(&eve_key).unwrap().public_key().unwrap(), u64::MAX)
+            .unwrap();
+        let forged = certify(&eve, &key_name, public_key, &eve_key, 3_600_000);
+        let other = EcdsaP256Signer::generate(key_name.clone()).unwrap();
+        let other_key = certify(&lab.root, &key_name, other.public_key().unwrap(), &lab.root_key, 3_600_000);
+
+        let refused: [(&str, Vec<Certificate>, bool); 3] = [
+            ("signed by an impostor", vec![forged, eve_cert, lab.anchor.clone()], true),
+            ("certifying another public key", vec![other_key, lab.anchor.clone()], true),
+            ("chaining to no adopted context", vec![genuine.clone(), lab.anchor.clone()], false),
+        ];
+        for (case, served, adopt) in refused {
+            let engine = launch_serving(served);
+            if adopt {
+                lab.adopt(&engine);
+            }
+            engine
+                .load_identity_enclave(key_name.to_string(), Box::new(SoftEnclave(Arc::clone(&key))), None)
+                .unwrap();
+            assert!(engine.principal_cert_wire().is_err(), "a certificate {case} was taken");
+            assert!(engine.certificate_validity().is_err(), "a certificate {case} was recorded");
+            engine.shutdown();
+        }
+
+        let engine = launch_serving(vec![genuine.clone(), lab.anchor.clone()]);
+        lab.adopt(&engine);
+        engine
+            .load_identity_enclave(key_name.to_string(), Box::new(SoftEnclave(key)), None)
+            .unwrap();
+        let genuine_wire = genuine.data_wire().unwrap().to_vec();
+        assert_eq!(engine.principal_cert_wire().unwrap(), genuine_wire);
+        assert_eq!(engine.certificate_validity().unwrap().cert_name, genuine.name.to_string());
+        engine.shutdown();
+    }
+
+    /// A self-issued enclave identity's certificate is its own
+    /// self-certificate, made once at generation. Re-bound at a later launch,
+    /// an enclave identity uses the certificate the host persisted — a CA
+    /// certificate stays the one served and reported, never hidden by a
+    /// minted one — and with none held or reachable it has no certificate
+    /// at all rather than a made-up one.
+    #[test]
+    fn a_persisted_certificate_is_never_hidden_by_a_minted_one() {
+        let key = enclave_key();
         let engine = NdnEngine::new(cfg()).unwrap();
         let generated = engine
             .generate_identity_enclave("/lab/alice".into(), Box::new(SoftEnclave(Arc::clone(&key))))
             .unwrap();
         let self_cert = generated.certificate.clone().expect("a self-certificate");
         assert_eq!(engine.principal_cert_wire().unwrap(), self_cert);
-        assert_eq!(engine.principal_cert_wire().unwrap(), self_cert, "minted once");
+        assert_eq!(engine.principal_cert_wire().unwrap(), self_cert, "made once");
         engine.shutdown();
 
-        // Enrollment: the namespace CA certifies the enclave key.
+        // The namespace's CA certifies the enclave key.
+        let lab = Lab::new();
         let key_name: Name = generated.key_name.parse().unwrap();
-        let ca = SecurityManager::new();
-        let ca_key: Name = "/lab/KEY/ca".parse().unwrap();
-        ca.generate_ecdsa_p256(ca_key.clone()).unwrap();
-        let issued = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(ca.certify_as(
-                &key_name,
-                key.public_key().unwrap(),
-                &ca_key,
-                3_600_000,
-                ndn_security::cert_name::NDNCERT_ISSUER,
-                None,
-            ))
-            .unwrap();
+        let issued = certify(&lab.root, &key_name, key.public_key().unwrap(), &lab.root_key, 3_600_000);
         let issued_wire = issued.data_wire().unwrap().to_vec();
+        let enclave = || Box::new(SoftEnclave(Arc::clone(&key)));
 
-        // The next launch loads the enclave key by name; the CA is reachable.
-        let next_launch = Arc::new(NdnEngine::new(cfg()).unwrap());
-        let producer = Arc::clone(&next_launch);
-        let served = Ca {
-            cert_name: (*issued.name).clone(),
-            wire: issued_wire.clone(),
-        };
-        std::thread::spawn(move || {
-            let _ = producer.serve("/lab/alice".into(), Box::new(served));
-        });
-        std::thread::sleep(Duration::from_millis(500));
-        next_launch
-            .load_identity_enclave(generated.key_name.clone(), Box::new(SoftEnclave(key)))
+        // Offline, nothing persisted: no certificate, none minted.
+        let offline = NdnEngine::new(cfg()).unwrap();
+        offline
+            .load_identity_enclave(generated.key_name.clone(), enclave(), None)
             .unwrap();
-        assert_eq!(next_launch.principal_cert_wire().unwrap(), issued_wire);
-        assert_eq!(
-            next_launch.certificate_validity().unwrap().cert_name,
-            issued.name.to_string()
-        );
+        assert!(offline.principal_cert_wire().is_err());
+        assert!(offline.certificate_validity().is_err());
+        offline.shutdown();
+
+        // Offline with the persisted CA certificate: it is the one used.
+        let next_launch = NdnEngine::new(cfg()).unwrap();
+        next_launch
+            .load_identity_enclave(generated.key_name.clone(), enclave(), Some(issued_wire.clone()))
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(next_launch.principal_cert_wire().unwrap(), issued_wire);
+            let validity = next_launch.certificate_validity().unwrap();
+            assert_eq!(validity.cert_name, issued.name.to_string());
+            assert_eq!(validity.valid_until_secs, issued.valid_until / 1_000_000_000);
+        }
         next_launch.shutdown();
+
+        // A self-issued identity is re-bound with its own self-certificate.
+        let relaunch = NdnEngine::new(cfg()).unwrap();
+        relaunch
+            .load_identity_enclave(generated.key_name.clone(), enclave(), Some(self_cert.clone()))
+            .unwrap();
+        assert_eq!(relaunch.principal_cert_wire().unwrap(), self_cert);
+
+        // A certificate of another key, or not certifying the enclave's key,
+        // is refused.
+        let other = EcdsaP256Signer::generate("/lab/bob/KEY/hw".parse().unwrap()).unwrap();
+        let bobs = certify(&lab.root, other.key_name(), other.public_key().unwrap(), &lab.root_key, 3_600_000);
+        let not_this_key = certify(&lab.root, &key_name, other.public_key().unwrap(), &lab.root_key, 3_600_000);
+        for wire in [bobs.data_wire().unwrap().to_vec(), not_this_key.data_wire().unwrap().to_vec(), vec![1, 2, 3]] {
+            assert!(
+                relaunch
+                    .load_identity_enclave(generated.key_name.clone(), enclave(), Some(wire))
+                    .is_err()
+            );
+        }
+        relaunch.shutdown();
+    }
+
+    /// A renewal's outcome keeps the daemon's distinction: a CA that cannot
+    /// be reached is a retryable failure, an expired certificate a refusal,
+    /// and an unusable SafeBag or password an error before anything is sent.
+    #[test]
+    fn renewal_outcomes_say_whether_retrying_can_help() {
+        use ndn_security::safebag::SafeBag;
+
+        let ca = SecurityManager::new();
+        let ca_key: Name = "/lab/CA/KEY/ca".parse().unwrap();
+        ca.generate_ecdsa_p256(ca_key.clone()).unwrap();
+        let device = EcdsaP256Signer::generate("/lab/alice/KEY/k".parse().unwrap()).unwrap();
+        let pkcs8 = device.to_pkcs8_der().unwrap();
+        let bag = |validity_ms| {
+            let cert = certify(&ca, device.key_name(), device.public_key().unwrap(), &ca_key, validity_ms);
+            SafeBag::encrypt(cert.data_wire().unwrap(), &pkcs8, b"pw")
+                .unwrap()
+                .encode()
+                .to_vec()
+        };
+        let current = bag(3_600_000);
+        let expired = bag(1);
+        std::thread::sleep(Duration::from_millis(10));
+
+        // No face: the CA cannot be reached.
+        let engine = NdnEngine::new(cfg()).unwrap();
+        assert!(
+            matches!(
+                engine.renew_certificate(current.clone(), b"pw".to_vec(), Vec::new()),
+                Ok(NdnRenewal::Failed { .. })
+            ),
+            "an unreachable CA is retryable"
+        );
+        assert!(matches!(
+            engine.renew_certificate(expired, b"pw".to_vec(), Vec::new()),
+            Ok(NdnRenewal::Refused { .. })
+        ));
+        assert!(engine.renew_certificate(current, b"wrong".to_vec(), Vec::new()).is_err());
+        assert!(engine.renew_certificate(vec![1, 2, 3], b"pw".to_vec(), Vec::new()).is_err());
+        assert!(!engine.has_identity(), "nothing is loaded without a renewal");
+        engine.shutdown();
     }
 }

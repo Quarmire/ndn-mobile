@@ -557,15 +557,19 @@ impl NdnClient {
         self.identity_core.generate_identity_enclave(name, enclave)
     }
 
-    /// Re-bind a previously generated hardware identity (by its key name)
-    /// after restart. Requires the `identity` feature.
+    /// Re-bind a hardware identity (by its key name) after restart, with the
+    /// certificate the host persisted for it — see
+    /// [`NdnEngine::load_identity_enclave`](crate::NdnEngine::load_identity_enclave).
+    /// Requires the `identity` feature.
     #[cfg(feature = "identity")]
     pub fn load_identity_enclave(
         &self,
         key_name: String,
         enclave: Box<dyn NdnEnclaveBackend>,
+        certificate: Option<Vec<u8>>,
     ) -> Result<bool, NdnError> {
-        self.identity_core.load_identity_enclave(key_name, enclave)
+        self.identity_core
+            .load_identity_enclave(key_name, enclave, certificate)
     }
 
     /// Serve one RemoteSigner request (the single-shot core).
@@ -624,7 +628,9 @@ impl NdnClient {
         self.identity_core.principal_public_key()
     }
 
-    /// A certificate for the loaded identity. Requires the `identity` feature.
+    /// The loaded identity's current certificate — see
+    /// [`NdnEngine::principal_cert_wire`](crate::NdnEngine::principal_cert_wire).
+    /// Requires the `identity` feature.
     #[cfg(feature = "identity")]
     pub fn principal_cert_wire(&self) -> Result<Vec<u8>, NdnError> {
         self.identity_core.principal_cert_wire()

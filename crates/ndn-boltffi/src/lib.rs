@@ -94,7 +94,8 @@ pub use handlers::{
 pub use types::{
     NdnActionClass, NdnCertValidity, NdnContext, NdnContextRefresh, NdnData, NdnDelegationScope,
     NdnEngineConfig, NdnEnrollConfig,
-    NdnEnrolledIdentity, NdnError, NdnFaceSpec, NdnRecoveredIdentity, NdnRevocation, NdnSample,
+    NdnEnrolledIdentity, NdnError, NdnFaceSpec, NdnRecoveredIdentity, NdnRenewal, NdnRevocation,
+    NdnSample,
     NdnSecurityProfile, NdnTrustEnvelope,
 };
 pub use ble::NdnBleBackend;

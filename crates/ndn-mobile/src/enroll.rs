@@ -200,7 +200,7 @@ impl From<CertError> for EnrollError {
 
 /// [`CaExchange`] over an app [`Consumer`] — an embedded engine's in-proc face
 /// or a cross-process forwarder connection.
-struct ConsumerExchange<'a>(&'a mut Consumer);
+pub struct ConsumerExchange<'a>(pub &'a mut Consumer);
 
 impl CaExchange for ConsumerExchange<'_> {
     async fn express(&mut self, interest: Bytes) -> Result<Data, CertError> {

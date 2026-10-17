@@ -65,7 +65,10 @@ pub struct NdnEnrollConfig {
 pub struct NdnEnrolledIdentity {
     pub key_name: String,
     pub cert_name: String,
-    /// Issued certificate wire, if the CA's repo served it.
+    /// The identity's certificate (Data wire): the issued one, if the CA's
+    /// repo served it, or a generated identity's self-certificate. For an
+    /// enclave identity (no SafeBag) persist it and pass it to
+    /// `load_identity_enclave` at every launch.
     pub certificate: Option<Vec<u8>>,
     /// Password-encrypted SafeBag to persist (App Group / Keychain).
     pub safebag: Vec<u8>,
@@ -98,6 +101,28 @@ pub struct NdnCertValidity {
     /// When to renew, Unix seconds: once a third of the lifetime is left
     /// (the `ndn-fwd` daemon's default).
     pub renew_at_secs: u64,
+}
+
+/// The outcome of a renewal attempt
+/// ([`NdnEngine::renew_certificate`](crate::NdnEngine::renew_certificate)),
+/// in the `ndn-fwd` daemon's terms: renewed, refused (retrying cannot help)
+/// or failed (retry later). After a refusal or failure the current
+/// certificate stays in use.
+#[data]
+#[derive(Debug, Clone)]
+pub enum NdnRenewal {
+    /// A new certificate for the same key was issued and is loaded. Persist
+    /// `identity.safebag` and `identity.issuers` in place of the old ones.
+    Renewed { identity: NdnEnrolledIdentity },
+    /// Not renewable as it stands: the CA refused (a revoked key, a role it
+    /// does not renew, …), the certificate expired or names no CA of its
+    /// namespace, or the certificate the CA issued was refused. Retrying
+    /// cannot help; `detail` says why and what to do instead (usually:
+    /// enroll again with a new invite).
+    Refused { detail: String },
+    /// The attempt failed — the CA was unreachable or the device key could
+    /// not sign — and can be retried later; `detail` says why.
+    Failed { detail: String },
 }
 
 /// A class of management action for a §7 scoped-signing grant
