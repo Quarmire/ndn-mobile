@@ -428,6 +428,10 @@ impl NdnError {
                     .map(|reason| format!("{reason:?}"))
                     .unwrap_or_else(|| "Unspecified".to_string()),
             },
+            AppError::Refused { reason } => NdnError::Nacked {
+                name: name.to_string(),
+                reason: format!("{:?}", ndn_packet::NackReason::Refused(reason)),
+            },
             AppError::Connection(e) => NdnError::Engine { msg: e.to_string() },
             AppError::Closed => NdnError::Engine {
                 msg: "connection closed".into(),
