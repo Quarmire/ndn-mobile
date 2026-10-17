@@ -262,15 +262,31 @@ impl IdentityCore {
                 ),
                 Ok(ContextRefresh::Updated(update)) => {
                     let fingerprint = ndn_cert::anchor_fingerprint(&update.signer);
+                    // A walk (`ndn_cert::follow_versions`) went through the
+                    // versions in between; the signer is an anchor of the
+                    // last of them.
+                    let walked: Vec<String> = update
+                        .walked
+                        .iter()
+                        .map(|s| format!("v{}", s.context.version()))
+                        .collect();
+                    let from = update
+                        .walked
+                        .last()
+                        .map_or(update.previous, |s| s.context.version());
+                    let through = if walked.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (followed through {})", walked.join(", "))
+                    };
                     entry(
                         "updated",
                         update.context.version(),
                         update.revoked.iter().map(Name::to_string).collect(),
                         format!(
-                            "adopted v{} signed by {}, an anchor of v{}",
+                            "adopted v{} signed by {}, an anchor of v{from}{through}",
                             update.context.version(),
                             update.signer.name,
-                            update.previous
                         ),
                         Some(NdnContext::adopted(&update.context, &update.data, &fingerprint)),
                     )
@@ -352,19 +368,25 @@ impl IdentityCore {
             certificate: Some(cert_wire.to_vec()),
             safebag: bag.encode().to_vec(),
             adopted_context: adopted_context(&enrollment.adopted),
+            issuers: enrollment.issued.issuers.iter().map(|d| d.raw().to_vec()).collect(),
         })
     }
 
-    /// Renew the certificate in `safebag` at the CA that issued it (same
-    /// key, proof of the current certificate, no invite), load the identity
-    /// with the new certificate, and return a new SafeBag (same key, same
-    /// `password`) to persist. Blocking (network round trips).
+    /// Renew the certificate in `safebag` at its namespace's CA (same key,
+    /// proof of the current certificate, no invite), load the identity with
+    /// the new certificate, and return a new SafeBag (same key, same
+    /// `password`) and the new certificate's issuer chain to persist.
+    /// `issuers` are the issuer certificates kept from the enrollment or
+    /// earlier renewal (empty = none kept; undecodable entries are skipped):
+    /// after a recovery the namespace's CA runs a later CA key and renews the
+    /// certificate only with this chain. Blocking (network round trips).
     #[cfg(feature = "identity")]
     pub(crate) fn renew_certificate(
         &self,
         engine: &ndn_app::ForwarderEngine,
         safebag: Vec<u8>,
         password: Vec<u8>,
+        issuers: Vec<Vec<u8>>,
     ) -> Result<NdnEnrolledIdentity, NdnError> {
         use ndn_security::safebag::SafeBag;
 
@@ -378,12 +400,17 @@ impl IdentityCore {
             .ok_or_else(|| refused(&format!("{} names no key", current.name)))?;
         let signer = ndn_mobile::MobileEngine::load_identity(&bag, &password, key_name.clone())
             .map_err(NdnError::identity)?;
+        let kept: Vec<ndn_packet::Data> = issuers
+            .into_iter()
+            .filter_map(|wire| ndn_packet::Data::decode(wire.into()).ok())
+            .collect();
         let issued = self
             .rt
             .block_on(ndn_identity::renew_via_engine(
                 engine,
                 &self.keyring,
                 &current,
+                &kept,
                 Arc::clone(&signer),
             ))
             .map_err(|e| refused(&e))?;
@@ -399,6 +426,7 @@ impl IdentityCore {
             certificate: Some(cert_wire.to_vec()),
             safebag: renewed.encode().to_vec(),
             adopted_context: None,
+            issuers: issued.issuers.iter().map(|d| d.raw().to_vec()).collect(),
         })
     }
 
@@ -632,6 +660,7 @@ impl IdentityCore {
                 certificate: enrolled.certificate().map(|b| b.to_vec()),
                 safebag: bag.encode().to_vec(),
                 adopted_context: None,
+                issuers: Vec::new(),
             };
             if let Some(wire) = enrolled.certificate() {
                 self.record_cert(wire);
@@ -702,6 +731,7 @@ impl IdentityCore {
                 certificate: enrolled.certificate().map(|b| b.to_vec()),
                 safebag: Vec::new(),
                 adopted_context: None,
+                issuers: Vec::new(),
             };
             // A CA that pairs no repo returns no certificate: the current one
             // is then fetched by key name when first needed.
@@ -745,6 +775,7 @@ impl IdentityCore {
                 certificate: generated.certificate().map(|b| b.to_vec()),
                 safebag: bag.encode().to_vec(),
                 adopted_context: None,
+                issuers: Vec::new(),
             };
             if let Some(wire) = generated.certificate() {
                 self.record_cert(wire);
@@ -828,6 +859,7 @@ impl IdentityCore {
                 certificate: Some(cert_wire.to_vec()),
                 safebag: Vec::new(),
                 adopted_context: None,
+                issuers: Vec::new(),
             };
             self.record_cert(&cert_wire);
             *self.identity.lock().unwrap() = Some(signer);

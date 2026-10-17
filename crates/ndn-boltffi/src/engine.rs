@@ -955,21 +955,29 @@ impl NdnEngine {
     }
 
     /// Renew the certificate in `safebag` (the bag the host persisted from
-    /// an enrollment or an earlier renewal) at the CA that issued it, before
-    /// it expires: the CA re-certifies the same key on proof of the current
-    /// certificate — no invite. On success the identity is loaded with the
-    /// new certificate and the result carries a new SafeBag (same key, same
-    /// `password`) for the host to persist in place of the old one. Refused
-    /// for an expired certificate, a key the CA revoked or a role it does not
-    /// renew (guests, by default): the device then needs a new invite. The
-    /// namespace's trust context must be adopted (the new certificate's
-    /// chain is checked) and the engine needs a route toward the CA. Schedule
-    /// it with [`certificate_validity`](Self::certificate_validity). Blocking;
+    /// an enrollment or an earlier renewal) at its namespace's CA, before it
+    /// expires: the CA re-certifies the same key on proof of the current
+    /// certificate — no invite. Pass as `issuers` the issuer certificates
+    /// persisted beside the bag (`NdnEnrolledIdentity::issuers` of that
+    /// enrollment or renewal; empty = none kept, undecodable entries are
+    /// skipped): after the namespace's root device is replaced through a
+    /// recovery kit, the namespace's CA runs a later CA key, nobody else may
+    /// serve the CA certificate that issued this one, and the new CA renews it
+    /// only with this chain. On success the identity is loaded with the new
+    /// certificate and the result carries a new SafeBag (same key, same
+    /// `password`) and the new certificate's `issuers` for the host to persist
+    /// in place of the old ones. Refused for an expired certificate, a key the
+    /// CA revoked or a role it does not renew (guests, by default): the device
+    /// then needs a new invite. The namespace's trust context must be adopted
+    /// (the new certificate's chain is checked) and the engine needs a route
+    /// toward the CA. Schedule it with
+    /// [`certificate_validity`](Self::certificate_validity). Blocking;
     /// requires the `identity` feature.
     pub fn renew_certificate(
         &self,
         safebag: Vec<u8>,
         password: Vec<u8>,
+        issuers: Vec<Vec<u8>>,
     ) -> Result<NdnEnrolledIdentity, NdnError> {
         #[cfg(feature = "identity")]
         {
@@ -982,11 +990,11 @@ impl NdnEngine {
                     .clone()
             };
             self.identity_core
-                .renew_certificate(&engine, safebag, password)
+                .renew_certificate(&engine, safebag, password, issuers)
         }
         #[cfg(not(feature = "identity"))]
         {
-            let _ = (safebag, password);
+            let _ = (safebag, password, issuers);
             Err(NdnError::engine("renew_certificate requires the `identity` feature"))
         }
     }
@@ -1096,6 +1104,7 @@ impl NdnEngine {
                 certificate: enrolled.certificate().map(|b| b.to_vec()),
                 safebag: bag.encode().to_vec(),
                 adopted_context: None,
+                issuers: Vec::new(),
             };
             self.identity_core.set_identity(enrolled.signer());
             Ok(result)

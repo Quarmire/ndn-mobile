@@ -72,6 +72,15 @@ pub struct NdnEnrolledIdentity {
     /// The trust context adopted on the way (`None` when it was already
     /// held), with its signed Data: persist it and adopt it again at launch.
     pub adopted_context: Option<NdnContext>,
+    /// The issuer certificates (signed Data wires, in walk order) of the
+    /// certificate's chain, as checked under the namespace's trust context.
+    /// Persist them beside the SafeBag and pass them to `renew_certificate`:
+    /// after the namespace's root device is replaced through a recovery kit,
+    /// nobody else may serve the CA certificate that issued this one, and the
+    /// new CA renews it only with this chain. Empty after a token, PIN,
+    /// generated or enclave identity: those paths do not check the chain
+    /// against a trust context, so they have no verified chain to keep.
+    pub issuers: Vec<Vec<u8>>,
 }
 
 /// The validity of the loaded identity's certificate, so the host can

@@ -131,7 +131,7 @@ fn convert(e: TrustEnvelope) -> Result<NdnTrustEnvelope, NdnError> {
         TrustEnvelope::Recovery { bundle } => NdnTrustEnvelope::Recovery {
             bundle: bundle.to_vec(),
         },
-        TrustEnvelope::Bag { key_name, safebag } => NdnTrustEnvelope::Bag {
+        TrustEnvelope::Bag { key_name, safebag, .. } => NdnTrustEnvelope::Bag {
             key_name,
             safebag: safebag.to_vec(),
         },
