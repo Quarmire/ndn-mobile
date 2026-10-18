@@ -366,6 +366,9 @@ pub struct NdnTrustAnchor {
 #[derive(Debug, Clone)]
 pub struct NdnIdentityState {
     pub approvals: Vec<NdnPendingApproval>,
+    /// Why `approvals` is incomplete (a namespace whose CA could not be
+    /// asked, or the forwarder's refusal), with what to do; show beside it.
+    pub approval_notes: Vec<String>,
     pub identities: Vec<NdnSecurityKey>,
     pub anchors: Vec<NdnTrustAnchor>,
 }
@@ -390,6 +393,7 @@ impl NdnIdentityState {
                     reason: a.reason.clone(),
                 })
                 .collect(),
+            approval_notes: s.approval_notes.clone(),
             identities: s.identities.iter().map(from_key).collect(),
             anchors: s.anchors.iter().map(from_anchor).collect(),
         }
@@ -616,6 +620,7 @@ mod tests {
                 state: "pending".into(),
                 ..Default::default()
             }],
+            approval_notes: Vec::new(),
             identities: SecurityKeyInfo::parse_list(
                 "name=/lab/alice has_cert=true valid_until=never",
             ),

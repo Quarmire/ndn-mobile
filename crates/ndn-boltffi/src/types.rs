@@ -500,6 +500,23 @@ pub enum NdnError {
     Timeout { name: String },
     #[error("interest nacked ({reason}): {name}")]
     Nacked { name: String, reason: String },
+    /// This device's forwarder refused the Data that answered the Interest
+    /// for `name`: it failed validation. `refusal` is a stable token to match
+    /// on — `chain`, `revoked`, `bad-signature`, `schema`, `untrusted-root`,
+    /// `context`, `unverifiable`. `final_verdict` is false only for
+    /// `unverifiable` (the signing certificate could not be fetched yet): ask
+    /// again later; every other refusal gets the same answer if asked again.
+    /// `hint` says what to do, in one user-facing line.
+    #[error(
+        "refused ({refusal}, {}): {name}: {hint}",
+        if *.final_verdict { "final" } else { "refused for now" }
+    )]
+    Refused {
+        name: String,
+        refusal: String,
+        final_verdict: bool,
+        hint: String,
+    },
     #[error("engine error: {msg}")]
     Engine { msg: String },
     #[error("invalid NDN name: {name}")]
@@ -531,9 +548,11 @@ impl NdnError {
                     .map(|reason| format!("{reason:?}"))
                     .unwrap_or_else(|| "Unspecified".to_string()),
             },
-            AppError::Refused { reason } => NdnError::Nacked {
+            AppError::Refused { reason } => NdnError::Refused {
                 name: name.to_string(),
-                reason: format!("{:?}", ndn_packet::NackReason::Refused(reason)),
+                refusal: reason.as_str().to_string(),
+                final_verdict: reason.is_final(),
+                hint: reason.next_step().to_string(),
             },
             AppError::Connection(e) => NdnError::Engine { msg: e.to_string() },
             AppError::Closed => NdnError::Engine {
@@ -564,5 +583,33 @@ impl NdnError {
 
     pub(crate) fn invalid_addr(addr: impl Into<String>) -> Self {
         NdnError::InvalidAddress { addr: addr.into() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndn_packet::Refusal;
+
+    /// A refusal reaches apps as `NdnError::Refused` with the stable token
+    /// (not a Debug string), whether asking again can help, and what to do.
+    #[test]
+    fn a_refusal_maps_to_its_token_finality_and_next_step() {
+        for reason in Refusal::ALL {
+            match NdnError::from_app(AppError::Refused { reason }, "/home/bob/doc") {
+                NdnError::Refused {
+                    name,
+                    refusal,
+                    final_verdict,
+                    hint,
+                } => {
+                    assert_eq!(name, "/home/bob/doc");
+                    assert_eq!(Refusal::from_token(&refusal), Some(reason));
+                    assert_eq!(final_verdict, reason != Refusal::Unverifiable, "{refusal}");
+                    assert_eq!(hint, reason.next_step());
+                }
+                other => panic!("{reason}: {other:?}"),
+            }
+        }
     }
 }

@@ -72,6 +72,16 @@ fn request_store(storage_dir: &str) -> Result<RequestStore, NdnError> {
     })
 }
 
+/// End the pending requests the CA never answered before they expired
+/// ([`RequestStore::expire_overdue`]: their sealed keys, this app's only
+/// copy, are deleted), so a new request may go out.
+fn expire_overdue(store: &RequestStore) -> Result<(), ndn_cert::CertError> {
+    for r in store.expire_overdue()? {
+        tracing::warn!(target: "ndn_boltffi::identity", request = %r.request_id, "the CA never answered before the request expired; it ended here and its key was deleted");
+    }
+    Ok(())
+}
+
 fn request_of(r: &OutgoingRequest) -> NdnEnrollmentRequest {
     let detail = match &r.state {
         OutgoingState::Pending => String::new(),
@@ -336,8 +346,8 @@ impl IdentityCore {
             (_, false) => None,
         };
 
-        let outstanding = store
-            .outstanding(&identity.to_string())
+        let outstanding = expire_overdue(&store)
+            .and_then(|()| store.outstanding(&identity.to_string()))
             .map_err(|e| fail(format!("cannot read this app's request records: {e}")))?;
         if let Some(outstanding) = outstanding {
             return Ok(NdnApprovalOutcome::Pending {
@@ -448,8 +458,8 @@ impl IdentityCore {
         persist_password: Vec<u8>,
     ) -> Result<NdnApprovalOutcome, NdnError> {
         let store = request_store(&storage_dir)?;
-        let mut outgoing = store
-            .list()
+        let mut outgoing = expire_overdue(&store)
+            .and_then(|()| store.list())
             .map_err(|e| refused(format!("cannot read this app's request records: {e}")))?
             .into_iter()
             .find(|r| r.request_id == request || r.key_name == request)
@@ -701,8 +711,8 @@ impl IdentityCore {
         storage_dir: String,
     ) -> Result<Vec<NdnEnrollmentRequest>, NdnError> {
         let store = request_store(&storage_dir)?;
-        store
-            .list()
+        expire_overdue(&store)
+            .and_then(|()| store.list())
             .map(|list| list.iter().map(request_of).collect())
             .map_err(|e| refused(format!("cannot read this app's request records: {e}")))
     }
