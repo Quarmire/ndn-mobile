@@ -95,6 +95,9 @@ paranoid-android   = "0.2"
 [dev-dependencies]
 # Host tests can opt into the engine's tracing via RUST_LOG.
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
+# The approval tests serve an in-process CA on an app engine
+# (`register_producer` ties its face to a token).
+tokio-util = { workspace = true }
 
 [build-dependencies]
 boltffi = "0.25"

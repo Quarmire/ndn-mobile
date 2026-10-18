@@ -955,6 +955,225 @@ impl NdnEngine {
         }
     }
 
+    /// Ask to enroll this device as `<namespace>/<role>/<device>` on an
+    /// admin's approval — the app's `ndn-fwd enroll <anchor link> --role
+    /// admin|node`. `link_uri` is the namespace's `ndn-trust://anchor` link
+    /// (or, for a namespace that wants an invite AND an approval, the
+    /// invite); the trust context is adopted first if it is not held
+    /// (checked against the link's expected fingerprint), else the held one
+    /// must be signed by that root. `role` must be one the context puts
+    /// under approval (its enrollment hint; `admin` and `node` by default):
+    /// any other is refused saying which path to use (an invite,
+    /// [`enroll_with_invite`](Self::enroll_with_invite)). A fresh key asks
+    /// the namespace's CA; the request is recorded in `storage_dir` (the
+    /// app's private files directory; under `requests/`) with the key sealed
+    /// under `persist_password`, so [`poll_enrollment`](Self::poll_enrollment)
+    /// finishes it, across restarts. Asking again while a request for the
+    /// identity is pending answers with that request (no second key).
+    /// Usually [`NdnApprovalOutcome::Pending`]: show its `request.code` so
+    /// the approving admin can compare it. A refusal is
+    /// `NdnError::EnrollmentFailed` (carrying any context adopted on the way;
+    /// nothing is kept for the key). Blocking; requires the `identity`
+    /// feature.
+    pub fn request_enrollment(
+        &self,
+        storage_dir: String,
+        link_uri: String,
+        role: String,
+        device: String,
+        persist_password: Vec<u8>,
+    ) -> Result<crate::types::NdnApprovalOutcome, NdnError> {
+        #[cfg(feature = "identity")]
+        {
+            let engine = {
+                let guard = self.inner.lock().unwrap();
+                guard
+                    .as_ref()
+                    .ok_or_else(|| NdnError::engine("engine is shut down"))?
+                    .engine()
+                    .clone()
+            };
+            self.identity_core.request_enrollment(
+                &engine,
+                storage_dir,
+                link_uri,
+                role,
+                device,
+                persist_password,
+            )
+        }
+        #[cfg(not(feature = "identity"))]
+        {
+            let _ = (storage_dir, link_uri, role, device, persist_password);
+            Err(NdnError::engine("request_enrollment requires the `identity` feature"))
+        }
+    }
+
+    /// Wait up to `wait_secs` for the namespace CA's decision on the request
+    /// recorded in `storage_dir` under `request` (its request id or key
+    /// name), with the `persist_password` it was made with. The CA holds a
+    /// status Interest for the request and answers it the moment an admin
+    /// decides, so this returns at once on a decision; with nothing decided
+    /// it returns `Pending` when `wait_secs` end (`0`: look once, now). An
+    /// app calls it at launch and then in a loop from a background thread
+    /// or coroutine (e.g. `wait_secs = 300`) while the request is pending;
+    /// the waiting costs one small Interest per 30 s. The outcome:
+    /// - `Pending`: still waiting (`detail` says when the CA could not be
+    ///   reached this time).
+    /// - `Issued`: the certificate is installed and loaded as after
+    ///   [`enroll_with_invite`](Self::enroll_with_invite); persist
+    ///   `identity.safebag` and `identity.issuers`. Asking about the
+    ///   request again reports it again.
+    /// - `Denied` / `Expired` / `Failed`: the request ended, the reason says
+    ///   why and what to do; the key was deleted. A denial or an expiry is
+    ///   acted on only when the CA's key signed it.
+    ///
+    /// An `Err` changes nothing (an unknown request, a wrong password, an
+    /// unreadable storage directory). Blocking (up to `wait_secs`, plus the
+    /// certificate's fetch once approved); requires the `identity` feature.
+    pub fn poll_enrollment(
+        &self,
+        storage_dir: String,
+        request: String,
+        wait_secs: u32,
+        persist_password: Vec<u8>,
+    ) -> Result<crate::types::NdnApprovalOutcome, NdnError> {
+        #[cfg(feature = "identity")]
+        {
+            let engine = {
+                let guard = self.inner.lock().unwrap();
+                guard
+                    .as_ref()
+                    .ok_or_else(|| NdnError::engine("engine is shut down"))?
+                    .engine()
+                    .clone()
+            };
+            self.identity_core
+                .poll_enrollment(&engine, storage_dir, request, wait_secs, persist_password)
+        }
+        #[cfg(not(feature = "identity"))]
+        {
+            let _ = (storage_dir, request, wait_secs, persist_password);
+            Err(NdnError::engine("poll_enrollment requires the `identity` feature"))
+        }
+    }
+
+    /// The requests for an admin's approval recorded in `storage_dir`
+    /// (pending and ended), oldest first — the app's `ndn-fwd enroll
+    /// --status`. Requires the `identity` feature.
+    pub fn enrollment_requests(
+        &self,
+        storage_dir: String,
+    ) -> Result<Vec<crate::types::NdnEnrollmentRequest>, NdnError> {
+        #[cfg(feature = "identity")]
+        {
+            self.identity_core.enrollment_requests(storage_dir)
+        }
+        #[cfg(not(feature = "identity"))]
+        {
+            let _ = storage_dir;
+            Err(NdnError::engine("enrollment_requests requires the `identity` feature"))
+        }
+    }
+
+    /// The requests waiting for an admin's approval at the namespace's CA,
+    /// asked as the loaded identity — which must be a current, unrevoked
+    /// admin certificate of a namespace whose trust context is held (any
+    /// other identity is refused here, saying why). Pass as `issuers` the
+    /// issuer certificates persisted with the admin identity
+    /// (`NdnEnrolledIdentity::issuers`): the CA checks the admin key's chain
+    /// with them. Refusals by the CA carry its reason and what to do.
+    /// Blocking; requires the `identity` feature.
+    pub fn list_pending_approvals(
+        &self,
+        issuers: Vec<Vec<u8>>,
+    ) -> Result<Vec<crate::types::NdnPendingApproval>, NdnError> {
+        #[cfg(feature = "identity")]
+        {
+            let engine = {
+                let guard = self.inner.lock().unwrap();
+                guard
+                    .as_ref()
+                    .ok_or_else(|| NdnError::engine("engine is shut down"))?
+                    .engine()
+                    .clone()
+            };
+            self.identity_core.list_pending_approvals(&engine, issuers)
+        }
+        #[cfg(not(feature = "identity"))]
+        {
+            let _ = issuers;
+            Err(NdnError::engine("list_pending_approvals requires the `identity` feature"))
+        }
+    }
+
+    /// Approve the pending request `target` — its request id or the
+    /// six-digit verification code the requesting device shows — as the
+    /// loaded admin identity (see
+    /// [`list_pending_approvals`](Self::list_pending_approvals) for
+    /// `issuers`): the approval is signed by the admin key and pushed to the
+    /// CA, which issues the certificate at the requester's next poll.
+    /// Returns the request as the CA now holds it. Blocking; requires the
+    /// `identity` feature.
+    pub fn approve_request(
+        &self,
+        target: String,
+        issuers: Vec<Vec<u8>>,
+    ) -> Result<crate::types::NdnPendingApproval, NdnError> {
+        #[cfg(feature = "identity")]
+        {
+            let engine = {
+                let guard = self.inner.lock().unwrap();
+                guard
+                    .as_ref()
+                    .ok_or_else(|| NdnError::engine("engine is shut down"))?
+                    .engine()
+                    .clone()
+            };
+            self.identity_core
+                .decide_request(&engine, target, ndn_cert::Decision::Approve, issuers)
+        }
+        #[cfg(not(feature = "identity"))]
+        {
+            let _ = (target, issuers);
+            Err(NdnError::engine("approve_request requires the `identity` feature"))
+        }
+    }
+
+    /// Deny the pending request `target` (request id or verification code)
+    /// as the loaded admin identity, with `reason` — the requester sees it.
+    /// As [`approve_request`](Self::approve_request) otherwise. Blocking;
+    /// requires the `identity` feature.
+    pub fn deny_request(
+        &self,
+        target: String,
+        reason: String,
+        issuers: Vec<Vec<u8>>,
+    ) -> Result<crate::types::NdnPendingApproval, NdnError> {
+        #[cfg(feature = "identity")]
+        {
+            let engine = {
+                let guard = self.inner.lock().unwrap();
+                guard
+                    .as_ref()
+                    .ok_or_else(|| NdnError::engine("engine is shut down"))?
+                    .engine()
+                    .clone()
+            };
+            self.identity_core.decide_request(
+                &engine,
+                target,
+                ndn_cert::Decision::Deny { reason },
+                issuers,
+            )
+        }
+        #[cfg(not(feature = "identity"))]
+        {
+            let _ = (target, reason, issuers);
+            Err(NdnError::engine("deny_request requires the `identity` feature"))
+        }
+    }
+
     /// Renew the certificate in `safebag` (the bag the host persisted from
     /// an enrollment or an earlier renewal) at its namespace's CA, before it
     /// expires: the CA re-certifies the same key on proof of the current

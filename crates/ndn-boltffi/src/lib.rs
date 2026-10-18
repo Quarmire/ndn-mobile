@@ -76,13 +76,16 @@ pub mod types;
 pub mod ble;
 pub mod wifi_aware;
 
+#[cfg(all(test, feature = "identity"))]
+mod approval_tests;
+
 #[cfg(unix)]
 pub use client::NdnClient;
 #[cfg(all(unix, feature = "dashboard"))]
 pub use dashboard::{
     NdnCsInfo, NdnDashboard, NdnDashboardState, NdnFaceInfo, NdnFibEntry, NdnForwarderStatus,
-    NdnIdentityState, NdnMgmtResponse, NdnNextHop, NdnPendingApproval, NdnSecurityKey,
-    NdnStrategyEntry, NdnTrustAnchor,
+    NdnIdentityState, NdnMgmtResponse, NdnNextHop, NdnSecurityKey, NdnStrategyEntry,
+    NdnTrustAnchor,
 };
 pub use codec::{NdnCodec, NdntsReassembler};
 pub use engine::NdnEngine;
@@ -92,11 +95,10 @@ pub use handlers::{
     NdnSampleHandler,
 };
 pub use types::{
-    NdnActionClass, NdnCertValidity, NdnContext, NdnContextRefresh, NdnData, NdnDelegationScope,
-    NdnEngineConfig, NdnEnrollConfig,
-    NdnEnrolledIdentity, NdnError, NdnFaceSpec, NdnRecoveredIdentity, NdnRenewal, NdnRevocation,
-    NdnSample,
-    NdnSecurityProfile, NdnTrustEnvelope,
+    NdnActionClass, NdnApprovalOutcome, NdnCertValidity, NdnContext, NdnContextRefresh, NdnData,
+    NdnDelegationScope, NdnEngineConfig, NdnEnrollConfig, NdnEnrolledIdentity,
+    NdnEnrollmentRequest, NdnError, NdnFaceSpec, NdnPendingApproval, NdnRecoveredIdentity,
+    NdnRenewal, NdnRevocation, NdnSample, NdnSecurityProfile, NdnTrustEnvelope,
 };
 pub use ble::NdnBleBackend;
 pub use wifi_aware::NdnNanBackend;

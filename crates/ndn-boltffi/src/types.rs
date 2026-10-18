@@ -125,6 +125,109 @@ pub enum NdnRenewal {
     Failed { detail: String },
 }
 
+/// A request this device made for an admin's approval, as recorded in the
+/// app's storage (`<storage_dir>/requests/`, one record per key).
+#[data]
+#[derive(Debug, Clone)]
+pub struct NdnEnrollmentRequest {
+    pub namespace: String,
+    /// The namespace CA's prefix (`/<ns>` for `/<ns>/CA`).
+    pub ca_prefix: String,
+    /// The identity asked for, `/<ns>/<role>/<device>`.
+    pub identity: String,
+    /// The key generated on this device for it.
+    pub key_name: String,
+    pub request_id: String,
+    /// The six-digit verification code: show it, so the person approving
+    /// can compare it with the code their admin screen lists.
+    pub code: String,
+    /// Unix seconds.
+    pub created_secs: u64,
+    /// When the CA expires the request undecided, Unix seconds (`0`:
+    /// unknown).
+    pub expires_secs: u64,
+    /// `pending`, `issued`, `denied`, `expired` or `failed`.
+    pub state: String,
+    /// For an ended request: why, and what to do (`issued`: the
+    /// certificate's name).
+    pub detail: String,
+}
+
+/// Where a request for an admin's approval stands
+/// ([`NdnEngine::request_enrollment`](crate::NdnEngine::request_enrollment),
+/// [`NdnEngine::poll_enrollment`](crate::NdnEngine::poll_enrollment)).
+#[data]
+#[derive(Debug, Clone)]
+pub enum NdnApprovalOutcome {
+    /// Waiting for an admin: show `request.code`, poll again later.
+    /// `detail` is empty, or says why this poll could not reach the CA.
+    /// `adopted_context`: the trust context adopted while asking (`None`
+    /// when it was held): persist it and adopt it again at launch.
+    Pending {
+        request: NdnEnrollmentRequest,
+        detail: String,
+        adopted_context: Option<NdnContext>,
+    },
+    /// Approved: the certificate is issued, checked and loaded (`sign`
+    /// works). Persist `identity.safebag` (sealed with the password the
+    /// request was made with) and `identity.issuers`, as after
+    /// `enroll_with_invite`.
+    Issued {
+        request: NdnEnrollmentRequest,
+        identity: NdnEnrolledIdentity,
+    },
+    /// An admin denied the request; the key was deleted. `reason` says why
+    /// and what to do.
+    Denied {
+        request: NdnEnrollmentRequest,
+        reason: String,
+    },
+    /// The request expired undecided or the CA no longer holds it; the key
+    /// was deleted. Ask again.
+    Expired {
+        request: NdnEnrollmentRequest,
+        reason: String,
+    },
+    /// The request cannot finish (its key is gone or unreadable, the CA
+    /// refused it, or the issued certificate was refused); `reason` says
+    /// why and what to do.
+    Failed {
+        request: NdnEnrollmentRequest,
+        reason: String,
+    },
+}
+
+/// One request for an admin's approval the operator can approve or deny —
+/// as the CA host's management lists it (`NdnDashboard`) and as an admin
+/// device fetches it from the namespace's CA
+/// ([`NdnEngine::list_pending_approvals`](crate::NdnEngine::list_pending_approvals)).
+#[data]
+#[derive(Debug, Clone)]
+pub struct NdnPendingApproval {
+    /// The request id — pass it (or `code`) to `ca_approve` / `ca_deny`,
+    /// or `approve_request` / `deny_request`.
+    pub request_id: String,
+    /// The key to certify, `/<ns>/<role>/<device>/KEY/<id>`.
+    pub key_name: String,
+    /// The CA the request was made to (the namespace, for a namespace CA).
+    pub namespace: String,
+    /// The role and device asked for (empty off the role layout).
+    pub role: String,
+    pub device: String,
+    /// The verification code the requesting device shows too (`482 913`).
+    pub code: String,
+    /// `pending`, `approved` or `denied`.
+    pub state: String,
+    /// When it was made (Unix seconds); its age is now minus this.
+    pub created_secs: u64,
+    /// Pending: when it expires undecided; decided: until when it is kept.
+    pub expires_secs: u64,
+    /// Who decided (empty while pending).
+    pub approver: String,
+    /// A denial's reason (empty otherwise).
+    pub reason: String,
+}
+
 /// A class of management action for a §7 scoped-signing grant
 /// ([`NdnEngine::grant_signing_scope`](crate::NdnEngine::grant_signing_scope)).
 /// `Any` covers every non-sensitive class; the others narrow the grant.

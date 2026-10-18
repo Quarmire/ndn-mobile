@@ -25,7 +25,7 @@ use ndn_dashboard_core::{
 use ndn_ipc::MgmtClient;
 use tokio::runtime::Runtime;
 
-use crate::types::NdnError;
+use crate::types::{NdnError, NdnPendingApproval};
 
 /// boltffi-local newtype implementing the core-defined [`ManagementClient`]
 /// over the ndn-ipc Unix-socket client. The orphan rule forbids
@@ -185,18 +185,19 @@ impl NdnDashboard {
         NdnIdentityState::from_state(engine.identity_state())
     }
 
-    /// Approve a pending request by id (signed command — the operator
-    /// identity loaded on the forwarder authorises it).
-    pub fn ca_approve(&self, request_id: String) -> Result<NdnMgmtResponse, NdnError> {
+    /// Approve the pending request for an admin's approval that `target`
+    /// names — its request id or its six-digit verification code (signed
+    /// command; the forwarder accepts it only from a local operator).
+    pub fn ca_approve(&self, target: String) -> Result<NdnMgmtResponse, NdnError> {
         let mut e = self.engine.lock().unwrap();
-        finish(self.rt.block_on(e.ca_approve(&request_id)))
+        finish(self.rt.block_on(e.ca_approve(&target)))
     }
 
-    /// Deny a pending request by id. An empty `reason` records the default
-    /// denial detail.
-    pub fn ca_deny(&self, request_id: String, reason: String) -> Result<NdnMgmtResponse, NdnError> {
+    /// Deny the pending request `target` names (request id or code). An
+    /// empty `reason` records "no reason given"; the device is told it.
+    pub fn ca_deny(&self, target: String, reason: String) -> Result<NdnMgmtResponse, NdnError> {
         let mut e = self.engine.lock().unwrap();
-        finish(self.rt.block_on(e.ca_deny(&request_id, &reason)))
+        finish(self.rt.block_on(e.ca_deny(&target, &reason)))
     }
 
     /// Withdraw local trust in an anchor by its certificate key name (a signed
@@ -334,18 +335,6 @@ impl From<MgmtResponse> for NdnMgmtResponse {
     }
 }
 
-/// One pending device-approval request the operator can approve or deny.
-#[data]
-#[derive(Debug, Clone)]
-pub struct NdnPendingApproval {
-    /// Opaque request id — pass to `ca_approve` / `ca_deny`.
-    pub request_id: String,
-    /// The certificate name the device is requesting.
-    pub cert_name: String,
-    /// How the requester satisfied the challenge (may be empty).
-    pub description: String,
-}
-
 /// A local identity key and its certificate posture.
 #[data]
 #[derive(Debug, Clone)]
@@ -389,8 +378,16 @@ impl NdnIdentityState {
                 .iter()
                 .map(|a| NdnPendingApproval {
                     request_id: a.request_id.clone(),
-                    cert_name: a.cert_name.clone(),
-                    description: a.description.clone(),
+                    key_name: a.key_name.clone(),
+                    namespace: a.namespace.clone(),
+                    role: a.role.clone(),
+                    device: a.device.clone(),
+                    code: a.code.clone(),
+                    state: a.state.clone(),
+                    created_secs: a.created_secs,
+                    expires_secs: a.expires_secs,
+                    approver: a.approver.clone(),
+                    reason: a.reason.clone(),
                 })
                 .collect(),
             identities: s.identities.iter().map(from_key).collect(),
@@ -611,8 +608,13 @@ mod tests {
         let state = IdentityState {
             approvals: vec![ndn_dashboard_core::PendingApproval {
                 request_id: "req-7".into(),
-                cert_name: "/lab/eve/devices/cam".into(),
-                description: "PIN".into(),
+                key_name: "/lab/eve/node/cam/KEY/k1".into(),
+                namespace: "/lab/eve".into(),
+                role: "node".into(),
+                device: "cam".into(),
+                code: "482 913".into(),
+                state: "pending".into(),
+                ..Default::default()
             }],
             identities: SecurityKeyInfo::parse_list(
                 "name=/lab/alice has_cert=true valid_until=never",
@@ -623,8 +625,8 @@ mod tests {
 
         assert_eq!(vm.approvals.len(), 1);
         assert_eq!(vm.approvals[0].request_id, "req-7");
-        assert_eq!(vm.approvals[0].cert_name, "/lab/eve/devices/cam");
-        assert_eq!(vm.approvals[0].description, "PIN");
+        assert_eq!(vm.approvals[0].key_name, "/lab/eve/node/cam/KEY/k1");
+        assert_eq!(vm.approvals[0].code, "482 913");
 
         assert_eq!(vm.identities.len(), 1);
         assert_eq!(vm.identities[0].name, "/lab/alice");

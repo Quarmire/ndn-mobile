@@ -25,6 +25,9 @@ use crate::types::{
     NdnEnrolledIdentity, NdnError, NdnRecoveredIdentity, NdnRenewal,
 };
 
+#[cfg(feature = "identity")]
+mod approval;
+
 /// The signing identity + trust state shared by both FFI backends. Holds the
 /// loaded operator signer, the §7 scoped-signing policy, the adopted trust
 /// contexts, the shared runtime, and a forwarder `Connection` (in-proc for the
@@ -351,17 +354,40 @@ impl IdentityCore {
                 adopted_context: adopted_context(&failure.adopted),
             })?;
 
-        let cert_name = (*enrollment.issued.cert.name).clone();
-        let cert_wire = enrollment.issued.data.raw().clone();
-        let bag = ndn_security::safebag::SafeBag::encrypt(
-            cert_wire.clone(),
+        self.install_issued(
+            &key_name,
             &pkcs8,
+            &enrollment.issued,
             &persist_password,
+            adopted_context(&enrollment.adopted),
         )
-        .map_err(|e| key_error(&e))?;
+    }
+
+    /// Load the certificate the namespace's CA `issued` for the device key
+    /// `key_name` (`pkcs8`) as this core's identity, sealed into a SafeBag
+    /// under `persist_password` for the host to persist: how an invite
+    /// enrollment and an approved request both end.
+    #[cfg(feature = "identity")]
+    pub(crate) fn install_issued(
+        &self,
+        key_name: &Name,
+        pkcs8: &[u8],
+        issued: &ndn_cert::IssuedCertificate,
+        persist_password: &[u8],
+        adopted_context: Option<NdnContext>,
+    ) -> Result<NdnEnrolledIdentity, NdnError> {
+        use ndn_security::EcdsaP256Signer;
+
+        let key_error = |e: &dyn std::fmt::Display| NdnError::Identity {
+            msg: format!("device key: {e}"),
+        };
+        let cert_name = (*issued.cert.name).clone();
+        let cert_wire = issued.data.raw().clone();
+        let bag = ndn_security::safebag::SafeBag::encrypt(cert_wire.clone(), pkcs8, persist_password)
+            .map_err(|e| key_error(&e))?;
         // The KeyLocator names the key; verifiers resolve it to the newest
         // valid certificate (this one, a renewed one after renew_certificate).
-        let signer = EcdsaP256Signer::from_pkcs8_der(&pkcs8, key_name.clone())
+        let signer = EcdsaP256Signer::from_pkcs8_der(pkcs8, key_name.clone())
             .map_err(|e| key_error(&e))?;
         self.record_cert(&cert_wire);
         *self.identity.lock().unwrap() = Some(Arc::new(signer));
@@ -370,8 +396,8 @@ impl IdentityCore {
             cert_name: cert_name.to_string(),
             certificate: Some(cert_wire.to_vec()),
             safebag: bag.encode().to_vec(),
-            adopted_context: adopted_context(&enrollment.adopted),
-            issuers: enrollment.issued.issuers.iter().map(|d| d.raw().to_vec()).collect(),
+            adopted_context,
+            issuers: issued.issuers.iter().map(|d| d.raw().to_vec()).collect(),
         })
     }
 
