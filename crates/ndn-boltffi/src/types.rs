@@ -323,8 +323,12 @@ impl NdnContext {
 /// What [`NdnEngine::refresh_contexts`](crate::NdnEngine::refresh_contexts)
 /// found for one held trust context. `state` is `updated` (a newer version,
 /// signed by an anchor of the held one, is now held), `current`,
-/// `upstream-older` (what answered serves an older version; nothing changed)
-/// or `failed` (`detail` says why; the held version stays in force).
+/// `upstream-older` (what answered serves an older version; nothing
+/// changed), `behind` (what answered is older than a version known to
+/// exist; refresh again), `source` (this device holds the namespace's root
+/// key), `unreachable` (nothing answered; the held version stays) or
+/// `failed` (`detail` says why; the held version stays in force) — the
+/// `ndn-fwd` daemon's states.
 ///
 /// For `updated`, `context` carries the new signed context and the
 /// fingerprint of the root that signed it: persist both in place of the

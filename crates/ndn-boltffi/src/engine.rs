@@ -3496,17 +3496,19 @@ mod enclave_identity_tests {
     /// A renewal's outcome keeps the daemon's distinction: a CA that cannot
     /// be reached is a retryable failure, an expired certificate a refusal,
     /// and an unusable SafeBag or password an error before anything is sent.
+    /// As on the daemon, only a device key of a namespace whose trust
+    /// context is held, certified by its CA, is renewed.
     #[test]
     fn renewal_outcomes_say_whether_retrying_can_help() {
         use ndn_security::safebag::SafeBag;
 
-        let ca = SecurityManager::new();
+        let lab = Lab::new();
         let ca_key: Name = "/lab/CA/KEY/ca".parse().unwrap();
-        ca.generate_ecdsa_p256(ca_key.clone()).unwrap();
-        let device = EcdsaP256Signer::generate("/lab/alice/KEY/k".parse().unwrap()).unwrap();
+        lab.root.generate_ecdsa_p256(ca_key.clone()).unwrap();
+        let device = EcdsaP256Signer::generate("/lab/member/alice/KEY/k".parse().unwrap()).unwrap();
         let pkcs8 = device.to_pkcs8_der().unwrap();
         let bag = |validity_ms| {
-            let cert = certify(&ca, device.key_name(), device.public_key().unwrap(), &ca_key, validity_ms);
+            let cert = certify(&lab.root, device.key_name(), device.public_key().unwrap(), &ca_key, validity_ms);
             SafeBag::encrypt(cert.data_wire().unwrap(), &pkcs8, b"pw")
                 .unwrap()
                 .encode()
@@ -3518,6 +3520,7 @@ mod enclave_identity_tests {
 
         // No face: the CA cannot be reached.
         let engine = NdnEngine::new(cfg()).unwrap();
+        lab.adopt(&engine);
         assert!(
             matches!(
                 engine.renew_certificate(current.clone(), b"pw".to_vec(), Vec::new()),

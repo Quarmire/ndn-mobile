@@ -42,6 +42,7 @@ ndn-discovery = { path = "../ndn-ext/crates/discovery/ndn-discovery", default-fe
 ndn-discovery-core = { path = "../ndn-rs/crates/forwarding/ndn-discovery-core" }
 ndn-cert     = { path = "../ndn-rs/crates/security/ndn-cert" }
 ndn-identity = { path = "../ndn-rs/crates/security/ndn-identity" }
+ndn-namespace = { path = "../ndn-rs/crates/security/ndn-namespace" }
 ndn-mgmt     = { path = "../ndn-rs/crates/forwarding/ndn-mgmt" }
 ndn-observability = { path = "../ndn-rs/crates/platform/ndn-observability" }
 ndn-compute   = { path = "../ndn-ext/crates/compute/ndn-compute" }

@@ -41,7 +41,7 @@ management = ["ndn-mobile/management"]
 ## Operator identity + signing on the engine (`load_identity` / `sign`, NDNCERT
 ## enrollment, and the RemoteSigner responder). Native-only — pulls
 ## ndn-cert (not wasm-safe).
-identity = ["ndn-mobile/enroll", "ndn-security/custodian", "dep:ndn-identity", "dep:getrandom", "dep:async-trait", "dep:ndn-config", "dep:p256"]
+identity = ["ndn-mobile/enroll", "ndn-security/custodian", "dep:ndn-identity", "dep:ndn-namespace", "dep:tokio-util", "dep:getrandom", "dep:async-trait", "dep:ndn-config", "dep:p256"]
 ## Operator console (`NdnDashboard`): poll a forwarder's management plane for
 ## faces / routes / CS / strategies / status. Native-only — pulls
 ## ndn-dashboard-core (not wasm-safe).
@@ -83,6 +83,11 @@ tokio           = { workspace = true, features = ["rt-multi-thread"] }
 bytes           = { workspace = true, features = ["std"] }
 thiserror       = { workspace = true }
 tracing         = { workspace = true }
+parking_lot     = "0.12"
+# The personal-namespace library (`identity`): refresh, adopt, enroll,
+# approvals, renewal — the same code the ndn-fwd daemon runs.
+ndn-namespace   = { workspace = true, optional = true }
+tokio-util      = { workspace = true, optional = true }
 boltffi         = "0.25"
 
 # Android: route the engine's `tracing` events to logcat so on-device face/dial/

@@ -27,6 +27,8 @@ use crate::types::{
 
 #[cfg(feature = "identity")]
 mod approval;
+#[cfg(feature = "identity")]
+mod host;
 
 /// The signing identity + trust state shared by both FFI backends. Holds the
 /// loaded operator signer, the §7 scoped-signing policy, the adopted trust
@@ -172,44 +174,40 @@ impl IdentityCore {
         Ok(NdnContext::adopted(&ctx, &data, &fingerprint))
     }
 
-    /// Adopt the namespace a scanned `ndn-trust://anchor` link names,
-    /// the same way the `ndn-fwd` daemon does
-    /// (`ndn_identity::adopt_anchor_link_via_engine`): an inline context is
-    /// verified against the link's expected fingerprint; a fingerprint-only
-    /// link fetches the context by name through `engine` — whose validator
-    /// admits exactly the expected context meanwhile — and requires at least
-    /// the version the link names. Blocking (network round trips). The
-    /// result carries the signed context for the host to persist.
+    /// Adopt the namespace a scanned `ndn-trust://anchor` link names, as
+    /// the `ndn-fwd` daemon does ([`ndn_namespace::keep::adopt_link`]): an
+    /// inline context is verified against the link's expected fingerprint; a
+    /// fingerprint-only link fetches the context by name through `engine` —
+    /// whose validator admits exactly the expected context meanwhile — and
+    /// requires at least the version the link names. Blocking (network round
+    /// trips). The result carries the signed context for the host to
+    /// persist.
     #[cfg(feature = "identity")]
     pub(crate) fn adopt_context_link(
         &self,
         engine: &ndn_app::ForwarderEngine,
         link_uri: String,
     ) -> Result<NdnContext, NdnError> {
-        let refused = |e: ndn_cert::AdoptError| NdnError::Identity {
-            msg: format!("trust context refused: {e}"),
+        let refused = |reason: String| NdnError::Identity {
+            msg: format!("trust context refused: {reason}"),
         };
-        let link = ndn_cert::AnchorLink::from_uri(&link_uri).map_err(refused)?;
-        let adopted = self
-            .rt
-            .block_on(ndn_identity::adopt_anchor_link_via_engine(
-                engine,
-                &self.keyring,
-                &link,
-            ))
-            .map_err(refused)?;
-        Ok(NdnContext::adopted(
-            &adopted.context,
-            &adopted.data,
-            &link.expected_fingerprint,
-        ))
+        let link = ndn_cert::AnchorLink::from_uri(&link_uri).map_err(|e| refused(e.to_string()))?;
+        let contexts = Arc::new(host::AppContexts::default());
+        let participant = self.participant(engine, &contexts);
+        self.rt
+            .block_on(ndn_namespace::keep::adopt_link(&participant, &link))
+            .map_err(|e| refused(e.reason))?;
+        contexts
+            .newest(&link.namespace)
+            .ok_or_else(|| refused(format!("{} was not kept", link.namespace)))
     }
 
     /// Check each held trust context (only `namespace`, when given) for a
-    /// newer version through `engine`, the way the `ndn-fwd` daemon does
-    /// (`ndn_identity::refresh_context_via_engine`): the newest version's name
-    /// by RDR metadata, then the signed context, adopted only if it is newer
-    /// and signed by an anchor of the version held (continuity). A refused or
+    /// newer version through `engine`, as the `ndn-fwd` daemon does
+    /// ([`ndn_namespace::refresh::refresh_contexts`]): the newest version's
+    /// name by RDR metadata, then the signed context, adopted only if it is
+    /// newer and signed by an anchor of the version held (continuity),
+    /// following the versions in between after a recovery. A refused or
     /// failed check changes nothing. Blocking (network round trips).
     #[cfg(feature = "identity")]
     pub(crate) fn refresh_contexts(
@@ -217,104 +215,64 @@ impl IdentityCore {
         engine: &ndn_app::ForwarderEngine,
         namespace: Option<String>,
     ) -> Result<Vec<crate::types::NdnContextRefresh>, NdnError> {
-        use crate::types::NdnContextRefresh;
-        use ndn_cert::ContextRefresh;
+        use ndn_namespace::RefreshState;
 
-        let held = self.keyring.contexts();
-        let targets = match namespace {
-            Some(ns) => {
-                let name: Name = ns.parse().map_err(|_| NdnError::invalid_name(&ns))?;
-                let ctx = held
-                    .into_iter()
-                    .find(|c| *c.namespace() == name)
-                    .ok_or_else(|| NdnError::Identity {
-                        msg: format!("no trust context is held for {ns}; adopt it first"),
-                    })?;
-                vec![ctx]
-            }
-            None => held,
-        };
-        let mut results = Vec::with_capacity(targets.len());
-        for ctx in targets {
-            let ns = ctx.namespace().clone();
-            let entry = |state: &str, version, revoked, detail, context| NdnContextRefresh {
-                namespace: ns.to_string(),
-                state: state.to_string(),
-                held_version: ctx.version(),
-                version,
-                revoked,
-                detail,
-                context,
-            };
-            let outcome = self.rt.block_on(ndn_identity::refresh_context_via_engine(
-                engine,
-                &self.keyring,
-                &ns,
-            ));
-            results.push(match outcome {
-                Ok(ContextRefresh::Current { version }) => entry(
-                    "current",
-                    version,
-                    Vec::new(),
-                    format!("the namespace serves v{version}, the version held"),
-                    None,
-                ),
-                Ok(ContextRefresh::UpstreamOlder { held, offered }) => entry(
-                    "upstream-older",
-                    held,
-                    Vec::new(),
-                    format!("what answered serves v{offered}, older than the held v{held}"),
-                    None,
-                ),
-                Ok(ContextRefresh::Updated(update)) => {
-                    let fingerprint = ndn_cert::anchor_fingerprint(&update.signer);
-                    // A walk (`ndn_cert::follow_versions`) went through the
-                    // versions in between; the signer is an anchor of the
-                    // last of them.
-                    let walked: Vec<String> = update
-                        .walked
-                        .iter()
-                        .map(|s| format!("v{}", s.context.version()))
-                        .collect();
-                    let from = update
-                        .walked
-                        .last()
-                        .map_or(update.previous, |s| s.context.version());
-                    let through = if walked.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" (followed through {})", walked.join(", "))
-                    };
-                    entry(
-                        "updated",
-                        update.context.version(),
-                        update.revoked.iter().map(Name::to_string).collect(),
-                        format!(
-                            "adopted v{} signed by {}, an anchor of v{from}{through}",
-                            update.context.version(),
-                            update.signer.name,
-                        ),
-                        Some(NdnContext::adopted(&update.context, &update.data, &fingerprint)),
-                    )
+        let namespace = namespace
+            .map(|ns| ns.parse::<Name>().map_err(|_| NdnError::invalid_name(&ns)))
+            .transpose()?;
+        let contexts = Arc::new(host::AppContexts::default());
+        let participant = self.participant(engine, &contexts);
+        let results = self
+            .rt
+            .block_on(ndn_namespace::refresh::refresh_contexts(&participant, namespace))
+            .map_err(host::refused)?;
+        Ok(results
+            .into_iter()
+            .map(|info| {
+                let context = match info.state {
+                    RefreshState::Updated => info
+                        .namespace
+                        .parse::<Name>()
+                        .ok()
+                        .and_then(|ns| contexts.newest(&ns)),
+                    _ => None,
+                };
+                crate::types::NdnContextRefresh {
+                    state: match info.state {
+                        RefreshState::Updated => "updated",
+                        RefreshState::Current => "current",
+                        RefreshState::UpstreamOlder => "upstream-older",
+                        RefreshState::Behind => "behind",
+                        RefreshState::Source => "source",
+                        RefreshState::Unreachable => "unreachable",
+                        RefreshState::Failed => "failed",
+                    }
+                    .to_string(),
+                    namespace: info.namespace,
+                    held_version: info.held_version,
+                    version: info.version,
+                    revoked: info.revoked,
+                    detail: info.detail,
+                    context,
                 }
-                Err(e) => entry("failed", ctx.version(), Vec::new(), e.to_string(), None),
-            });
-        }
-        Ok(results)
+            })
+            .collect())
     }
 
     /// Enroll this device with the CA an `ndn-trust://invite` link names, as
-    /// `<ns>/<role>/<device>`, the same way the `ndn-fwd` daemon does
-    /// (`ndn_identity::enroll_with_invite_via_engine`): adopt the
-    /// namespace's trust context if it is not held (checked against the
-    /// invite's root fingerprint), generate a fresh ECDSA-P256 key here,
-    /// obtain a certificate for it with the invite's token and check its chain
-    /// to the root. On success the identity is installed for signing and the
-    /// result carries a password-encrypted SafeBag (key + issued certificate)
-    /// and any trust context adopted on the way for the host to persist; a
-    /// failure that adopted the context reports it in
-    /// [`NdnError::EnrollmentFailed`]. Blocking (network round trips);
-    /// `engine` needs a face and a route for the namespace.
+    /// `<ns>/<role>/<device>`, the way the `ndn-fwd` daemon does
+    /// ([`ndn_namespace::enroll`]): adopt the namespace's trust context if
+    /// it is not held (checked against the invite's root fingerprint), else
+    /// check the held one is signed by that root; generate a fresh ECDSA-P256
+    /// key here, redeem the invite's token for a certificate and check its
+    /// chain to the root. On success the identity is installed for signing
+    /// and the result carries a password-encrypted SafeBag (key + issued
+    /// certificate) and any trust context adopted on the way for the host to
+    /// persist; a failure that adopted the context reports it in
+    /// [`NdnError::EnrollmentFailed`]. A role the namespace certifies on an
+    /// admin's approval is refused here: ask with `request_enrollment`.
+    /// Blocking (network round trips); `engine` needs a face and a route
+    /// for the namespace.
     #[cfg(feature = "identity")]
     pub(crate) fn enroll_with_invite(
         &self,
@@ -323,96 +281,74 @@ impl IdentityCore {
         device: String,
         persist_password: Vec<u8>,
     ) -> Result<NdnEnrolledIdentity, NdnError> {
-        use ndn_security::EcdsaP256Signer;
+        use ndn_cert::EnrollLink;
+        use ndn_namespace::enroll::{Enrolling, Route, ensure_context, route};
 
         let refused = |e: &dyn std::fmt::Display| NdnError::Identity {
             msg: format!("enrollment refused: {e}"),
         };
-        let key_error = |e: &dyn std::fmt::Display| NdnError::Identity {
-            msg: format!("device key: {e}"),
-        };
         let invite = ndn_cert::InviteLink::from_uri(&invite_uri).map_err(|e| refused(&e))?;
         let identity = invite.device_identity(&device).map_err(|e| refused(&e))?;
-        let key_name = ndn_cert::new_device_key_name(&identity);
-        let key = EcdsaP256Signer::generate(key_name.clone()).map_err(|e| key_error(&e))?;
-        let pkcs8 = key.to_pkcs8_der().map_err(|e| key_error(&e))?;
-        let adopted_context = |adopted: &Option<ndn_cert::LinkAdoption>| {
-            adopted.as_ref().zip(invite.expected_fingerprint.as_ref()).map(|(a, fp)| {
-                NdnContext::adopted(&a.context, &a.data, fp)
-            })
+        let namespace = invite.namespace.clone();
+        let role = invite.role;
+        let link = EnrollLink::Invite(invite);
+        let contexts = Arc::new(host::AppContexts::default());
+        let participant = self.participant(engine, &contexts);
+        let vault = host::AppVault::new(self, String::new(), persist_password);
+        let failed = |reason: String| NdnError::EnrollmentFailed {
+            msg: format!("enrollment refused: {reason}"),
+            adopted_context: contexts.newest(&namespace),
         };
-        let enrollment = self
+        let adopted = self
             .rt
-            .block_on(ndn_identity::enroll_with_invite_via_engine(
-                engine,
-                &self.keyring,
-                &invite,
-                Arc::new(key),
-            ))
-            .map_err(|failure| NdnError::EnrollmentFailed {
-                msg: format!("enrollment refused: {}", failure.error),
-                adopted_context: adopted_context(&failure.adopted),
-            })?;
-
-        self.install_issued(
-            &key_name,
-            &pkcs8,
-            &enrollment.issued,
-            &persist_password,
-            adopted_context(&enrollment.adopted),
-        )
-    }
-
-    /// Load the certificate the namespace's CA `issued` for the device key
-    /// `key_name` (`pkcs8`) as this core's identity, sealed into a SafeBag
-    /// under `persist_password` for the host to persist: how an invite
-    /// enrollment and an approved request both end.
-    #[cfg(feature = "identity")]
-    pub(crate) fn install_issued(
-        &self,
-        key_name: &Name,
-        pkcs8: &[u8],
-        issued: &ndn_cert::IssuedCertificate,
-        persist_password: &[u8],
-        adopted_context: Option<NdnContext>,
-    ) -> Result<NdnEnrolledIdentity, NdnError> {
-        use ndn_security::EcdsaP256Signer;
-
-        let key_error = |e: &dyn std::fmt::Display| NdnError::Identity {
-            msg: format!("device key: {e}"),
+            .block_on(ensure_context(&participant, &link))
+            .map_err(|e| failed(e.reason))?;
+        match route(&participant, &link, role).map_err(|e| failed(e.reason))? {
+            Route::Invite => {}
+            Route::Approval { .. } => {
+                return Err(failed(format!(
+                    "{namespace} certifies {role} devices on an admin's approval: ask with \
+                     request_enrollment"
+                )));
+            }
+        }
+        let EnrollLink::Invite(invite) = &link else {
+            unreachable!("an invite link")
         };
-        let cert_name = (*issued.cert.name).clone();
-        let cert_wire = issued.data.raw().clone();
-        let bag = ndn_security::safebag::SafeBag::encrypt(cert_wire.clone(), pkcs8, persist_password)
-            .map_err(|e| key_error(&e))?;
-        // The KeyLocator names the key; verifiers resolve it to the newest
-        // valid certificate (this one, a renewed one after renew_certificate).
-        let signer = EcdsaP256Signer::from_pkcs8_der(pkcs8, key_name.clone())
-            .map_err(|e| key_error(&e))?;
-        self.record_cert(&cert_wire);
-        *self.identity.lock().unwrap() = Some(Arc::new(signer));
-        Ok(NdnEnrolledIdentity {
-            key_name: key_name.to_string(),
-            cert_name: cert_name.to_string(),
-            certificate: Some(cert_wire.to_vec()),
-            safebag: bag.encode().to_vec(),
-            adopted_context,
-            issuers: issued.issuers.iter().map(|d| d.raw().to_vec()).collect(),
-        })
+        let enrolling = Enrolling {
+            namespace: namespace.clone(),
+            identity,
+            previous_identity: None,
+            adopted_context: adopted,
+            context_check: None,
+        };
+        self.rt
+            .block_on(ndn_namespace::enroll::enroll_by_invite(
+                &participant,
+                &vault,
+                invite,
+                enrolling,
+            ))
+            .map_err(|e| failed(e.reason))?;
+        vault
+            .installed(contexts.newest(&namespace))
+            .ok_or_else(|| failed("the issued certificate was not installed".into()))
     }
 
     /// Renew the certificate in `safebag` at its namespace's CA (same key,
-    /// proof of the current certificate, no invite). Renewed: the identity
-    /// is loaded with the new certificate, and the outcome carries a new
-    /// SafeBag (same key, same `password`) and the new certificate's issuer
-    /// chain to persist. Otherwise the outcome says whether retrying can help
-    /// ([`ndn_cert::RenewalError::is_final`]): `Refused` when it cannot,
-    /// `Failed` when it can. `issuers` are the issuer certificates kept from
-    /// the enrollment or earlier renewal (empty = none kept; undecodable
-    /// entries are skipped): after a recovery the namespace's CA runs a later
-    /// CA key and renews the certificate only with this chain. An `Err` is an
-    /// unusable `safebag` or `password`, found before anything is sent.
-    /// Blocking (network round trips).
+    /// proof of the current certificate, no invite), as the `ndn-fwd`
+    /// daemon does ([`ndn_namespace::renewal::renew_now`]). Renewed: the
+    /// identity is loaded with the new certificate, and the outcome carries
+    /// a new SafeBag (same key, same `password`) and the new certificate's
+    /// issuer chain to persist. Otherwise the outcome says whether retrying
+    /// can help: `Refused` when it cannot (a revoked key, a role the CA does
+    /// not renew, a certificate no namespace CA issued in a namespace this
+    /// app holds), `Failed` when it can. `issuers` are the issuer
+    /// certificates kept from the enrollment or earlier renewal (empty =
+    /// none kept; undecodable entries are skipped): after a recovery the
+    /// namespace's CA runs a later CA key and renews the certificate only
+    /// with this chain. An `Err` is an unusable `safebag` or `password`,
+    /// found before anything is sent. Blocking (network round trips).
     #[cfg(feature = "identity")]
     pub(crate) fn renew_certificate(
         &self,
@@ -421,6 +357,7 @@ impl IdentityCore {
         password: Vec<u8>,
         issuers: Vec<Vec<u8>>,
     ) -> Result<NdnRenewal, NdnError> {
+        use ndn_namespace::RenewalState;
         use ndn_security::safebag::SafeBag;
 
         let unusable = |why: String| NdnError::Identity {
@@ -454,46 +391,42 @@ impl IdentityCore {
         let signer = ndn_mobile::MobileEngine::load_identity(&bag, &password, key_name.clone())
             .map_err(|e| opened(&e))?;
         let pkcs8 = bag.decrypt_pkcs8(&password).map_err(|e| opened(&e))?;
-        let kept: Vec<ndn_packet::Data> = issuers
-            .into_iter()
-            .filter_map(|wire| ndn_packet::Data::decode(wire.into()).ok())
-            .collect();
-        let issued = match self.rt.block_on(ndn_identity::renew_via_engine(
-            engine,
-            &self.keyring,
-            &current,
-            &kept,
-            Arc::clone(&signer),
-        )) {
-            Ok(issued) => issued,
-            Err(e) if e.is_final() => return Ok(NdnRenewal::Refused { detail: e.to_string() }),
-            Err(e) => return Ok(NdnRenewal::Failed { detail: e.to_string() }),
+        let held = host::Held {
+            key: key_name.clone(),
+            cert: current,
+            pkcs8: Some(pkcs8),
+            signer: Arc::clone(&signer),
         };
-        let cert_wire = issued.data.raw().clone();
-        let renewed = match SafeBag::encrypt(cert_wire.clone(), &pkcs8, &password) {
+        let vault = host::AppVault::holding(self, Some(held), issuers, password);
+        let contexts = Arc::new(host::AppContexts::default());
+        let participant = self.participant(engine, &contexts);
+        let renewed = match self
+            .rt
+            .block_on(ndn_namespace::renewal::renew_now(&participant, &vault))
+        {
             Ok(renewed) => renewed,
-            Err(e) => {
-                return Ok(NdnRenewal::Failed {
-                    detail: format!(
-                        "the CA renewed the certificate as {}, but sealing it into a new SafeBag \
-                         failed ({e}); the current certificate stays in use: renew again",
-                        issued.cert.name
-                    ),
-                });
-            }
+            // Nothing a namespace CA issued in a namespace this app holds.
+            Err(e) => return Ok(NdnRenewal::Refused { detail: e.reason }),
         };
-        self.record_cert(&cert_wire);
-        *self.identity.lock().unwrap() = Some(signer);
-        Ok(NdnRenewal::Renewed {
-            identity: NdnEnrolledIdentity {
-                key_name: key_name.to_string(),
-                cert_name: issued.cert.name.to_string(),
-                certificate: Some(cert_wire.to_vec()),
-                safebag: renewed.encode().to_vec(),
-                adopted_context: None,
-                issuers: issued.issuers.iter().map(|d| d.raw().to_vec()).collect(),
-            },
-        })
+        let Some(info) = renewed.into_iter().find(|info| info.key == key_name.to_string()) else {
+            return Ok(NdnRenewal::Refused {
+                detail: format!("{key_name} is not a certificate a namespace CA issued"),
+            });
+        };
+        match info.state {
+            RenewalState::Renewed => {
+                let identity = vault.installed(None).ok_or_else(|| {
+                    unusable("the renewed certificate was not sealed".into())
+                })?;
+                if let Some(cert) = &identity.certificate {
+                    self.record_cert(&Bytes::from(cert.clone()));
+                }
+                *self.identity.lock().unwrap() = Some(signer);
+                Ok(NdnRenewal::Renewed { identity })
+            }
+            RenewalState::Refused => Ok(NdnRenewal::Refused { detail: info.detail }),
+            RenewalState::Failed => Ok(NdnRenewal::Failed { detail: info.detail }),
+        }
     }
 
     /// The validity of the loaded identity's current certificate, with
