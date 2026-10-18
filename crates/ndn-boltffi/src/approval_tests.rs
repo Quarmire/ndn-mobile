@@ -253,7 +253,7 @@ fn enrolled(bob: &Namespace, role: &str, device: &str) -> (NdnEngine, Vec<Vec<u8
 /// an app from its SafeBag.
 fn member(bob: &Namespace) -> NdnEngine {
     let engine = bob.engine();
-    let key_name = new_device_key_name(&ns().append("member").append("phone"));
+    let key_name = new_device_key_name(&ns().append("member").append("phone")).unwrap();
     let key = EcdsaP256Signer::generate(key_name.clone()).unwrap();
     let pkcs8 = key.to_pkcs8_der().unwrap();
     let key: Arc<dyn Signer> = Arc::new(key);

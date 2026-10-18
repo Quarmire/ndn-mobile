@@ -23,7 +23,7 @@ use parking_lot::Mutex;
 use bytes::Bytes;
 use ndn_cert::RequestStore;
 use ndn_namespace::{
-    Activation, ContextStore, KeyUnavailable, KeyVault, Participant, ParticipantParts,
+    Activation, ContextStore, HostWords, KeyUnavailable, KeyVault, Participant, ParticipantParts,
     StoredContext,
 };
 use ndn_packet::{Data, Name};
@@ -412,7 +412,33 @@ impl IdentityCore {
             own_certs: None,
             sync: None,
             ca: None,
+            words: app_words(),
         })
+    }
+}
+
+/// How the person using the app does what a library refusal or log line
+/// asks of them: the app's calls, never a forwarder's commands or its PIB.
+/// What only a root device does (making invites, showing the anchor link,
+/// its root key) keeps the library's neutral words.
+pub(crate) fn app_words() -> HostWords {
+    HostWords {
+        enroll_again: "request_enrollment".into(),
+        enroll_first: "enroll_with_invite".into(),
+        enroll_with_invite: "enroll with the invite (enroll_with_invite)".into(),
+        enroll_with_invite_as: "ask with the invite as {role} (request_enrollment)".into(),
+        enroll_as_admin: "a request as admin from the namespace's anchor link \
+                          (request_enrollment)"
+            .into(),
+        adopt: "adopt_context_link with its anchor link".into(),
+        refresh_context: "refresh_contexts for {namespace}".into(),
+        list_approvals: "list_pending_approvals".into(),
+        decide_approvals: "Decide with approve_request".into(),
+        key_storage: "the app's key storage".into(),
+        key_storage_dir: "the app's key storage".into(),
+        make_key_storage_readable: "Make the app's key storage readable".into(),
+        contexts_not_served: "this app serves no trust contexts".into(),
+        ..HostWords::default()
     }
 }
 
@@ -420,5 +446,52 @@ impl IdentityCore {
 pub(crate) fn refused(refusal: ndn_namespace::TrustRefusal) -> NdnError {
     NdnError::Identity {
         msg: refusal.reason,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The library's messages, worded for the app, name the app's calls and
+    /// none of a forwarder's commands, configuration or PIB.
+    #[test]
+    fn app_words_name_no_forwarder() {
+        let w = app_words();
+        let ns: Name = "/home/bob".parse().unwrap();
+        let messages = [
+            w.context_check_timed_out(8, &ns),
+            w.request_expired_unanswered(),
+            w.not_an_enroll_link("bad"),
+            w.invite_for_another_role(&ns, "member", "guest"),
+            w.role_by_invite(&ns, "member", "admin, node"),
+            w.role_by_invite_and_approval(&ns, "node"),
+            w.invite_spent(),
+            w.approval_used(),
+            w.request_not_recorded("r1", "123456", "full", "the app's storage"),
+            w.enrolled(),
+            w.request_names_no_ca(),
+            w.request_names_no_key(),
+            w.request_key_gone(&ns, "gone"),
+            w.no_pending_request("123456", "the CAs of the namespaces this node administers"),
+            w.nothing_to_approve(),
+            w.no_context(&ns),
+            w.renewal_unreadable("unreadable"),
+            w.nothing_to_renew("the app's storage"),
+            w.renewal_waits_for_storage(),
+            w.renew_before_too_long(),
+            w.not_published(),
+            w.already_certified(&ns, "/home/bob/member/phone/KEY/k1", ""),
+        ];
+        for m in &messages {
+            for forwarder in ["ndn-fwd", "PIB", "[security]", "`", " --", "{role}", "{namespace}"] {
+                assert!(!m.contains(forwarder), "{m:?} names {forwarder:?}");
+            }
+        }
+        assert_eq!(
+            w.no_context(&ns),
+            "this node holds no trust context for /home/bob; adopt it first (adopt_context_link \
+             with its anchor link)"
+        );
     }
 }

@@ -31,7 +31,7 @@ use ndn_security::safebag::SafeBag;
 use tokio_util::sync::CancellationToken;
 
 use super::IdentityCore;
-use super::host::{AppContexts, AppVault, Held, request_store, unseal};
+use super::host::{AppContexts, AppVault, Held, app_words, request_store, unseal};
 use crate::types::{
     NdnApprovalOutcome, NdnEnrolledIdentity, NdnEnrollmentRequest, NdnError, NdnPendingApproval,
 };
@@ -98,7 +98,8 @@ impl IdentityCore {
         persist_password: Vec<u8>,
     ) -> Result<NdnApprovalOutcome, NdnError> {
         request_store(&storage_dir).map_err(refused)?;
-        let link = ndn_namespace::enroll::parse_link(&link_uri).map_err(|e| refused(e.reason))?;
+        let link = ndn_namespace::enroll::parse_link(&link_uri, &app_words())
+            .map_err(|e| refused(e.reason))?;
         let namespace = link.namespace().clone();
         let role: Role = role.parse().map_err(|e| {
             refused(format!("{e}: ask as admin or node (the roles a namespace certifies on an admin's approval)"))
@@ -217,7 +218,7 @@ impl IdentityCore {
     ) -> Result<NdnApprovalOutcome, NdnError> {
         let deadline = Instant::now() + Duration::from_secs(wait_secs.into());
         let vault = AppVault::new(self, storage_dir.clone(), persist_password.clone());
-        let outgoing = ndn_namespace::enroll::enroll_status(&vault)
+        let outgoing = ndn_namespace::enroll::enroll_status(&vault, &app_words())
             .map_err(|e| refused(e.reason))?
             .into_iter()
             .find(|r| r.request_id == request || r.key_name == request)
@@ -349,7 +350,7 @@ impl IdentityCore {
         storage_dir: String,
     ) -> Result<Vec<NdnEnrollmentRequest>, NdnError> {
         let vault = AppVault::new(self, storage_dir, Vec::new());
-        ndn_namespace::enroll::enroll_status(&vault)
+        ndn_namespace::enroll::enroll_status(&vault, &app_words())
             .map(|list| list.iter().map(request_of).collect())
             .map_err(|e| refused(e.reason))
     }

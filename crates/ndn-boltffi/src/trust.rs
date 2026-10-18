@@ -17,13 +17,14 @@ pub struct NdnTrust;
 #[export]
 impl NdnTrust {
     /// Parse an `ndn-trust://<kind>/<base64url>` URI (also accepts the legacy
-    /// `ndn-ctx:1:…` anchor form and the `https://…/t/<kind>#…` universal-link
-    /// [`NdnError::Engine`] on a malformed or unrecognized payload; on an
-    /// anchor that does not pin a namespace + fingerprint; and on an unsigned
-    /// legacy anchor (`ndn-ctx:1:` or bare content), which cannot be verified
-    /// and is never adopted. An anchor without an inline context (fingerprint
-    /// only) parses with `context_data: None`: hand the URI to
-    /// `adopt_context_link`, which fetches the context by name.
+    /// `ndn-ctx:1:…` anchor form and the `https://<domain>/t/<kind>#…`
+    /// universal-link mirror). Errors with [`NdnError::Engine`] on a malformed
+    /// or unrecognized payload (including a `<kind>` that differs from the
+    /// envelope's); on an anchor without a namespace and expected fingerprint;
+    /// and on an unsigned legacy anchor (`ndn-ctx:1:` or bare content), which
+    /// cannot be verified and is never adopted. An anchor without an inline
+    /// context (fingerprint only) parses with `context_data: None`: hand the
+    /// URI to `adopt_context_link`, which fetches the context by name.
     pub fn parse(uri: String) -> Result<NdnTrustEnvelope, NdnError> {
         let env = TrustEnvelope::from_uri(&uri).map_err(NdnError::engine)?;
         convert(env)
@@ -56,7 +57,9 @@ impl NdnTrust {
     /// peer's *request* (what it wants + a TTL); `is_grant=true` is the operator's
     /// *grant* acknowledgement, with `grant` carrying the operator's certificate
     /// (signed NDN Data wire) so the peer can learn and verify the key behind the
-    /// signatures it later receives.
+    /// signatures it later receives. A request's `nonce` is
+    /// `ndn_trust_envelope::CAPABILITY_NONCE_LEN` (16) fresh random bytes; a
+    /// grant should echo the nonce of the request it answers.
     pub fn build_capability(
         is_grant: bool,
         namespace: String,
@@ -131,9 +134,16 @@ fn convert(e: TrustEnvelope) -> Result<NdnTrustEnvelope, NdnError> {
         TrustEnvelope::Recovery { bundle } => NdnTrustEnvelope::Recovery {
             bundle: bundle.to_vec(),
         },
-        TrustEnvelope::Bag { key_name, safebag, .. } => NdnTrustEnvelope::Bag {
+        TrustEnvelope::Bag {
+            key_name,
+            safebag,
+            namespace,
+            fingerprint,
+        } => NdnTrustEnvelope::Bag {
             key_name,
             safebag: safebag.to_vec(),
+            namespace,
+            fingerprint: fingerprint.map(|fp| fp.to_vec()),
         },
         TrustEnvelope::Capability(c) => NdnTrustEnvelope::Capability {
             is_grant: matches!(c.direction, CapDirection::Grant),
@@ -144,4 +154,50 @@ fn convert(e: TrustEnvelope) -> Result<NdnTrustEnvelope, NdnError> {
             grant: c.grant.map(|b| b.to_vec()),
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file recovery kit keeps its namespace and expected fingerprint; a
+    /// key-migration bag has neither.
+    #[test]
+    fn bag_keeps_namespace_and_fingerprint() {
+        let kit = TrustEnvelope::Bag {
+            key_name: "/home/bob/KEY/r0011223344556677".into(),
+            safebag: Bytes::from_static(b"\x80\x02\x00\x00"),
+            namespace: Some("/home/bob".into()),
+            fingerprint: Some([7; 32]),
+        };
+        let NdnTrustEnvelope::Bag {
+            key_name,
+            namespace,
+            fingerprint,
+            ..
+        } = NdnTrust::parse(kit.to_uri()).unwrap()
+        else {
+            panic!("expected a bag");
+        };
+        assert_eq!(key_name, "/home/bob/KEY/r0011223344556677");
+        assert_eq!(namespace.as_deref(), Some("/home/bob"));
+        assert_eq!(fingerprint, Some(vec![7; 32]));
+
+        let plain = TrustEnvelope::Bag {
+            key_name: "/home/bob/admin/phone/KEY/device".into(),
+            safebag: Bytes::from_static(b"\x80\x02\x00\x00"),
+            namespace: None,
+            fingerprint: None,
+        };
+        let NdnTrustEnvelope::Bag {
+            namespace,
+            fingerprint,
+            ..
+        } = NdnTrust::parse(plain.to_uri()).unwrap()
+        else {
+            panic!("expected a bag");
+        };
+        assert_eq!(namespace, None);
+        assert_eq!(fingerprint, None);
+    }
 }

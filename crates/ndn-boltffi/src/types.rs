@@ -416,8 +416,19 @@ pub enum NdnTrustEnvelope {
     },
     /// A recovery bundle — feed to `restore_identity`.
     Recovery { bundle: Vec<u8> },
-    /// A password-encrypted SafeBag — feed to `load_identity(safebag, password, key_name)`.
-    Bag { key_name: String, safebag: Vec<u8> },
+    /// A password-encrypted SafeBag. Without `namespace` it is an identity
+    /// key: feed it to `load_identity(safebag, password, key_name)`. With
+    /// `namespace` it is a namespace's file recovery kit (its recovery key,
+    /// not an identity): `load_identity` refuses it.
+    Bag {
+        key_name: String,
+        safebag: Vec<u8>,
+        /// The namespace a recovery kit recovers (NDN URI).
+        namespace: Option<String>,
+        /// The namespace's expected fingerprint (32 bytes) when the kit was
+        /// made, when the kit carries it.
+        fingerprint: Option<Vec<u8>>,
+    },
     /// An ephemeral scoped capability (pairing). `is_grant` distinguishes a
     /// peer's request (false) from an issued grant (true); `grant` carries the
     /// operator's certificate (signed NDN Data wire) on a grant.

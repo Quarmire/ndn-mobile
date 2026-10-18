@@ -565,6 +565,26 @@ impl IdentityCore {
         )
     }
 
+    /// Whether `key_name` is a namespace recovery key: `<ns>/KEY/r<hex>`, named
+    /// after its certificate's public key (`ndn_cert::recovery_key_name`). A
+    /// file recovery kit's SafeBag holds one; it recovers a namespace and is
+    /// never an operator identity.
+    #[cfg(feature = "identity")]
+    fn is_namespace_recovery_key(key_name: &Name, certificate: &Bytes) -> bool {
+        let components = key_name.components();
+        let Some(namespace_len) = components.len().checked_sub(2) else {
+            return false;
+        };
+        let Some(cert) = ndn_packet::Data::decode(certificate.clone())
+            .ok()
+            .and_then(|data| ndn_security::Certificate::decode(&data).ok())
+        else {
+            return false;
+        };
+        let namespace = Name::from_components(components[..namespace_len].iter().cloned());
+        ndn_cert::recovery_key_name(&namespace, &cert.public_key) == *key_name
+    }
+
     // ── Operator identity + signing ────────────────────────────────────────
 
     pub(crate) fn load_identity(
@@ -579,6 +599,14 @@ impl IdentityCore {
             let name: Name = key_name
                 .parse()
                 .map_err(|_| NdnError::invalid_name(key_name.clone()))?;
+            if Self::is_namespace_recovery_key(&name, &bag.certificate) {
+                return Err(NdnError::Identity {
+                    msg: format!(
+                        "{key_name} is the recovery key of a namespace recovery kit, not an \
+                         identity: use the kit to recover its namespace"
+                    ),
+                });
+            }
             let signer = ndn_mobile::MobileEngine::load_identity(&bag, &password, name)
                 .map_err(NdnError::identity)?;
             // Retain the CA-issued cert (inside the bag) so we can serve it to a

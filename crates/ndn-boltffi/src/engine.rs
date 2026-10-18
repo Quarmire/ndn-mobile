@@ -2247,6 +2247,40 @@ mod identity_tests {
         engine.shutdown();
     }
 
+    /// A file recovery kit is a SafeBag too, but of a namespace's recovery
+    /// key: the parsed bag keeps the kit's namespace and expected
+    /// fingerprint, and `load_identity` refuses to make it the operator.
+    #[test]
+    fn load_identity_refuses_a_namespace_recovery_kit() {
+        let ns: Name = "/home/bob".parse().unwrap();
+        let seed = ndn_cert::RecoverySeed::generate().unwrap();
+        let anchor = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(ndn_cert::recovery_anchor(std::sync::Arc::new(seed.signer(&ns))))
+            .unwrap();
+        let passphrase = ndn_cert::RootSecret::new(b"kit passphrase".to_vec());
+        let uri = ndn_cert::seal_file_kit(&seed, &anchor, &ns, Some([7; 32]), &passphrase).unwrap();
+        let crate::types::NdnTrustEnvelope::Bag {
+            key_name,
+            safebag,
+            namespace,
+            fingerprint,
+        } = crate::NdnTrust::parse(uri).unwrap()
+        else {
+            panic!("a file kit is a bag");
+        };
+        assert_eq!(namespace.as_deref(), Some("/home/bob"));
+        assert_eq!(fingerprint, Some(vec![7; 32]));
+
+        let engine = NdnEngine::new(test_config()).unwrap();
+        let err = engine
+            .load_identity(safebag, b"kit passphrase".to_vec(), key_name)
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("recovery kit"), "{err:?}");
+        assert!(!engine.has_identity());
+        engine.shutdown();
+    }
+
     /// The phone-as-second-factor: a desktop's `WireSignRequest` is gated by the
     /// (mock) biometric approval, signed by the loaded identity, and answered with
     /// a `WireSignResponse` — approved with a signature, or denied.
