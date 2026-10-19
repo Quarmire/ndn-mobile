@@ -18,8 +18,9 @@ use ndn_face_quic::{
     KeyError, KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig,
 };
 use ndn_link::{
-    ConfiguredEndpoints, EngineFaces, HostCandidates, LinkHints, LinkMode, LinkReport, LinkSetup,
-    LinkTrust, Links, OwnMembership, PeerId, PeerSpec, RelayOptions, RelaySource, RelayUse,
+    ConfiguredEndpoints, EngineFaces, HostCandidates, LinkDetail, LinkMode, LinkReport, LinkSetup,
+    LinkTrust, LinkWords, Links, OwnMembership, PeerId, PeerSpec, RelayOptions, RelaySource,
+    RelayUse,
 };
 use ndn_packet::Name;
 use ndn_security::{Certificate, Keyring};
@@ -80,18 +81,6 @@ impl LinkTrust for AppTrust {
         self.engine
             .validator()
             .and_then(|v| v.cert_cache().get_by_key_digest(&fingerprint.0))
-    }
-}
-
-/// How a person at this device does what a refusal asks, in the app's terms.
-fn hints() -> LinkHints {
-    LinkHints {
-        enroll: "enroll this device in the app with an invite link, or by an admin's approval"
-            .into(),
-        renew: "renew this device's certificate in the app".into(),
-        refresh: "refresh the namespace's trust context in the app".into(),
-        peer_entry: "relay".into(),
-        expect_key: "add this device on the other device with expected key {key}".into(),
     }
 }
 
@@ -216,7 +205,6 @@ impl PhoneLinks {
                 candidates: vec![Arc::new(HostCandidates::default())],
                 socket: Some(Arc::clone(&socket)),
                 transport,
-                hints: hints(),
                 relays: RelayOptions {
                     count: config.relay_count.max(1) as usize,
                     use_namespace: config.use_namespace_relays,
@@ -402,7 +390,7 @@ fn report(r: &LinkReport, local: Option<SocketAddr>, active: bool) -> NdnLinkRep
                     },
                     preference: r.preference,
                     state: r.state.as_str().to_owned(),
-                    text: r.text.clone(),
+                    text: worded(&r.detail),
                 }),
                 paths: l
                     .paths
@@ -417,13 +405,26 @@ fn report(r: &LinkReport, local: Option<SocketAddr>, active: bool) -> NdnLinkRep
                         via: p.via.clone(),
                     })
                     .collect(),
-                down: l.down.clone(),
+                down: l.down.as_ref().map(worded),
                 direct_state: l.direct.state.as_str().to_owned(),
-                direct_text: l.direct.text.clone(),
+                direct_text: l.direct.detail.as_ref().map(worded).unwrap_or_default(),
                 direct_retry_secs: l.direct.retry_in.map(|d| d.as_secs()),
             })
             .collect(),
     }
+}
+
+/// How the app words the link details whose neutral sentence stands in for
+/// a host's configuration and commands.
+const APP_WORDS: LinkWords<'static> = LinkWords {
+    peer_entry: "relay",
+    renew: "renew this device's certificate in the app",
+    expect_key: "add this device on the other device with expected key {key}",
+};
+
+/// A link detail's sentence in the app's words, its causes in place.
+fn worded(detail: &LinkDetail) -> String {
+    detail.render(&|d, causes| APP_WORDS.word(d, causes))
 }
 
 /// Each time an identity is added or the node identity changes, show the

@@ -8,6 +8,11 @@
 //! and is admitted by a relay of another trusted prefix by its membership
 //! there.
 
+#![allow(
+    clippy::result_large_err,
+    reason = "NdnError is the FFI's error type, returned as the app gets it"
+)]
+
 use std::net::SocketAddr;
 use std::os::fd::IntoRawFd;
 use std::sync::Arc;
@@ -24,7 +29,7 @@ use ndn_boltffi::{
 use ndn_engine::{EngineBuilder, EngineConfig, ShutdownHandle};
 use ndn_face_quic::{KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig};
 use ndn_link::{
-    ConfiguredEndpoints, EngineFaces, HoldLimits, LinkHints, LinkSetup, LinkTrust, Links, PeerSpec,
+    ConfiguredEndpoints, EngineFaces, HoldLimits, LinkSetup, LinkTrust, Links, PeerSpec,
     RelaySource, RelayUse, WakeNotifier, WakeRequest,
 };
 use ndn_packet::Name;
@@ -159,16 +164,6 @@ impl LinkTrust for HostTrust {
     }
 }
 
-fn hints() -> LinkHints {
-    LinkHints {
-        enroll: "enroll it".into(),
-        renew: "renew it".into(),
-        refresh: "refresh it".into(),
-        peer_entry: "[[peer]]".into(),
-        expect_key: "expect {key}".into(),
-    }
-}
-
 /// The wake requests a relay's notifier was handed: for which device, with
 /// which token.
 #[derive(Default)]
@@ -241,7 +236,6 @@ impl Host {
                 candidates: Vec::new(),
                 socket: Some(socket),
                 transport,
-                hints: hints(),
                 relays: Default::default(),
                 service: Default::default(),
                 direct: Default::default(),

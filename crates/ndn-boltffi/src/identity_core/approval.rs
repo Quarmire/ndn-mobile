@@ -31,7 +31,9 @@ use ndn_security::safebag::SafeBag;
 use tokio_util::sync::CancellationToken;
 
 use super::IdentityCore;
-use super::host::{AppContexts, AppParticipant, AppVault, app_words, request_store, unseal};
+use super::host::{
+    AppContexts, AppParticipant, AppVault, app_detail, app_text, request_store, unseal,
+};
 use crate::types::{
     NdnApprovalOutcome, NdnEnrolledIdentity, NdnEnrollmentRequest, NdnError, NdnPendingApproval,
 };
@@ -46,7 +48,7 @@ fn request_of(r: &OutgoingRequest) -> NdnEnrollmentRequest {
         OutgoingState::Issued { certificate } => certificate.clone(),
         OutgoingState::Denied { reason }
         | OutgoingState::Expired { reason }
-        | OutgoingState::Failed { reason } => reason.clone(),
+        | OutgoingState::Failed { reason } => app_detail(reason),
     };
     NdnEnrollmentRequest {
         namespace: r.namespace.clone(),
@@ -68,15 +70,15 @@ fn ended_outcome(r: &OutgoingRequest) -> Option<NdnApprovalOutcome> {
     match &r.state {
         OutgoingState::Denied { reason } => Some(NdnApprovalOutcome::Denied {
             request,
-            reason: reason.clone(),
+            reason: app_detail(reason),
         }),
         OutgoingState::Expired { reason } => Some(NdnApprovalOutcome::Expired {
             request,
-            reason: reason.clone(),
+            reason: app_detail(reason),
         }),
         OutgoingState::Failed { reason } => Some(NdnApprovalOutcome::Failed {
             request,
-            reason: reason.clone(),
+            reason: app_detail(reason),
         }),
         OutgoingState::Pending | OutgoingState::Issued { .. } => None,
     }
@@ -98,8 +100,8 @@ impl IdentityCore {
         persist_password: Vec<u8>,
     ) -> Result<NdnApprovalOutcome, NdnError> {
         request_store(&storage_dir).map_err(refused)?;
-        let link = ndn_namespace::enroll::parse_link(&link_uri, &app_words())
-            .map_err(|e| refused(e.reason))?;
+        let link =
+            ndn_namespace::enroll::parse_link(&link_uri).map_err(|e| refused(app_text(&e)))?;
         let namespace = link.namespace().clone();
         let role: Role = role.parse().map_err(|e| {
             refused(format!(
@@ -112,10 +114,11 @@ impl IdentityCore {
         let contexts = Arc::new(AppContexts::default());
         let participant = self.participant(engine, &contexts);
         let vault = AppVault::new(self, storage_dir, persist_password);
-        let fail = |e: TrustRefusal| NdnError::EnrollmentFailed {
-            msg: e.reason,
+        let failed = |msg: String| NdnError::EnrollmentFailed {
+            msg,
             adopted_context: contexts.newest(&namespace),
         };
+        let fail = |e: TrustRefusal| failed(app_text(&e));
         let adopted = self
             .rt
             .block_on(ndn_namespace::enroll::ensure_context(&participant, &link))
@@ -124,12 +127,9 @@ impl IdentityCore {
             match ndn_namespace::enroll::route(&participant, &link, role).map_err(fail)? {
                 Route::Approval { ca_prefix, token } => (ca_prefix, token),
                 Route::Invite => {
-                    return Err(fail(ndn_namespace::refusal(
-                        400,
-                        format!(
-                            "{namespace} certifies {role} devices by invite, not on an admin's \
+                    return Err(failed(format!(
+                        "{namespace} certifies {role} devices by invite, not on an admin's \
                          approval: enroll with the invite (enroll_with_invite)"
-                        ),
                     )));
                 }
             };
@@ -219,8 +219,10 @@ impl IdentityCore {
     ) -> Result<NdnApprovalOutcome, NdnError> {
         let deadline = Instant::now() + Duration::from_secs(wait_secs.into());
         let vault = AppVault::new(self, storage_dir.clone(), persist_password.clone());
-        let outgoing = ndn_namespace::enroll::enroll_status(&vault, &app_words())
-            .map_err(|e| refused(e.reason))?
+        let contexts = Arc::new(AppContexts::default());
+        let participant = self.participant(engine, &contexts);
+        let outgoing = ndn_namespace::enroll::enroll_status(&participant, &vault)
+            .map_err(|e| refused(app_text(&e)))?
             .into_iter()
             .find(|r| r.request_id == request || r.key_name == request)
             .ok_or_else(|| {
@@ -250,8 +252,6 @@ impl IdentityCore {
             }
         }
 
-        let contexts = Arc::new(AppContexts::default());
-        let participant = self.participant(engine, &contexts);
         let waited = self
             .rt
             .block_on(ndn_namespace::approval_wait::wait_for_decision(
@@ -352,12 +352,15 @@ impl IdentityCore {
     /// oldest first.
     pub(crate) fn enrollment_requests(
         &self,
+        engine: &ndn_app::ForwarderEngine,
         storage_dir: String,
     ) -> Result<Vec<NdnEnrollmentRequest>, NdnError> {
+        let contexts = Arc::new(AppContexts::default());
+        let participant = self.participant(engine, &contexts);
         let vault = AppVault::new(self, storage_dir, Vec::new());
-        ndn_namespace::enroll::enroll_status(&vault, &app_words())
+        ndn_namespace::enroll::enroll_status(&participant, &vault)
             .map(|list| list.iter().map(request_of).collect())
-            .map_err(|e| refused(e.reason))
+            .map_err(|e| refused(app_text(&e)))
     }
 
     // ── Approver ───────────────────────────────────────────────────────
@@ -381,7 +384,8 @@ impl IdentityCore {
         let vault = AppVault::with_issuers(self, issuers);
         let contexts = Arc::new(AppContexts::default());
         let participant = self.participant(engine, &contexts);
-        let creds = admin_credentials(&participant, &vault, &[]).map_err(|e| refused(e.reason))?;
+        let creds =
+            admin_credentials(&participant, &vault, &[]).map_err(|e| refused(app_text(&e)))?;
         if !creds.is_empty() {
             return Ok((participant, creds));
         }
@@ -434,11 +438,11 @@ impl IdentityCore {
             .block_on(ndn_namespace::approver::list(&participant, &[], || {
                 Ok(creds)
             }))
-            .map_err(|e| refused(e.reason))?;
+            .map_err(|e| refused(app_text(&e)))?;
         if let Some(note) = listing.notes.first()
             && listing.records.is_empty()
         {
-            return Err(refused(note.clone()));
+            return Err(refused(app_detail(note)));
         }
         Ok(listing.records.iter().map(pending_approval).collect())
     }
@@ -465,7 +469,7 @@ impl IdentityCore {
                 operator,
             ))
             .map(|r| pending_approval(&r))
-            .map_err(|e| refused(e.reason))
+            .map_err(|e| refused(app_text(&e)))
     }
 }
 

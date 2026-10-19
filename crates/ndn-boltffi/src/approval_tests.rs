@@ -732,6 +732,22 @@ fn an_app_takes_part_in_several_trusted_prefixes() {
             "{seen:?}"
         );
     }
+    // The followed prefix, adopted from its envelope.
+    assert!(
+        seen.contains(&("/club".into(), "adopted".into(), "following".into())),
+        "{seen:?}"
+    );
+    // Each enrollment waited for an approval: it names the request; each
+    // change is told once.
+    for e in changes.lock().iter().filter(|e| e.change == "enrolled") {
+        assert!(
+            e.request.is_some() && e.key.is_some() && e.valid_until.is_some(),
+            "{e:?}"
+        );
+    }
+    for change in &seen {
+        assert_eq!(seen.iter().filter(|c| *c == change).count(), 1, "{seen:?}");
+    }
 
     // The app restarts: it adopts its persisted contexts and loads every
     // persisted SafeBag, whatever the order, then chooses its persisted node
@@ -769,4 +785,50 @@ fn an_app_takes_part_in_several_trusted_prefixes() {
     assert_eq!(relaunched.identities().len(), 2);
     signs_each_prefix_with_its_own_key(&relaunched, &home, &work);
     relaunched.shutdown();
+}
+
+/// The plain adoption of a persisted or scanned context (`adopt_context`)
+/// is told to the membership watchers as every adoption is: `adopted`, once
+/// per prefix new to the app — at a launch restoring the persisted contexts
+/// too — and nothing when the version is already held.
+#[test]
+fn a_plain_adoption_is_told_once() {
+    let bob = Namespace::new();
+    let club = Namespace::of("/club");
+    let app = bob.engine();
+    let changes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    std::thread::scope(|s| {
+        let watching = s.spawn(|| app.watch_memberships(Box::new(Watcher(Arc::clone(&changes)))));
+        std::thread::sleep(Duration::from_millis(200));
+        for ns in [&bob, &club, &bob] {
+            app.adopt_context(
+                ns.context.raw().to_vec(),
+                ns.ns.to_string(),
+                ns.fingerprint.to_vec(),
+            )
+            .unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        app.shutdown();
+        watching.join().unwrap().unwrap();
+    });
+    let seen: Vec<(String, String, String, u64)> = changes
+        .lock()
+        .iter()
+        .map(|e| {
+            (
+                e.namespace.clone(),
+                e.change.clone(),
+                e.relation.clone(),
+                e.version,
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (NS.into(), "adopted".into(), "following".into(), 1),
+            ("/club".into(), "adopted".into(), "following".into(), 1),
+        ]
+    );
 }

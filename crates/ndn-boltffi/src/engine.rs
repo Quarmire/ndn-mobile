@@ -1044,13 +1044,34 @@ impl NdnEngine {
     /// pins. The context is adopted only if its signature verifies under the
     /// pinned anchor and it roots `namespace` (TOFU); its anchors then become
     /// trusted for that namespace. A mismatched pin, a tampered context, or a
-    /// version strictly older than one already held is an error.
+    /// version strictly older than one already held is an error. A prefix new
+    /// to the app is told to the membership watchers as `adopted`
+    /// ([`watch_memberships`](Self::watch_memberships)), as every adoption
+    /// is — a launch restoring the persisted contexts included.
     pub fn adopt_context(
         &self,
         context_data: Vec<u8>,
         namespace: String,
         fingerprint: Vec<u8>,
     ) -> Result<NdnContext, NdnError> {
+        #[cfg(feature = "identity")]
+        {
+            let engine = self
+                .inner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|inner| inner.engine().clone());
+            // Shut down: nobody watches any more.
+            if let Some(engine) = engine {
+                return self.identity_core.adopt_context_on(
+                    &engine,
+                    context_data,
+                    namespace,
+                    fingerprint,
+                );
+            }
+        }
         self.identity_core
             .adopt_context(context_data, namespace, fingerprint)
     }
@@ -1286,7 +1307,15 @@ impl NdnEngine {
     ) -> Result<Vec<crate::types::NdnEnrollmentRequest>, NdnError> {
         #[cfg(feature = "identity")]
         {
-            self.identity_core.enrollment_requests(storage_dir)
+            let engine = {
+                let guard = self.inner.lock().unwrap();
+                guard
+                    .as_ref()
+                    .ok_or_else(|| NdnError::engine("engine is shut down"))?
+                    .engine()
+                    .clone()
+            };
+            self.identity_core.enrollment_requests(&engine, storage_dir)
         }
         #[cfg(not(feature = "identity"))]
         {
@@ -3518,7 +3547,8 @@ mod context_tests {
     fn an_adopted_context_can_be_persisted_and_adopted_at_launch() {
         let bob = SecurityManager::new();
         let uri = namespace_envelope(&bob, "/home/bob", 3);
-        let adopts: [fn(&NdnEngine, &str) -> Result<NdnContext, NdnError>; 2] = [
+        type Adopt = fn(&NdnEngine, &str) -> Result<NdnContext, NdnError>;
+        let adopts: [Adopt; 2] = [
             |e, uri| scan_and_adopt(e, uri),
             |e, uri| e.adopt_context_link(uri.to_string()),
         ];

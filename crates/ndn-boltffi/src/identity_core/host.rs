@@ -18,7 +18,7 @@
 //!   issued there are kept under `<storage_dir>/issuers/`
 //!   ([`ndn_cert::issuers`]).
 //! - [`AppParticipant`]: the [`Participant`] a call works through; the
-//!   membership changes it reports reach the app's watchers
+//!   trust events it reports reach the app's watchers
 //!   ([`IdentityCore::watch_memberships`]).
 
 use std::collections::HashMap;
@@ -29,7 +29,7 @@ use parking_lot::Mutex;
 
 use bytes::Bytes;
 use ndn_cert::RequestStore;
-use ndn_cert::report::MembershipEvent;
+use ndn_cert::report::TrustEvent;
 use ndn_namespace::{
     Activation, ContextStore, HostWords, KeyUnavailable, KeyVault, Participant, ParticipantParts,
     StoredContext,
@@ -435,7 +435,7 @@ impl KeyVault for AppVault<'_> {
 
     fn activate(
         &self,
-        _identity: &Name,
+        identity: &Name,
         key: &Name,
         signer: Arc<dyn Signer>,
         _first_identity: bool,
@@ -456,21 +456,29 @@ impl KeyVault for AppVault<'_> {
             Err(e) => Activation {
                 signing_now: false,
                 node_identity: false,
-                at_next_start: vec![e.to_string()],
+                at_next_start: vec![
+                    ndn_namespace::Detail::new(
+                        ndn_namespace::detail_code::NEXT_START_NOT_ACTIVATED,
+                        format!("the identity was kept, but not taken into use now ({e})"),
+                    )
+                    .with("identity", identity)
+                    .with("error", &e),
+                ],
             },
         }
     }
 }
 
 /// The [`Participant`] an FFI call works through; dropped at the end of the
-/// call, it hands the membership changes it reported to the app's watchers,
-/// each with the app's relation to the namespace after the call (judged
-/// over the identities the app holds, as [`IdentityCore::memberships`]: the
-/// library judges an event's relation by the engine's key store, which holds
-/// none of the app's identities).
+/// call, it hands the trust events it reported
+/// ([`Participant::events`]) to the app's watchers, each membership change
+/// with the app's relation to the namespace after the call (judged over the
+/// identities the app holds, as [`IdentityCore::memberships`]: the library
+/// judges an event's relation by the engine's key store, which holds none
+/// of the app's identities).
 pub(crate) struct AppParticipant<'a> {
     participant: Participant,
-    events: tokio::sync::broadcast::Receiver<MembershipEvent>,
+    events: tokio::sync::broadcast::Receiver<TrustEvent>,
     core: &'a IdentityCore,
 }
 
@@ -499,10 +507,12 @@ impl Drop for AppParticipant<'_> {
         let vault = AppVault::new(self.core, String::new(), Vec::new());
         let now = ndn_namespace::membership::memberships(&self.participant, &vault);
         for mut event in events {
-            if let Some(info) = now.iter().find(|m| m.namespace == event.namespace) {
-                event.relation = info.relation;
+            if let TrustEvent::MembershipChanged(change) = &mut event
+                && let Some(info) = now.iter().find(|m| m.namespace == change.namespace)
+            {
+                change.relation = info.relation;
             }
-            self.core.publish_membership(event);
+            self.core.publish(event);
         }
     }
 }
@@ -527,7 +537,7 @@ impl IdentityCore {
             words: app_words(),
         });
         AppParticipant {
-            events: participant.membership_events(),
+            events: participant.events(),
             participant,
             core: self,
         }
@@ -572,10 +582,21 @@ pub(crate) fn app_words() -> HostWords {
     }
 }
 
-/// An [`NdnError`] from a library refusal.
+/// A library refusal in the app's words: its code rendered with
+/// [`app_words`].
+pub(crate) fn app_text(refusal: &ndn_namespace::TrustRefusal) -> String {
+    app_words().render(refusal)
+}
+
+/// A library detail in the app's words ([`app_words`]).
+pub(crate) fn app_detail(detail: &ndn_namespace::Detail) -> String {
+    app_words().render_detail(detail)
+}
+
+/// An [`NdnError`] from a library refusal, in the app's words.
 pub(crate) fn refused(refusal: ndn_namespace::TrustRefusal) -> NdnError {
     NdnError::Identity {
-        msg: refusal.reason,
+        msg: app_text(&refusal),
     }
 }
 
@@ -627,10 +648,5 @@ mod tests {
                 assert!(!m.contains(forwarder), "{m:?} names {forwarder:?}");
             }
         }
-        assert_eq!(
-            w.no_context(&ns),
-            "this node holds no trust context for /home/bob; adopt it first (adopt_context_link \
-             with its anchor link)"
-        );
     }
 }

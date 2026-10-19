@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use ndn_app::{Connection, Consumer, DemuxConnection};
-use ndn_cert::report::MembershipEvent;
+use ndn_cert::report::TrustEvent;
 use ndn_packet::Name;
 use tokio::runtime::Runtime;
 
@@ -71,9 +71,10 @@ pub(crate) struct IdentityCore {
     /// certificate, as kept from its enrollment or renewal or passed by the
     /// host: the rest of the chain a link hello carries.
     issuers: parking_lot::Mutex<HashMap<Name, Vec<Bytes>>>,
-    /// The membership changes the library's operations report
-    /// ([`Self::watch_memberships`]).
-    memberships: tokio::sync::broadcast::Sender<MembershipEvent>,
+    /// The trust events the library's operations report
+    /// ([`ndn_namespace::Participant::events`] of each call's participant);
+    /// [`Self::watch_memberships`] hands on the membership changes.
+    events: tokio::sync::broadcast::Sender<TrustEvent>,
     /// Cancelled when the engine shuts down: ends the membership watch.
     #[cfg(feature = "identity")]
     closed: tokio_util::sync::CancellationToken,
@@ -92,9 +93,9 @@ pub(crate) struct IdentityCore {
     pinned_anchors: Mutex<Vec<ndn_security::Certificate>>,
 }
 
-/// How many membership changes a slow watcher may fall behind by before it
-/// misses some (it is told, and reads `memberships` for the current state).
-const MEMBERSHIP_EVENTS: usize = 64;
+/// How many trust events a slow watcher may fall behind by before it misses
+/// some (it is told, and reads `memberships` for the current state).
+const TRUST_EVENTS: usize = 64;
 
 impl IdentityCore {
     /// Build a core over `conn` (the forwarder seam) sharing runtime `rt`,
@@ -122,7 +123,7 @@ impl IdentityCore {
             node: parking_lot::Mutex::new(None),
             changes: tokio::sync::watch::Sender::new(0),
             issuers: parking_lot::Mutex::new(HashMap::new()),
-            memberships: tokio::sync::broadcast::channel(MEMBERSHIP_EVENTS).0,
+            events: tokio::sync::broadcast::channel(TRUST_EVENTS).0,
             #[cfg(feature = "identity")]
             closed: tokio_util::sync::CancellationToken::new(),
             #[cfg(feature = "identity")]
@@ -192,12 +193,64 @@ impl IdentityCore {
     /// signature verifies under the anchor `fingerprint` pins and it roots
     /// `namespace` (TOFU; `ndn_cert::adopt_with_tofu`). A mismatched pin, a
     /// tampered context, or an older version than the one held is an error.
+    /// Nothing is told: a client without an engine has no watchers
+    /// ([`Self::adopt_context_on`] tells them).
     pub(crate) fn adopt_context(
         &self,
         context_data: Vec<u8>,
         namespace: String,
         fingerprint: Vec<u8>,
     ) -> Result<NdnContext, NdnError> {
+        let (ctx, data, fingerprint) = self.adopt_tofu(context_data, namespace, fingerprint)?;
+        Ok(NdnContext::adopted(&ctx, &data, &fingerprint))
+    }
+
+    /// [`Self::adopt_context`] on the engine's side: the version is kept as
+    /// an adoption by link is ([`ndn_namespace::keep::keep_adopted`]), so the
+    /// watchers are told of it the same way (`adopted` when the prefix is
+    /// new to the app — a scanned envelope, or a launch restoring what the
+    /// host persisted; nothing for a version already held).
+    #[cfg(feature = "identity")]
+    pub(crate) fn adopt_context_on(
+        &self,
+        engine: &ndn_app::ForwarderEngine,
+        context_data: Vec<u8>,
+        namespace: String,
+        fingerprint: Vec<u8>,
+    ) -> Result<NdnContext, NdnError> {
+        let contexts = Arc::new(host::AppContexts::default());
+        // Made before the adoption: it judges what changed against what the
+        // app held until now.
+        let participant = self.participant(engine, &contexts);
+        let (ctx, data, fingerprint) = self.adopt_tofu(context_data, namespace, fingerprint)?;
+        let adopted = ndn_cert::LinkAdoption {
+            context: Arc::clone(&ctx),
+            data,
+            fetched: false,
+        };
+        ndn_namespace::keep::keep_adopted(&participant, &adopted, &fingerprint).map_err(|e| {
+            NdnError::Identity {
+                msg: format!("trust context refused: {}", host::app_text(&e)),
+            }
+        })?;
+        Ok(NdnContext::adopted(&ctx, &adopted.data, &fingerprint))
+    }
+
+    /// Adopt `context_data` into the keyring (see [`Self::adopt_context`]):
+    /// the context, its signed Data and the expected fingerprint.
+    fn adopt_tofu(
+        &self,
+        context_data: Vec<u8>,
+        namespace: String,
+        fingerprint: Vec<u8>,
+    ) -> Result<
+        (
+            Arc<ndn_security::SignedTrustContext>,
+            ndn_packet::Data,
+            [u8; 32],
+        ),
+        NdnError,
+    > {
         let ns: Name = namespace
             .parse()
             .map_err(|_| NdnError::invalid_name(&namespace))?;
@@ -213,7 +266,7 @@ impl IdentityCore {
                     msg: format!("trust context refused: {e}"),
                 }
             })?;
-        Ok(NdnContext::adopted(&ctx, &data, &fingerprint))
+        Ok((ctx, data, fingerprint))
     }
 
     /// Adopt the namespace a scanned `ndn-trust://anchor` link names, as
@@ -238,7 +291,7 @@ impl IdentityCore {
         let participant = self.participant(engine, &contexts);
         self.rt
             .block_on(ndn_namespace::keep::adopt_link(&participant, &link))
-            .map_err(|e| refused(e.reason))?;
+            .map_err(|e| refused(host::app_text(&e)))?;
         contexts
             .newest(&link.namespace)
             .ok_or_else(|| refused(format!("{} was not kept", link.namespace)))
@@ -297,7 +350,7 @@ impl IdentityCore {
                     held_version: info.held_version,
                     version: info.version,
                     revoked: info.revoked,
-                    detail: info.detail,
+                    detail: host::app_detail(&info.detail),
                     context,
                 }
             })
@@ -347,8 +400,8 @@ impl IdentityCore {
         let adopted = self
             .rt
             .block_on(ensure_context(&participant, &link))
-            .map_err(|e| failed(e.reason))?;
-        match route(&participant, &link, role).map_err(|e| failed(e.reason))? {
+            .map_err(|e| failed(host::app_text(&e)))?;
+        match route(&participant, &link, role).map_err(|e| failed(host::app_text(&e)))? {
             Route::Invite => {}
             Route::Approval { .. } => {
                 return Err(failed(format!(
@@ -374,7 +427,7 @@ impl IdentityCore {
                 invite,
                 enrolling,
             ))
-            .map_err(|e| failed(e.reason))?;
+            .map_err(|e| failed(host::app_text(&e)))?;
         vault
             .installed(contexts.newest(&namespace))
             .ok_or_else(|| failed("the issued certificate was not installed".into()))
@@ -451,7 +504,11 @@ impl IdentityCore {
         {
             Ok(renewed) => renewed,
             // Nothing a namespace CA issued in a namespace this app holds.
-            Err(e) => return Ok(NdnRenewal::Refused { detail: e.reason }),
+            Err(e) => {
+                return Ok(NdnRenewal::Refused {
+                    detail: host::app_text(&e),
+                });
+            }
         };
         let Some(info) = renewed
             .into_iter()
@@ -473,10 +530,18 @@ impl IdentityCore {
                 Ok(NdnRenewal::Renewed { identity })
             }
             RenewalState::Refused => Ok(NdnRenewal::Refused {
-                detail: info.detail,
+                detail: info
+                    .detail
+                    .as_ref()
+                    .map(host::app_detail)
+                    .unwrap_or_default(),
             }),
             RenewalState::Failed => Ok(NdnRenewal::Failed {
-                detail: info.detail,
+                detail: info
+                    .detail
+                    .as_ref()
+                    .map(host::app_detail)
+                    .unwrap_or_default(),
             }),
         }
     }
@@ -1987,11 +2052,11 @@ impl IdentityCore {
 
 #[cfg(feature = "identity")]
 impl IdentityCore {
-    /// Pass on `event`, a membership change an operation of the library
-    /// reported, to the watchers ([`Self::watch_memberships`]).
-    pub(crate) fn publish_membership(&self, event: MembershipEvent) {
+    /// Pass on `event`, a trust event an operation of the library reported,
+    /// to the watchers ([`Self::watch_memberships`]).
+    pub(crate) fn publish(&self, event: TrustEvent) {
         // No watcher: nobody to tell.
-        let _ = self.memberships.send(event);
+        let _ = self.events.send(event);
     }
 
     /// Hand each membership change to `handler` as it happens, until the
@@ -2002,13 +2067,14 @@ impl IdentityCore {
     ) -> Result<bool, NdnError> {
         use tokio::sync::broadcast::error::RecvError;
 
-        let mut events = self.memberships.subscribe();
+        let mut events = self.events.subscribe();
         self.rt.block_on(async {
             loop {
                 tokio::select! {
                     () = self.closed.cancelled() => return,
                     event = events.recv() => match event {
-                        Ok(event) => handler.on_membership(crate::types::NdnMembershipEvent::from_event(event)),
+                        Ok(TrustEvent::MembershipChanged(event)) => handler.on_membership(crate::types::NdnMembershipEvent::from_event(event)),
+                        Ok(_) => {}
                         Err(RecvError::Lagged(missed)) => tracing::warn!(
                             target: "ndn_boltffi::identity",
                             missed,

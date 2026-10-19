@@ -69,7 +69,11 @@ impl NdnTrust {
         grant: Option<Vec<u8>>,
     ) -> String {
         TrustEnvelope::Capability(Capability {
-            direction: if is_grant { CapDirection::Grant } else { CapDirection::Request },
+            direction: if is_grant {
+                CapDirection::Grant
+            } else {
+                CapDirection::Request
+            },
             namespace,
             scope_patterns,
             ttl_secs,
@@ -117,6 +121,8 @@ fn convert(e: TrustEnvelope) -> Result<NdnTrustEnvelope, NdnError> {
             token,
             ttl_secs,
             anchor_fingerprint,
+            // The device-name hint is not exposed to apps yet.
+            device: _,
         } => NdnTrustEnvelope::Invite {
             ca_prefix,
             identity_namespace,

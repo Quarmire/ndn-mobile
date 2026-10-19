@@ -443,7 +443,8 @@ impl NdnMembership {
 }
 
 /// A change of the app's membership in one trusted prefix
-/// ([`NdnEngine::watch_memberships`](crate::NdnEngine::watch_memberships)).
+/// ([`NdnEngine::watch_memberships`](crate::NdnEngine::watch_memberships)):
+/// identifiers and states only, for the app to word.
 #[data]
 #[derive(Debug, Clone)]
 pub struct NdnMembershipEvent {
@@ -454,8 +455,22 @@ pub struct NdnMembershipEvent {
     /// What changed: `adopted`, `enrolled`, `renewed`, `revoked` or
     /// `root-changed` (a recovery replaced the prefix's root).
     pub change: String,
-    /// What changed, in words.
-    pub detail: String,
+    /// The version of the prefix's trust context held after the change.
+    pub version: u64,
+    /// The key the change is about: the key enrolled, renewed, or that no
+    /// longer validates (`revoked`).
+    pub key: Option<String>,
+    /// What the version revokes on the key's chain (`revoked`): the key or
+    /// certificate name.
+    pub revoked: Option<String>,
+    /// The version whose root the new one replaced (`root-changed`).
+    pub replaced_version: Option<u64>,
+    /// The new certificate's validity end, ISO 8601 UTC (`enrolled`,
+    /// `renewed`).
+    pub valid_until: Option<String>,
+    /// The request for an admin's approval the enrollment waited for
+    /// (`enrolled`).
+    pub request: Option<String>,
 }
 
 impl NdnMembershipEvent {
@@ -472,7 +487,12 @@ impl NdnMembershipEvent {
                 MembershipChange::RootChanged => "root-changed",
             }
             .to_string(),
-            detail: event.detail,
+            version: event.version,
+            key: event.key,
+            revoked: event.revoked,
+            replaced_version: event.replaced_version,
+            valid_until: event.valid_until,
+            request: event.request,
         }
     }
 }
