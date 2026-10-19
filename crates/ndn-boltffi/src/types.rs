@@ -445,7 +445,11 @@ pub enum NdnTrustEnvelope {
 #[data]
 #[derive(Debug, Clone)]
 pub enum NdnSecurityProfile {
-    /// Full chain validation with certificate fetching.
+    /// Full chain validation with certificate fetching, against the trust
+    /// contexts adopted into the engine (`adopt_context`,
+    /// `adopt_context_link`). Fails closed: Data from a network face whose
+    /// name no adopted context governs is refused `untrusted-root` when it
+    /// names a signer.
     Default,
     /// Verify signature only; skip trust schema and chain walk.
     AcceptSigned,

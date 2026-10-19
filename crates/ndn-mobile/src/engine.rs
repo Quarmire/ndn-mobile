@@ -284,6 +284,14 @@ pub struct MobileEngine {
 }
 
 /// Mobile-tuned defaults: 8 MB CS, single pipeline thread, full chain validation.
+///
+/// The engine has no security manager, so under the default
+/// [`SecurityProfile::Default`] it fails closed: Data from a network face that
+/// names a signer validates only under a trust context adopted into the
+/// engine validator's keyring (or an anchor added to it), and is refused
+/// `untrusted-root` otherwise. An app that verifies end to end itself sets
+/// [`SecurityProfile::Disabled`]; one content with signatures alone,
+/// [`SecurityProfile::AcceptSigned`].
 pub struct MobileEngineBuilder {
     cs_capacity_mb: usize,
     security_profile: SecurityProfile,
