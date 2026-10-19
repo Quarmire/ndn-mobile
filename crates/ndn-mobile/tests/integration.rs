@@ -39,7 +39,7 @@ async fn test_in_process_roundtrip() {
             .ok();
     });
 
-    let data = consumer.fetch("/test/data").await.expect("fetch failed");
+    let data = consumer.fetch(ndn_packet::name!("/test/data")).await.expect("fetch failed");
     assert_eq!(
         data.content().map(|b| b.as_ref()),
         Some(b"hello ndn".as_ref())
@@ -57,8 +57,8 @@ async fn test_multiple_producers_distinct_faces() {
         .await
         .expect("engine build failed");
 
-    let p1 = engine.register_producer("/a");
-    let p2 = engine.register_producer("/b");
+    let p1 = engine.register_producer(ndn_packet::name!("/a"));
+    let p2 = engine.register_producer(ndn_packet::name!("/b"));
 
     // The producers reference distinct prefixes.
     assert_ne!(p1.prefix().to_string(), p2.prefix().to_string());
@@ -98,7 +98,7 @@ async fn test_suspend_resume_keeps_appface_alive() {
 
     // AppFace must still work.
     let data = consumer
-        .fetch("/test/suspend")
+        .fetch(ndn_packet::name!("/test/suspend"))
         .await
         .expect("fetch after suspend failed");
     assert_eq!(data.content().map(|b| b.as_ref()), Some(b"alive".as_ref()));

@@ -13,7 +13,7 @@
 //! async fn main() -> anyhow::Result<()> {
 //!     let (engine, handle) = MobileEngine::builder().build().await?;
 //!     let mut consumer = Consumer::from_handle(handle);
-//!     let data = consumer.fetch("/ndn/edu/example/data/1").await?;
+//!     let data = consumer.fetch(ndn_packet::name!("/ndn/edu/example/data/1")).await?;
 //!     println!("got {} bytes", data.content().map_or(0, |b| b.len()));
 //!     engine.shutdown().await;
 //!     Ok(())

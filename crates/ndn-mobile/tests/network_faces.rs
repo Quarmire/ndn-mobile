@@ -58,8 +58,8 @@ async fn distinct_peers_get_distinct_faces() {
     let peers = engine.peers();
     assert_eq!(peers.len(), 2);
 
-    engine.route_to_peer("/to/a", &peers[0], 0);
-    engine.route_to_peer("/to/b", &peers[1], 0);
+    engine.route_to_peer(ndn_packet::name!("/to/a"), &peers[0], 0);
+    engine.route_to_peer(ndn_packet::name!("/to/b"), &peers[1], 0);
 
     let fib = engine.engine().fib();
     let a = fib.lpm(&"/to/a".parse().unwrap()).unwrap().nexthops[0].face_id;
@@ -77,7 +77,7 @@ async fn distinct_peers_get_distinct_faces() {
 async fn peer_and_route_survive_suspend_resume() {
     let mut engine = engine_with_udp_peers(&[PEER_A]).await;
     let peers = engine.peers();
-    engine.route_to_peer("/ndn", &peers[0], 0);
+    engine.route_to_peer(ndn_packet::name!("/ndn"), &peers[0], 0);
 
     let fib = engine.engine().fib();
     let peer_id_before = fib.lpm(&"/ndn".parse().unwrap()).unwrap().nexthops[0].face_id;

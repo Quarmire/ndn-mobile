@@ -2046,7 +2046,7 @@ async fn build_engine(config: NdnEngineConfig) -> Result<(MobileEngine, InProcHa
     // broadcasts to peers on the group. This is what makes a local-first node a
     // full participant (publish AND fetch), not just a producer.
     if had_multicast {
-        engine.route_to_multicast("/");
+        engine.route_to_multicast(ndn_packet::name!("/"));
     }
 
     // An uplink is a default route out: install `/` toward each TCP-uplink peer so

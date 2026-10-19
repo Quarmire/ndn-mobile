@@ -149,7 +149,7 @@ async fn run() -> Result<()> {
             // the forwarder face when uplinking.
             match uplink {
                 None => {
-                    if !engine.route_to_multicast("/") {
+                    if !engine.route_to_multicast(ndn_packet::name!("/")) {
                         bail!("no multicast face — cannot fetch over the group");
                     }
                 }

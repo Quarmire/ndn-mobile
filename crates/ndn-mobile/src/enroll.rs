@@ -11,11 +11,12 @@
 //! ```no_run
 //! # async fn doc(engine: &ndn_mobile::MobileEngine) -> anyhow::Result<()> {
 //! use ndn_mobile::enroll::EnrollConfig;
+//! use ndn_packet::name;
 //! let peer = &engine.peers()[0];               // a gateway added with with_tcp_peer/…
-//! engine.route_to_peer("/ndn", peer, 0);       // CA lives under /ndn
+//! engine.route_to_peer(name!("/ndn"), peer, 0); // CA lives under /ndn
 //! let id = engine
 //!     .enroll_pin(
-//!         EnrollConfig::new("/ndn", "/ndn/mobile/alice"),
+//!         EnrollConfig::new(name!("/ndn"), name!("/ndn/mobile/alice")),
 //!         |req| async move { ask_user_for_pin(&req.request_id).await },
 //!     )
 //!     .await?;
