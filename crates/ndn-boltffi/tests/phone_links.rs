@@ -3,8 +3,10 @@
 //! `ndn-fwd` runs (`ndn_link` on an engine): the phone links to its
 //! namespace's relay, reaches the desktop device and is reached by it
 //! through the relay and then over a direct path, changes a link's mode,
-//! goes to the background and back, moves to another socket, and hands the
-//! relay a wake token the relay's notifier gets while the phone is asleep.
+//! goes to the background and back, moves to another socket, hands the
+//! relay a wake token the relay's notifier gets while the phone is asleep,
+//! and is admitted by a relay of another trusted prefix by its membership
+//! there.
 
 use std::net::SocketAddr;
 use std::os::fd::IntoRawFd;
@@ -16,20 +18,20 @@ use parking_lot::Mutex;
 
 use ndn_app::{EngineAppExt, ForwarderEngine};
 use ndn_boltffi::{
-    NdnEngine, NdnEngineConfig, NdnError, NdnInterestHandler, NdnLinkMode, NdnLinkReport, NdnLinkStatus,
-    NdnLinksConfig, NdnRelay, NdnSecurityProfile,
+    NdnEngine, NdnEngineConfig, NdnError, NdnInterestHandler, NdnLinkMode, NdnLinkReport,
+    NdnLinkStatus, NdnLinksConfig, NdnRelay, NdnSecurityProfile,
 };
 use ndn_engine::{EngineBuilder, EngineConfig, ShutdownHandle};
 use ndn_face_quic::{KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig};
 use ndn_link::{
-    ConfiguredEndpoints, EngineFaces, HoldLimits, LinkHints, LinkSetup, LinkTrust, Links, PeerSpec, RelaySource,
-    RelayUse, WakeNotifier, WakeRequest,
+    ConfiguredEndpoints, EngineFaces, HoldLimits, LinkHints, LinkSetup, LinkTrust, Links, PeerSpec,
+    RelaySource, RelayUse, WakeNotifier, WakeRequest,
 };
 use ndn_packet::Name;
 use ndn_packet::encode::DataBuilder;
 use ndn_security::{
-    Certificate, EcdsaP256Signer, Ed25519Signer, Keyring, SecurityManager, SecurityProfile, SignedTrustContext,
-    Signer,
+    Certificate, EcdsaP256Signer, Ed25519Signer, Keyring, SecurityManager, SecurityProfile,
+    SignedTrustContext, Signer,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -41,9 +43,11 @@ fn n(s: &str) -> Name {
     s.parse().unwrap()
 }
 
-/// The namespace `/home`: its root key, its signed trust context (default
-/// link policy: members link, `node` devices relay, direct paths on).
+/// A namespace (`/home` unless named): its root key, its signed trust
+/// context (default link policy: members link, `node` devices relay, direct
+/// paths on).
 struct Home {
+    ns: String,
     root: SecurityManager,
     root_key: Name,
     anchor: Certificate,
@@ -53,22 +57,27 @@ struct Home {
 
 impl Home {
     fn new() -> Self {
+        Self::of(NS)
+    }
+
+    fn of(ns: &str) -> Self {
         // RUST_LOG shows the link library's view when a test fails.
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_test_writer()
             .try_init();
         let root = SecurityManager::new();
-        let root_key = n(&format!("{NS}/KEY/root"));
+        let root_key = n(&format!("{ns}/KEY/root"));
         root.generate_ed25519(root_key.clone()).unwrap();
         let signer = root.get_signer_sync(&root_key).unwrap();
         let anchor = root
             .issue_self_signed(&root_key, signer.public_key().unwrap(), u64::MAX)
             .unwrap();
-        let ctx = SignedTrustContext::hierarchical(n(NS)).with_version(1);
+        let ctx = SignedTrustContext::hierarchical(n(ns)).with_version(1);
         ctx.add_anchor(anchor.clone());
         let context_data = ctx.sign_into_data(signer.as_ref()).unwrap();
         Self {
+            ns: ns.to_string(),
             root,
             root_key,
             anchor,
@@ -90,6 +99,36 @@ impl Home {
                 None,
             ))
             .unwrap()
+    }
+
+    /// Adopt this namespace's context in the app.
+    fn adopt_in(&self, app: &NdnEngine) {
+        app.adopt_context(
+            self.context_data.raw().to_vec(),
+            self.ns.clone(),
+            ndn_cert::anchor_fingerprint(&self.anchor).to_vec(),
+        )
+        .unwrap();
+    }
+
+    /// Load the app's identity `<ns>/member/phone` in this namespace: a
+    /// SafeBag with the certificate the root issued, as the host persisted.
+    fn load_phone_identity(&self, app: &NdnEngine, seed: u8) {
+        let key_name = n(&format!("{}/member/phone/KEY/p{seed}", self.ns));
+        let signer = EcdsaP256Signer::from_seed(&[seed; 32], key_name.clone()).unwrap();
+        let cert = self.certify(&key_name, signer.public_key().unwrap());
+        let bag = ndn_security::safebag::SafeBag::encrypt(
+            cert.data_wire().unwrap(),
+            &signer.to_pkcs8_der().unwrap(),
+            PASSWORD,
+        )
+        .unwrap();
+        app.load_identity(
+            bag.encode().to_vec(),
+            PASSWORD.to_vec(),
+            key_name.to_string(),
+        )
+        .unwrap();
     }
 
     fn keyring(&self) -> Arc<Keyring> {
@@ -155,9 +194,18 @@ struct Host {
 }
 
 impl Host {
-    fn start(home: &Home, device: &str, seed: u8, peers: Vec<PeerSpec>, setup: impl FnOnce(&mut LinkSetup)) -> Self {
-        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-        let key_name = n(&format!("{NS}{device}/KEY/k{seed}"));
+    fn start(
+        home: &Home,
+        device: &str,
+        seed: u8,
+        peers: Vec<PeerSpec>,
+        setup: impl FnOnce(&mut LinkSetup),
+    ) -> Self {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let key_name = n(&format!("{}{device}/KEY/k{seed}", home.ns));
         let signer = Arc::new(Ed25519Signer::from_seed(&[seed; 32], key_name.clone()));
         let cert = home.certify(&key_name, signer.public_key().unwrap());
         let key = LinkKey::from_signer(signer).unwrap();
@@ -214,7 +262,9 @@ impl Host {
     /// Answer every Interest under `prefix` with `content`.
     fn serve(&self, prefix: &str, content: &'static [u8]) {
         let _guard = self.rt.enter();
-        let producer = self.engine.register_producer(n(prefix), self.cancel.child_token());
+        let producer = self
+            .engine
+            .register_producer(n(prefix), self.cancel.child_token());
         self.rt.spawn(async move {
             let _ = producer
                 .serve(|interest, responder| async move {
@@ -229,7 +279,9 @@ impl Host {
         let _guard = self.rt.enter();
         let mut consumer = self.engine.app_consumer(self.cancel.child_token());
         self.rt
-            .block_on(async { tokio::time::timeout(Duration::from_secs(5), consumer.get(n(name))).await })
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), consumer.get(n(name))).await
+            })
             .ok()?
             .ok()
             .map(|b| b.to_vec())
@@ -242,9 +294,9 @@ impl Drop for Host {
     }
 }
 
-/// The relay `/home/node/relay`, serving its namespace (the default),
+/// The relay `<ns>/node/relay`, serving its namespace (the default),
 /// holding Interests for sleeping devices that ask and handing their wake
-/// tokens to `woken`; it answers `/home/node/relay/hello` itself.
+/// tokens to `woken`; it answers `<ns>/node/relay/hello` itself.
 fn relay(home: &Home, woken: &Arc<Woken>) -> Host {
     let notifier: Arc<dyn WakeNotifier> = Arc::clone(woken) as Arc<dyn WakeNotifier>;
     let relay = Host::start(home, "/node/relay", 1, Vec::new(), move |s| {
@@ -255,7 +307,7 @@ fn relay(home: &Home, woken: &Arc<Woken>) -> Host {
             max_hold: Duration::from_secs(10),
         });
     });
-    relay.serve(&format!("{NS}/node/relay/hello"), b"from the relay");
+    relay.serve(&format!("{}/node/relay/hello", home.ns), b"from the relay");
     relay
 }
 
@@ -294,7 +346,11 @@ struct Answer(&'static [u8]);
 
 impl NdnInterestHandler for Answer {
     fn handle_interest(&self, name: String) -> Option<Vec<u8>> {
-        Some(DataBuilder::new(name.parse::<Name>().ok()?, self.0).build().to_vec())
+        Some(
+            DataBuilder::new(name.parse::<Name>().ok()?, self.0)
+                .build()
+                .to_vec(),
+        )
     }
 }
 
@@ -303,28 +359,14 @@ impl NdnInterestHandler for Answer {
 /// serves `/home/member/phone/hello` and starts links.
 fn phone(home: &Home) -> Arc<NdnEngine> {
     let engine = Arc::new(NdnEngine::new(engine_config()).unwrap());
-    engine
-        .adopt_context(
-            home.context_data.raw().to_vec(),
-            NS.into(),
-            ndn_cert::anchor_fingerprint(&home.anchor).to_vec(),
-        )
-        .unwrap();
-    let key_name = n(&format!("{NS}/member/phone/KEY/p1"));
-    let signer = EcdsaP256Signer::from_seed(&[9; 32], key_name.clone()).unwrap();
-    let cert = home.certify(&key_name, signer.public_key().unwrap());
-    let bag = ndn_security::safebag::SafeBag::encrypt(
-        cert.data_wire().unwrap(),
-        &signer.to_pkcs8_der().unwrap(),
-        PASSWORD,
-    )
-    .unwrap();
-    engine
-        .load_identity(bag.encode().to_vec(), PASSWORD.to_vec(), key_name.to_string())
-        .unwrap();
+    home.adopt_in(&engine);
+    home.load_phone_identity(&engine, 9);
     let server = Arc::clone(&engine);
     std::thread::spawn(move || {
-        let _ = server.serve(format!("{NS}/member/phone"), Box::new(Answer(b"from the phone")));
+        let _ = server.serve(
+            format!("{NS}/member/phone"),
+            Box::new(Answer(b"from the phone")),
+        );
     });
     engine
         .start_links(NdnLinksConfig {
@@ -344,10 +386,15 @@ fn phone(home: &Home) -> Arc<NdnEngine> {
 }
 
 fn home_relay(relay: &Host, mode: NdnLinkMode, hold: bool) -> NdnRelay {
+    prefix_relay("home", NS, relay, mode, hold)
+}
+
+/// The relay `<ns>/node/relay` as the user adds it, labelled `label`.
+fn prefix_relay(label: &str, ns: &str, relay: &Host, mode: NdnLinkMode, hold: bool) -> NdnRelay {
     NdnRelay {
-        label: "home".into(),
+        label: label.into(),
         key: None,
-        device: Some(format!("{NS}/node/relay")),
+        device: Some(format!("{ns}/node/relay")),
         endpoints: vec![relay.addr.to_string()],
         preference: 0,
         mode,
@@ -366,7 +413,12 @@ fn link<'a>(report: &'a NdnLinkReport, label: &str) -> Option<&'a NdnLinkStatus>
 
 /// Whether the phone's link to its relay `home` is up.
 fn relay_up(phone: &NdnEngine) -> bool {
-    link(&status(phone), "home").is_some_and(|l| l.paths.iter().any(|p| p.kind == "link"))
+    linked(phone, "home")
+}
+
+/// Whether the phone's link labelled `label` is up.
+fn linked(phone: &NdnEngine, label: &str) -> bool {
+    link(&status(phone), label).is_some_and(|l| l.paths.iter().any(|p| p.kind == "link"))
 }
 
 fn until(what: &str, mut done: impl FnMut() -> bool) -> Duration {
@@ -389,12 +441,18 @@ fn the_app_reaches_a_desktop_device_through_its_relay_and_then_directly() {
     let relay = relay(&home, &woken);
     let desk = desk(&home, &relay);
     let phone = phone(&home);
-    phone.add_relay(home_relay(&relay, NdnLinkMode::Always, false)).unwrap();
+    phone
+        .add_relay(home_relay(&relay, NdnLinkMode::Always, false))
+        .unwrap();
     until("the phone links to its relay", || relay_up(&phone));
     let r = status(&phone);
     let home_link = link(&r, "home").unwrap();
     assert_eq!(home_link.device.as_deref(), Some("/home/node/relay"));
-    assert_eq!(home_link.relay.as_ref().unwrap().state, "linked", "{home_link:?}");
+    assert_eq!(
+        home_link.relay.as_ref().unwrap().state,
+        "linked",
+        "{home_link:?}"
+    );
 
     // Through the relay, both ways.
     let desk_hello = format!("{NS}/member/desk/hello");
@@ -402,16 +460,17 @@ fn the_app_reaches_a_desktop_device_through_its_relay_and_then_directly() {
         phone_gets(&phone, &desk_hello).is_ok_and(|c| c == b"from the desk")
     });
     until("the desk reaches the phone", || {
-        desk.get(&format!("{NS}/member/phone/hello")).is_some_and(|c| c == b"from the phone")
+        desk.get(&format!("{NS}/member/phone/hello"))
+            .is_some_and(|c| c == b"from the phone")
     });
 
     // Members linked to the same relay get a direct path by membership: no
     // peer entry names the desk.
     until("a direct path between the phone and the desk", || {
-        status(&phone)
-            .links
-            .iter()
-            .any(|l| l.device.as_deref() == Some("/home/member/desk") && l.paths.iter().any(|p| p.kind == "direct"))
+        status(&phone).links.iter().any(|l| {
+            l.device.as_deref() == Some("/home/member/desk")
+                && l.paths.iter().any(|p| p.kind == "direct")
+        })
     });
     assert!(phone_gets(&phone, &desk_hello).is_ok_and(|c| c == b"from the desk"));
     assert!(woken.0.lock().is_empty(), "the relay woke an awake phone");
@@ -428,14 +487,24 @@ fn link_modes_and_the_app_lifecycle() {
     let phone = phone(&home);
 
     // Off: configured, not linked until the app asks.
-    phone.add_relay(home_relay(&relay, NdnLinkMode::Off, false)).unwrap();
+    phone
+        .add_relay(home_relay(&relay, NdnLinkMode::Off, false))
+        .unwrap();
     std::thread::sleep(Duration::from_secs(2));
-    assert!(!relay_up(&phone), "an off link linked: {:?}", status(&phone));
+    assert!(
+        !relay_up(&phone),
+        "an off link linked: {:?}",
+        status(&phone)
+    );
     phone.connect_link("home".into()).unwrap();
     until("the app asked for the off link", || relay_up(&phone));
-    until("the phone reaches the desk", || phone_gets(&phone, &desk_hello).is_ok());
+    until("the phone reaches the desk", || {
+        phone_gets(&phone, &desk_hello).is_ok()
+    });
     phone.disconnect_link("home".into()).unwrap();
-    until("the off link closed when the app said so", || !relay_up(&phone));
+    until("the off link closed when the app said so", || {
+        !relay_up(&phone)
+    });
     std::thread::sleep(Duration::from_secs(2));
     assert!(!relay_up(&phone), "an off link linked again by itself");
 
@@ -446,14 +515,18 @@ fn link_modes_and_the_app_lifecycle() {
     phone
         .set_link_mode("home".into(), NdnLinkMode::OnDemand { idle_secs: 2 })
         .unwrap();
-    until("an on-demand link links while the app is active", || relay_up(&phone));
+    until("an on-demand link links while the app is active", || {
+        relay_up(&phone)
+    });
     assert!(matches!(
         link(&status(&phone), "home").unwrap().mode,
         Some(NdnLinkMode::OnDemand { idle_secs: 2 })
     ));
     phone.set_app_active(false);
     assert!(!status(&phone).active);
-    until("the on-demand link closes idle in the background", || !relay_up(&phone));
+    until("the on-demand link closes idle in the background", || {
+        !relay_up(&phone)
+    });
     assert!(
         phone_gets(&phone, &format!("{NS}/node/relay/hello")).is_ok_and(|c| c == b"from the relay"),
         "an outgoing Interest links the on-demand link again"
@@ -462,7 +535,9 @@ fn link_modes_and_the_app_lifecycle() {
     phone.set_app_active(true);
 
     // Always: linked, whatever the app does.
-    phone.set_link_mode("home".into(), NdnLinkMode::Always).unwrap();
+    phone
+        .set_link_mode("home".into(), NdnLinkMode::Always)
+        .unwrap();
     phone.set_app_active(false);
     std::thread::sleep(Duration::from_secs(4));
     assert!(relay_up(&phone), "an always link closed in the background");
@@ -478,12 +553,20 @@ fn a_sleeping_phone_is_woken_and_gets_the_held_interest() {
     let phone = phone(&home);
     let phone_hello = format!("{NS}/member/phone/hello");
     phone
-        .add_relay(home_relay(&relay, NdnLinkMode::OnDemand { idle_secs: 1 }, true))
+        .add_relay(home_relay(
+            &relay,
+            NdnLinkMode::OnDemand { idle_secs: 1 },
+            true,
+        ))
         .unwrap();
     until("the phone links to its relay", || relay_up(&phone));
-    phone.set_wake_token("home".into(), Some(b"push-token".to_vec())).unwrap();
+    phone
+        .set_wake_token("home".into(), Some(b"push-token".to_vec()))
+        .unwrap();
     // An awake phone is never woken.
-    until("the relay reaches the phone", || relay.get(&phone_hello).is_some());
+    until("the relay reaches the phone", || {
+        relay.get(&phone_hello).is_some()
+    });
     assert!(woken.0.lock().is_empty(), "the relay woke an awake phone");
 
     phone.set_app_active(false);
@@ -500,7 +583,10 @@ fn a_sleeping_phone_is_woken_and_gets_the_held_interest() {
     assert_eq!(device, Some(n("/home/member/phone")));
     assert_eq!(&token[..], b"push-token");
     phone.set_app_active(true);
-    assert_eq!(asker.join().unwrap().as_deref(), Some(&b"from the phone"[..]));
+    assert_eq!(
+        asker.join().unwrap().as_deref(),
+        Some(&b"from the phone"[..])
+    );
     phone.shutdown();
 }
 
@@ -512,8 +598,12 @@ fn a_network_change_moves_the_links() {
     let desk = desk(&home, &relay);
     let desk_hello = format!("{NS}/member/desk/hello");
     let phone = phone(&home);
-    phone.add_relay(home_relay(&relay, NdnLinkMode::Always, false)).unwrap();
-    until("the phone reaches the desk", || phone_gets(&phone, &desk_hello).is_ok());
+    phone
+        .add_relay(home_relay(&relay, NdnLinkMode::Always, false))
+        .unwrap();
+    until("the phone reaches the desk", || {
+        phone_gets(&phone, &desk_hello).is_ok()
+    });
     let before = status(&phone).local_address.unwrap();
 
     // The platform hands over a socket on the new network.
@@ -521,7 +611,10 @@ fn a_network_change_moves_the_links() {
     let after = socket.local_addr().unwrap().to_string();
     assert_ne!(before, after);
     phone.network_changed(Some(socket.into_raw_fd())).unwrap();
-    assert_eq!(status(&phone).local_address.as_deref(), Some(after.as_str()));
+    assert_eq!(
+        status(&phone).local_address.as_deref(),
+        Some(after.as_str())
+    );
     until("the relay link survives the move", || relay_up(&phone));
     until("the phone reaches the desk from its new address", || {
         phone_gets(&phone, &desk_hello).is_ok_and(|c| c == b"from the desk")
@@ -567,17 +660,67 @@ fn the_link_calls_say_why_they_refuse() {
     };
     let refused = phone.add_relay(bad_key).unwrap_err().to_string();
     assert!(refused.contains("64 hex digits"), "{refused}");
-    phone.add_relay(home_relay(&relay, NdnLinkMode::Always, false)).unwrap();
+    phone
+        .add_relay(home_relay(&relay, NdnLinkMode::Always, false))
+        .unwrap();
     let twice = phone
         .add_relay(home_relay(&relay, NdnLinkMode::Always, false))
         .unwrap_err()
         .to_string();
     assert!(twice.contains("already has a relay"), "{twice}");
-    let unknown = phone.set_link_mode("nowhere".into(), NdnLinkMode::Off).unwrap_err().to_string();
+    let unknown = phone
+        .set_link_mode("nowhere".into(), NdnLinkMode::Off)
+        .unwrap_err()
+        .to_string();
     assert!(unknown.contains("link_status"), "{unknown}");
     phone.remove_relay("home".into()).unwrap();
     assert!(link(&status(&phone), "home").is_none());
     phone.stop_links();
     assert!(phone.link_status().is_err());
+    phone.shutdown();
+}
+
+/// The phone is a member of `/home` (its node identity: its link key) and,
+/// enrolled after its links started, of `/work`. A relay of `/work` — which
+/// holds only `/work`'s trust context, and serves only `/work` — admits it
+/// by the `/work` membership its hello carries, bound to the link.
+#[test]
+fn a_relay_of_another_prefix_admits_the_phone_by_its_membership_there() {
+    let home = Home::new();
+    let work = Home::of("/work");
+    let woken = Arc::new(Woken::default());
+    let relay = relay(&work, &woken);
+    let phone = phone(&home);
+
+    work.adopt_in(&phone);
+    work.load_phone_identity(&phone, 10);
+    let identities = phone.identities();
+    assert_eq!(identities.len(), 2, "{identities:?}");
+    assert_eq!(
+        phone.principal_name().unwrap(),
+        "/home/member/phone",
+        "the node identity stays"
+    );
+
+    phone
+        .add_relay(prefix_relay(
+            "work",
+            "/work",
+            &relay,
+            NdnLinkMode::Always,
+            false,
+        ))
+        .unwrap();
+    until(
+        "the /work relay admits the phone by its /work membership",
+        || linked(&phone, "work"),
+    );
+    assert_eq!(
+        link(&status(&phone), "work").unwrap().device.as_deref(),
+        Some("/work/node/relay")
+    );
+    until("the phone reaches the /work relay", || {
+        phone_gets(&phone, "/work/node/relay/hello").is_ok_and(|c| c == b"from the relay")
+    });
     phone.shutdown();
 }

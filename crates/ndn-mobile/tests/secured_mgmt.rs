@@ -60,7 +60,7 @@ async fn secured_management_rejects_unsigned_command() {
 
     let (engine, handle) = MobileEngine::builder()
         .security_profile(SecurityProfile::Disabled)
-        .with_management_secured(validator, signer)
+        .with_management_secured(validator, Arc::new(ndn_security::ActiveSigner::new(signer)))
         .build()
         .await
         .expect("engine build");

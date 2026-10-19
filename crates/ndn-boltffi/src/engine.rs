@@ -13,17 +13,15 @@ use ndn_mobile::{MobileEngine, MobileEngineBuilder};
 use ndn_packet::Name;
 
 use crate::handlers::{
-    NdnApprovalGate, NdnEnclaveBackend, NdnInterestHandler, NdnPinHandler, NdnRecoverySigner,
-    NdnSampleHandler,
+    NdnApprovalGate, NdnEnclaveBackend, NdnInterestHandler, NdnMembershipHandler, NdnPinHandler,
+    NdnRecoverySigner, NdnSampleHandler,
 };
 use crate::identity_core::IdentityCore;
 use crate::types::{
     NdnActionClass, NdnCertValidity, NdnContext, NdnData, NdnDelegationScope, NdnEngineConfig,
-    NdnEnrollConfig,
-    NdnEnrolledIdentity, NdnError, NdnFaceSpec, NdnLinkMode, NdnLinkReport, NdnLinksConfig,
-    NdnRecoveredIdentity, NdnRelay, NdnRenewal, NdnRevocation,
-    NdnSample,
-    into_security_profile,
+    NdnEnrollConfig, NdnEnrolledIdentity, NdnError, NdnFaceSpec, NdnIdentity, NdnLinkMode,
+    NdnLinkReport, NdnLinksConfig, NdnMembership, NdnRecoveredIdentity, NdnRelay, NdnRenewal,
+    NdnRevocation, NdnSample, into_security_profile,
 };
 
 /// Why a link call cannot work in this build.
@@ -96,7 +94,12 @@ pub struct NdnEngine {
     ble_seam: Mutex<Option<crate::ble::BleSeam>>,
     /// Nearby-peer discovery: the presence table + the live serve guard for the
     /// `/localhost/discovery/peers` dataset. `Some` once `start_discovery` ran.
-    discovery: Mutex<Option<(Arc<crate::discovery::DiscoveryState>, ndn_app::demux::ServeGuard)>>,
+    discovery: Mutex<
+        Option<(
+            Arc<crate::discovery::DiscoveryState>,
+            ndn_app::demux::ServeGuard,
+        )>,
+    >,
     /// Tap-to-share producer board (cert + manifest + per-file serve loops).
     /// `None` until [`Self::start_offer_board`].
     offer_board: Mutex<Option<Arc<crate::offer::OfferBoard>>>,
@@ -193,6 +196,8 @@ impl NdnEngine {
     /// Linked devices are told first that this one is going.
     pub fn shutdown(&self) {
         self.stop_links();
+        #[cfg(feature = "identity")]
+        self.identity_core.close();
         if let Some(engine) = self.inner.lock().unwrap().take() {
             self.rt.block_on(engine.shutdown());
         }
@@ -200,7 +205,9 @@ impl NdnEngine {
 
     // ── QUIC links: relays, link modes, lifecycle, network changes ──
 
-    /// Start hosting QUIC links with the loaded identity: admitted from the
+    /// Start hosting QUIC links with the node identity's key, showing the
+    /// app's membership in each trusted prefix it holds on every link:
+    /// admitted from the
     /// adopted trust contexts like any device's, through the relays the
     /// user adds ([`Self::add_relay`]) and — with
     /// `config.use_namespace_relays` — those the namespaces' trust contexts
@@ -270,12 +277,16 @@ impl NdnEngine {
     /// Stop using the relay (or the namespace-listed relay) called `label`:
     /// its link closes and its routes go.
     pub fn remove_relay(&self, label: String) -> Result<bool, NdnError> {
-        on_links!(self, [label], |links| links.remove_relay(&label).map(|()| true))
+        on_links!(self, [label], |links| links
+            .remove_relay(&label)
+            .map(|()| true))
     }
 
     /// Change when the link to `label` is up (see [`NdnLinkMode`]).
     pub fn set_link_mode(&self, label: String, mode: NdnLinkMode) -> Result<bool, NdnError> {
-        on_links!(self, [label, mode], |links| links.set_mode(&label, &mode).map(|()| true))
+        on_links!(self, [label, mode], |links| links
+            .set_mode(&label, &mode)
+            .map(|()| true))
     }
 
     /// Link to `label` now, whatever its mode (an `Off` link stays up until
@@ -286,7 +297,9 @@ impl NdnEngine {
 
     /// Close the link to `label` now; it links again as its mode says.
     pub fn disconnect_link(&self, label: String) -> Result<bool, NdnError> {
-        on_links!(self, [label], |links| links.disconnect(&label).map(|()| true))
+        on_links!(self, [label], |links| links
+            .disconnect(&label)
+            .map(|()| true))
     }
 
     /// The app became active (`true`: foreground, `Activity.onStart` /
@@ -321,7 +334,9 @@ impl NdnEngine {
     /// Links migrate to it, dropped ones are dialled again and direct paths
     /// punched again now.
     pub fn network_changed(&self, socket_fd: Option<i32>) -> Result<bool, NdnError> {
-        on_links!(self, [socket_fd], |links| links.network_changed(socket_fd).map(|()| true))
+        on_links!(self, [socket_fd], |links| links
+            .network_changed(socket_fd)
+            .map(|()| true))
     }
 
     /// This device's links: each relay and device, its mode, the paths
@@ -384,12 +399,7 @@ impl NdnEngine {
     /// runtime — this is the bulk data plane the offer/file fetch should use.
     /// Returns total bytes written; progress polls the same getters as the leaf.
     #[cfg(unix)]
-    pub fn fetch_object_to_fd(
-        &self,
-        name: String,
-        hint: String,
-        fd: i32,
-    ) -> Result<u64, NdnError> {
+    pub fn fetch_object_to_fd(&self, name: String, hint: String, fd: i32) -> Result<u64, NdnError> {
         use std::os::fd::FromRawFd;
         use std::sync::atomic::Ordering;
         let parsed: Name = name.parse().map_err(|_| NdnError::invalid_name(&name))?;
@@ -429,7 +439,8 @@ impl NdnEngine {
     /// Poll alongside [`Self::fetch_progress_total`] from a UI thread; reads
     /// atomics outside the fetch lock. Reset to 0 at the start of each fetch.
     pub fn fetch_progress_received(&self) -> u64 {
-        self.fetch_received.load(std::sync::atomic::Ordering::Relaxed)
+        self.fetch_received
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Total segments in the object being fetched (0 until metadata lands).
@@ -446,7 +457,8 @@ impl NdnEngine {
     /// RDR whole-object publish: segments `content` under `<name>/v=<ver>` and
     /// serves it (metadata + segments) until the engine connection closes —
     /// blocking, run on a worker thread. `chunk_size == 0` uses the 8 KiB
-    /// default. Signed with the loaded operator identity if present. Pairs with
+    /// default. Signed with the identity `name` chooses (see [`sign`](Self::sign))
+    /// when the app holds any identity. Pairs with
     /// [`Self::fetch_object_verified`]; the core of file sharing over the node.
     pub fn publish_object(
         &self,
@@ -615,7 +627,14 @@ impl NdnEngine {
     /// "wifi-aware", …), `rssi` in dBm (0 = unknown), and the peer's AP-assigned
     /// IPv4 if its beacon carried one (empty = none). Call from the platform
     /// discovery callbacks. No-op if [`Self::start_discovery`] hasn't run.
-    pub fn note_peer(&self, id: String, label: String, face: String, rssi: i32, infra_addr: String) {
+    pub fn note_peer(
+        &self,
+        id: String,
+        label: String,
+        face: String,
+        rssi: i32,
+        infra_addr: String,
+    ) {
         if id.is_empty() {
             return;
         }
@@ -721,15 +740,18 @@ impl NdnEngine {
         #[cfg(not(feature = "identity"))]
         {
             let _ = node_id;
-            Err(NdnError::engine("identity feature not enabled in this build"))
+            Err(NdnError::engine(
+                "identity feature not enabled in this build",
+            ))
         }
     }
 
     /// Become the producer of record for `public_name`, serving it as a
-    /// node-signed RDR object whose segment content is streamed from a keyless
-    /// leaf over `source_prefix` (the leaf's internal content prefix). The node
-    /// key signs each segment locally — the leaf never signs and is never on the
-    /// per-segment path ("bulk off the seam", producer side). `size` is the
+    /// signed RDR object whose segment content is streamed from a keyless
+    /// leaf over `source_prefix` (the leaf's internal content prefix). This
+    /// node signs each segment locally, with the identity `public_name`
+    /// chooses (see [`sign`](Self::sign)) — the leaf never signs and is never
+    /// on the per-segment path ("bulk off the seam", producer side). `size` is the
     /// file's length. The leaf calls this over the seam (Layer 4 AIDL) after it
     /// has begun serving `source_prefix` via a streaming producer.
     pub fn register_object_relay(
@@ -746,12 +768,11 @@ impl NdnEngine {
             let source: Name = source_prefix
                 .parse()
                 .map_err(|_| NdnError::invalid_name(&source_prefix))?;
-            // The node key holder signs the relayed segments. (v0: any loaded
-            // operator key; the per-source capability/name-scope check is the
-            // authorization follow-up.)
-            let signer = self.identity_core.current_signer().ok_or_else(|| {
-                NdnError::engine("no operator identity loaded — cannot sign relayed object")
-            })?;
+            // The relayed object is Data under `public`: signed by the
+            // identity its name chooses (refused, saying why, when the app
+            // only follows the trusted prefix covering it or no identity of
+            // it covers it).
+            let signer = self.identity_core.signer_for(&public)?;
             let guard = self.inner.lock().unwrap();
             let engine = guard
                 .as_ref()
@@ -767,7 +788,9 @@ impl NdnEngine {
         #[cfg(not(feature = "identity"))]
         {
             let _ = (public_name, source_prefix, size);
-            Err(NdnError::engine("identity feature not enabled in this build"))
+            Err(NdnError::engine(
+                "identity feature not enabled in this build",
+            ))
         }
     }
 
@@ -892,8 +915,12 @@ impl NdnEngine {
         let ip: std::net::Ipv6Addr = peer_ip
             .parse()
             .map_err(|_| NdnError::engine(format!("unparseable NDP peer IPv6 '{peer_ip}'")))?;
-        let peer =
-            std::net::SocketAddr::V6(std::net::SocketAddrV6::new(ip, peer_port as u16, 0, scope_id));
+        let peer = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+            ip,
+            peer_port as u16,
+            0,
+            scope_id,
+        ));
         let guard = self.inner.lock().unwrap();
         let engine = guard
             .as_ref()
@@ -1052,7 +1079,9 @@ impl NdnEngine {
         #[cfg(not(feature = "identity"))]
         {
             let _ = link_uri;
-            Err(NdnError::engine("adopt_context_link requires the `identity` feature"))
+            Err(NdnError::engine(
+                "adopt_context_link requires the `identity` feature",
+            ))
         }
     }
 
@@ -1087,7 +1116,9 @@ impl NdnEngine {
         #[cfg(not(feature = "identity"))]
         {
             let _ = namespace;
-            Err(NdnError::engine("refresh_contexts requires the `identity` feature"))
+            Err(NdnError::engine(
+                "refresh_contexts requires the `identity` feature",
+            ))
         }
     }
 
@@ -1097,7 +1128,8 @@ impl NdnEngine {
     /// if it is not held (checked against the invite's root fingerprint); a
     /// fresh key is generated on this device, certified with the invite's
     /// token, and the certificate's chain to the root is checked. On success
-    /// the identity is installed (subsequent [`sign`](Self::sign) works) and
+    /// the identity is added beside the app's others (subsequent [`sign`](Self::sign)
+    /// works for names under it; enrolling never changes the node identity) and
     /// the result carries a password-encrypted SafeBag and, when the context
     /// was adopted on the way, `adopted_context` — both for the host to
     /// persist (re-adopt the context with [`adopt_context`](Self::adopt_context)
@@ -1127,7 +1159,9 @@ impl NdnEngine {
         #[cfg(not(feature = "identity"))]
         {
             let _ = (invite_uri, device, persist_password);
-            Err(NdnError::engine("enroll_with_invite requires the `identity` feature"))
+            Err(NdnError::engine(
+                "enroll_with_invite requires the `identity` feature",
+            ))
         }
     }
 
@@ -1181,7 +1215,9 @@ impl NdnEngine {
         #[cfg(not(feature = "identity"))]
         {
             let _ = (storage_dir, link_uri, role, device, persist_password);
-            Err(NdnError::engine("request_enrollment requires the `identity` feature"))
+            Err(NdnError::engine(
+                "request_enrollment requires the `identity` feature",
+            ))
         }
     }
 
@@ -1224,13 +1260,20 @@ impl NdnEngine {
                     .engine()
                     .clone()
             };
-            self.identity_core
-                .poll_enrollment(&engine, storage_dir, request, wait_secs, persist_password)
+            self.identity_core.poll_enrollment(
+                &engine,
+                storage_dir,
+                request,
+                wait_secs,
+                persist_password,
+            )
         }
         #[cfg(not(feature = "identity"))]
         {
             let _ = (storage_dir, request, wait_secs, persist_password);
-            Err(NdnError::engine("poll_enrollment requires the `identity` feature"))
+            Err(NdnError::engine(
+                "poll_enrollment requires the `identity` feature",
+            ))
         }
     }
 
@@ -1248,14 +1291,17 @@ impl NdnEngine {
         #[cfg(not(feature = "identity"))]
         {
             let _ = storage_dir;
-            Err(NdnError::engine("enrollment_requests requires the `identity` feature"))
+            Err(NdnError::engine(
+                "enrollment_requests requires the `identity` feature",
+            ))
         }
     }
 
-    /// The requests waiting for an admin's approval at the namespace's CA,
-    /// asked as the loaded identity — which must be a current, unrevoked
-    /// admin certificate of a namespace whose trust context is held (any
-    /// other identity is refused here, saying why). Pass as `issuers` the
+    /// The requests waiting for an admin's approval at the CA of each
+    /// namespace the app is an admin of — each asked as the app's identity
+    /// there, which must be a current, unrevoked admin certificate of a
+    /// namespace whose trust context is held (with none, refused here,
+    /// saying why for each identity). Pass as `issuers` the
     /// issuer certificates persisted with the admin identity
     /// (`NdnEnrolledIdentity::issuers`): the CA checks the admin key's chain
     /// with them. Refusals by the CA carry its reason and what to do.
@@ -1279,13 +1325,15 @@ impl NdnEngine {
         #[cfg(not(feature = "identity"))]
         {
             let _ = issuers;
-            Err(NdnError::engine("list_pending_approvals requires the `identity` feature"))
+            Err(NdnError::engine(
+                "list_pending_approvals requires the `identity` feature",
+            ))
         }
     }
 
     /// Approve the pending request `target` — its request id or the
     /// six-digit verification code the requesting device shows — as the
-    /// loaded admin identity (see
+    /// app's admin identity of the request's namespace (see
     /// [`list_pending_approvals`](Self::list_pending_approvals) for
     /// `issuers`): the approval is signed by the admin key and pushed to the
     /// CA, which issues the certificate at the requester's next poll.
@@ -1312,12 +1360,14 @@ impl NdnEngine {
         #[cfg(not(feature = "identity"))]
         {
             let _ = (target, issuers);
-            Err(NdnError::engine("approve_request requires the `identity` feature"))
+            Err(NdnError::engine(
+                "approve_request requires the `identity` feature",
+            ))
         }
     }
 
     /// Deny the pending request `target` (request id or verification code)
-    /// as the loaded admin identity, with `reason` — the requester sees it.
+    /// as the app's admin identity of its namespace, with `reason` — the requester sees it.
     /// As [`approve_request`](Self::approve_request) otherwise. Blocking;
     /// requires the `identity` feature.
     pub fn deny_request(
@@ -1346,7 +1396,9 @@ impl NdnEngine {
         #[cfg(not(feature = "identity"))]
         {
             let _ = (target, reason, issuers);
-            Err(NdnError::engine("deny_request requires the `identity` feature"))
+            Err(NdnError::engine(
+                "deny_request requires the `identity` feature",
+            ))
         }
     }
 
@@ -1397,17 +1449,90 @@ impl NdnEngine {
         #[cfg(not(feature = "identity"))]
         {
             let _ = (safebag, password, issuers);
-            Err(NdnError::engine("renew_certificate requires the `identity` feature"))
+            Err(NdnError::engine(
+                "renew_certificate requires the `identity` feature",
+            ))
         }
     }
 
-    /// The validity of the loaded identity's current certificate — when it
+    /// The validity of the node identity's current certificate — when it
     /// expires and when to renew it — so the host can schedule
     /// [`renew_certificate`](Self::renew_certificate). Errors, saying what
     /// to do, when no identity is loaded or no certificate of its key is
-    /// held or reachable.
+    /// held or reachable. Every identity's: [`identities`](Self::identities).
     pub fn certificate_validity(&self) -> Result<NdnCertValidity, NdnError> {
         self.identity_core.certificate_validity()
+    }
+
+    /// Every identity the app signs as — one per trusted prefix it is a
+    /// member of, and any self-issued one — with its certificate, its
+    /// validity (schedule each one's [`renew_certificate`](Self::renew_certificate)
+    /// from it) and which is the node identity.
+    pub fn identities(&self) -> Vec<NdnIdentity> {
+        self.identity_core.identities()
+    }
+
+    /// Make `identity` (one the app holds) its node identity: what it signs
+    /// its own traffic as — the principal operations (`principal_*`,
+    /// delegations, recovery, revocation), RemoteSigner responses,
+    /// `announce_prefix` and the link key. Otherwise the first identity the
+    /// app held is; enrolling elsewhere never changes it. The choice lasts
+    /// while the engine runs: persist it and choose it again at launch, after
+    /// loading the identities. Refused, saying what to do, for an identity
+    /// the app holds no key of.
+    pub fn set_node_identity(&self, identity: String) -> Result<bool, NdnError> {
+        self.identity_core.set_node_identity(identity)
+    }
+
+    /// How the app takes part in each trusted prefix it holds: `following`
+    /// (adopted only: it verifies the prefix's Data and cannot publish under
+    /// it) or `member` (its role, the identity and key it signs the prefix's
+    /// Data with, and until when) — the `ndn-fwd` daemon's
+    /// `security/memberships`. Errors only when the engine is shut down.
+    /// Requires the `identity` feature.
+    pub fn memberships(&self) -> Result<Vec<NdnMembership>, NdnError> {
+        #[cfg(feature = "identity")]
+        {
+            let engine = {
+                let guard = self.inner.lock().unwrap();
+                guard
+                    .as_ref()
+                    .ok_or_else(|| NdnError::engine("engine is shut down"))?
+                    .engine()
+                    .clone()
+            };
+            Ok(self.identity_core.memberships(&engine))
+        }
+        #[cfg(not(feature = "identity"))]
+        {
+            Err(NdnError::engine(
+                "memberships requires the `identity` feature",
+            ))
+        }
+    }
+
+    /// Blocking loop: hand each change of the app's membership in a trusted
+    /// prefix — adopted, enrolled, renewed, revoked, root changed, as the
+    /// app's adopt-by-link, enrollment, approval, renewal and refresh calls
+    /// make them — to `handler`, until [`shutdown`](Self::shutdown). Run on
+    /// a background thread. A handler that falls far behind misses changes:
+    /// read [`memberships`](Self::memberships) for the current state.
+    /// Requires the `identity` feature.
+    pub fn watch_memberships(
+        &self,
+        handler: Box<dyn NdnMembershipHandler>,
+    ) -> Result<bool, NdnError> {
+        #[cfg(feature = "identity")]
+        {
+            self.identity_core.watch_memberships(handler)
+        }
+        #[cfg(not(feature = "identity"))]
+        {
+            let _ = handler;
+            Err(NdnError::engine(
+                "watch_memberships requires the `identity` feature",
+            ))
+        }
     }
 
     /// List the adopted trust contexts (§6 home: "what contexts am I in").
@@ -1420,15 +1545,19 @@ impl NdnEngine {
         self.identity_core.forget_context(namespace)
     }
 
-    // ── Operator identity + signing (native-only; the `identity` feature) ──
-    // The phone holds the operator key and signs management commands /
-    // RemoteSigner responses through it. BoltFFI's one-object model means these
-    // are methods on the engine, not a separate handle.
+    // ── Identities + signing (native-only; the `identity` feature) ──
+    // The phone holds an identity in each trusted prefix it is a member of
+    // and signs each packet with the one its name chooses; the node identity
+    // signs its own traffic (management commands, RemoteSigner responses).
+    // BoltFFI's one-object model means these are methods on the engine, not a
+    // separate handle.
 
-    /// Restore a **software** operator identity from a password-encrypted
-    /// `SafeBag` (the bytes the device persisted). The key is held in memory and
-    /// used by [`sign`](Self::sign). For an enclave-held key the platform layer
-    /// owns the key and signs through a custodian instead. Blocking; errors with
+    /// Restore a **software** identity from a password-encrypted `SafeBag`
+    /// (the bytes the device persisted) and add it to the identities the app
+    /// signs as; the others stay. Load every persisted one at launch. The key
+    /// is held in memory and used by [`sign`](Self::sign) for names under it.
+    /// For an enclave-held key the platform layer owns the key and signs
+    /// through a custodian instead. Blocking; errors with
     /// [`NdnError::Identity`] on a bad bag / password / key name. Requires the
     /// `identity` feature (native builds); otherwise errors "feature not enabled".
     //
@@ -1447,24 +1576,31 @@ impl NdnEngine {
         // `void` Kotlin/Swift binding while the native `.so` still returns the
         // encoded result by value, so the FFI call writes the result to a
         // garbage sret pointer and segfaults. A non-unit `Ok` dodges that.
-        self.identity_core.load_identity(safebag, password, key_name)
+        self.identity_core
+            .load_identity(safebag, password, key_name)
     }
 
-    /// Whether an operator identity is loaded.
+    /// Whether the app holds any identity.
     pub fn has_identity(&self) -> bool {
         self.identity_core.has_identity()
     }
 
-    /// Sign `region` with the loaded operator identity — e.g. a signed management
-    /// command or a RemoteSigner response. Blocking; errors with
-    /// [`NdnError::Identity`] if no identity is loaded or signing fails.
-    pub fn sign(&self, region: Vec<u8>) -> Result<Vec<u8>, NdnError> {
-        self.identity_core.sign(region)
+    /// Sign `region`, the signed portion of a packet named `name` (a Data
+    /// packet or a signed Interest), with the identity `name` chooses: a
+    /// management command (`/localhost/…`, `/localhop/…`) is the node's own
+    /// traffic, signed by the node identity; under a trusted prefix the app
+    /// holds, its identity in that prefix (never another prefix's key);
+    /// under none, the identity whose name is the longest prefix of `name`.
+    /// Refused with [`NdnError::NoSigningIdentity`], saying why and what to
+    /// do, when the app only follows the prefix covering `name` or no
+    /// identity of it covers `name`. Blocking.
+    pub fn sign(&self, name: String, region: Vec<u8>) -> Result<Vec<u8>, NdnError> {
+        self.identity_core.sign(name, region)
     }
 
     /// Run NDNCERT enrollment (the `pin` challenge) and **load** the issued
     /// identity for signing. `pin_handler` is called once when the CA asks for
-    /// the PIN; on success the identity is installed (subsequent [`sign`](Self::sign)
+    /// the PIN; on success the identity is added (subsequent [`sign`](Self::sign)
     /// works) and the result carries a password-encrypted SafeBag for the host to
     /// persist. A route to the CA prefix must already exist (a gateway peer +
     /// route). Blocking; requires the `identity` feature.
@@ -1501,17 +1637,18 @@ impl NdnEngine {
             let bag = enrolled
                 .to_safebag(&config.persist_password)
                 .map_err(NdnError::identity)?;
-            let result = NdnEnrolledIdentity {
+            let node_identity = self
+                .identity_core
+                .set_identity(enrolled.signer(), enrolled.certificate())?;
+            Ok(NdnEnrolledIdentity {
                 key_name: enrolled.key_name().to_string(),
                 cert_name: enrolled.cert_name().to_string(),
                 certificate: enrolled.certificate().map(|b| b.to_vec()),
                 safebag: bag.encode().to_vec(),
                 adopted_context: None,
                 issuers: Vec::new(),
-            };
-            self.identity_core
-                .set_identity(enrolled.signer(), enrolled.certificate());
-            Ok(result)
+                node_identity,
+            })
         }
         #[cfg(not(feature = "identity"))]
         {
@@ -1525,7 +1662,7 @@ impl NdnEngine {
     /// Run NDNCERT enrollment via the **`token`** challenge (the "scan an
     /// invitation" flow) and **load** the issued identity. `token` is the
     /// invitation token carried by an `ndn-trust://invite/…` envelope; no
-    /// interactive prompt is needed. On success the identity is installed and the
+    /// interactive prompt is needed. On success the identity is added and the
     /// result carries a password-encrypted SafeBag to persist. A route to the CA
     /// prefix must already exist. Blocking; requires the `identity` feature.
     pub fn enroll_with_token(
@@ -1552,7 +1689,7 @@ impl NdnEngine {
     }
 
     /// Generate a **self-signed** local identity (no CA) for a fresh device,
-    /// install it for signing, and return a persistable SafeBag. The device can
+    /// add it to the identities the app signs as, and return a persistable SafeBag. The device can
     /// then be *sponsored* — a principal delegates a scope to this name (§3). A
     /// long-lived device key (no CA renewal path). Requires the `identity` feature.
     pub fn generate_identity(
@@ -1567,7 +1704,7 @@ impl NdnEngine {
     /// in the device enclave (Android StrongBox / iOS Secure Enclave) behind
     /// `enclave` and never leaves it — signing is biometric per use. Self-signs
     /// its certificate with the enclave key (one biometric prompt now) and
-    /// installs it. There is no SafeBag (non-exportable); the key persists in
+    /// adds it. There is no SafeBag (non-exportable); the key persists in
     /// hardware and the host re-binds the backend on next launch. Requires the
     /// `identity` feature.
     pub fn generate_identity_enclave(
@@ -1580,7 +1717,7 @@ impl NdnEngine {
 
     /// Re-bind a hardware identity after restart: rebuild the enclave-backed
     /// signer for the persisted `key_name` (no new key, no self-sign, **no
-    /// biometric**) and install it with `certificate`, the certificate the
+    /// biometric**) and add it with `certificate`, the certificate the
     /// host persisted for it (`NdnEnrolledIdentity::certificate` of its
     /// generation, enrollment or renewal; refused when it is not a
     /// certificate of `key_name` certifying the enclave's public key). Its
@@ -1604,10 +1741,10 @@ impl NdnEngine {
     /// Serve **one** RemoteSigner request (the phone-as-second-factor): decode the
     /// `WireSignRequest`, render a spoof-proof summary from its signed region, ask
     /// `gate` (the platform biometric prompt), and — if approved — sign the region
-    /// with the loaded identity. Returns the `WireSignResponse` wire (Approved with
+    /// with the node identity. Returns the `WireSignResponse` wire (Approved with
     /// the signature, or Denied) for the host to send back over its transport.
     /// The host owns the channel (BLE / Wi-Fi Aware / socket); this is the
-    /// single-shot core. Blocking; requires the `identity` feature + a loaded identity.
+    /// single-shot core. Blocking; requires the `identity` feature + an identity.
     pub fn respond_to_sign_request(
         &self,
         request: Vec<u8>,
@@ -1620,12 +1757,12 @@ impl NdnEngine {
     /// shared forwarder): each incoming Interest carries a `WireSignRequest` in
     /// its application parameters; this decodes it, consults the §7 scoped-signing
     /// policy (a live grant auto-approves, sensitive actions always prompt via
-    /// `gate`), signs the region with the loaded identity, and answers with the
+    /// `gate`), signs the region with the node identity, and answers with the
     /// `WireSignResponse` as the Data content. Unlike [`Self::respond_to_sign_request`]
     /// the signing is `await`ed *inside* the serve loop (no nested `block_on`), so
     /// the whole responder runs safely on one background thread. Blocking; returns
     /// when the engine connection closes. Run on a background thread. Requires the
-    /// `identity` feature + a loaded identity.
+    /// `identity` feature + an identity.
     #[cfg(feature = "identity")]
     pub fn serve_remote_signer(
         &self,
@@ -1640,12 +1777,12 @@ impl NdnEngine {
     /// `/localhop/nfd/rib/register` command (no FaceId → the gateway installs the
     /// route for the *requesting* face, i.e. this node's peer face) over the
     /// engine; the default route carries it one hop to the gateway. The command
-    /// is signed by the loaded identity; the gateway validates it against its
+    /// is signed by the node identity; the gateway validates it against its
     /// localhop trust anchors (a CA-issued operator cert validates against the
     /// CA anchor `ndn-fwd` auto-installs for a `[ca]`). Returns true on a
     /// 2xx `ControlResponse`. Without this, a served `<id>/signer` responder is
     /// only reachable if the operator adds the route on the gateway by hand.
-    /// Requires the `identity` feature, a loaded identity, and a gateway peer.
+    /// Requires the `identity` feature, an identity, and a gateway peer.
     #[cfg(feature = "identity")]
     pub fn announce_prefix(&self, prefix: String) -> Result<bool, NdnError> {
         self.identity_core.announce_prefix(prefix)
@@ -1668,13 +1805,13 @@ impl NdnEngine {
         self.identity_core.grant_signing_scope(action, ttl_secs)
     }
 
-    /// The loaded operator identity's `did:ndn` URI (the technical identifier).
+    /// The node identity's `did:ndn` URI (the technical identifier).
     /// Errors if no identity is loaded. Requires the `identity` feature.
     pub fn principal_did(&self) -> Result<String, NdnError> {
         self.identity_core.principal_did()
     }
 
-    /// The loaded operator identity's human-readable NDN name (e.g.
+    /// The node identity's human-readable NDN name (e.g.
     /// `/ndn/mobile/alice`) — the name-centric §6.2 signer-line identifier to
     /// show in UIs. Errors if no identity is loaded. Requires the `identity`
     /// feature.
@@ -1682,7 +1819,7 @@ impl NdnEngine {
         self.identity_core.principal_name()
     }
 
-    /// The loaded identity's raw public key — the bytes a verifier feeds to
+    /// The node identity's raw public key — the bytes a verifier feeds to
     /// [`verify_delegation`](Self::verify_delegation) / [`sign_delegated`](Self::sign_delegated)
     /// (and that a sponsor puts in an `ndn-trust://delegation/…` envelope). Errors
     /// if no identity is loaded.
@@ -1690,7 +1827,7 @@ impl NdnEngine {
         self.identity_core.principal_public_key()
     }
 
-    /// The loaded identity's current certificate — the unit a paired operator
+    /// The node identity's current certificate — the unit a paired operator
     /// console imports to provision a **remote signer**
     /// (`provision_remote_signer_from_cert`): it carries the operator name,
     /// public key, and algorithm, and doubles as the TOFU trust anchor for the
@@ -1699,7 +1836,7 @@ impl NdnEngine {
     /// CA-issued or renewed one), else the newest one of its key fetched by key
     /// name that chains to an adopted trust context; it is never minted here.
     /// Errors, saying what to do, when none is held or reachable. Requires the
-    /// `identity` feature + a loaded identity.
+    /// `identity` feature + an identity.
     #[cfg(feature = "identity")]
     pub fn principal_cert_wire(&self) -> Result<Vec<u8>, NdnError> {
         self.identity_core.principal_cert_wire()
@@ -1714,7 +1851,7 @@ impl NdnEngine {
     }
 
     /// Issue a signed device delegation: grant `scope` to the `device`
-    /// namespace, signed by the loaded operator identity. Returns the
+    /// namespace, signed by the node identity. Returns the
     /// `SignedDelegation` wire for the host to hand to the device (which
     /// presents it; any verifier checks it against this principal's key).
     /// `device` must be under the principal's namespace. Requires the
@@ -1740,7 +1877,7 @@ impl NdnEngine {
             .verify_delegation(delegation_wire, principal_pubkey)
     }
 
-    /// **Device side**: sign `region` with this device's loaded identity, but
+    /// **Device side**: sign `region` with this device's node identity, but
     /// only if `delegation_wire` (verified against `principal_pubkey`)
     /// authorizes the region's leading Name. Closes the delegation loop: the
     /// device acts on the principal's behalf strictly within the granted scope,
@@ -1771,12 +1908,12 @@ impl NdnEngine {
             .sign_delegated_named(name, payload, delegation_wire, principal_pubkey)
     }
 
-    /// Make the loaded identity **recoverable** by committing to an out-of-band
+    /// Make the node identity **recoverable** by committing to an out-of-band
     /// recovery key, and return the recovery **bundle** (the backup bytes the
     /// host stores — cloud / paper / another device). `recovery_pubkey` is a
     /// 32-byte Ed25519 public key the user holds the private half of elsewhere;
     /// only it can later authorize recovery. The bundle carries no private keys.
-    /// Requires the `identity` feature + a loaded identity.
+    /// Requires the `identity` feature + an identity.
     ///
     /// (The fresh-device *restore* from a bundle is a follow-on — it has its own
     /// operational-key persistence flow.)
@@ -1817,14 +1954,18 @@ impl NdnEngine {
         persist_password: Vec<u8>,
         recovery_signer: Box<dyn NdnRecoverySigner>,
     ) -> Result<NdnRecoveredIdentity, NdnError> {
-        self.identity_core
-            .restore_identity_remote(bundle, identity_name, persist_password, recovery_signer)
+        self.identity_core.restore_identity_remote(
+            bundle,
+            identity_name,
+            persist_password,
+            recovery_signer,
+        )
     }
 
-    /// Self-revoke the loaded identity: sign a [`RevocationRecord`] declaring
+    /// Self-revoke the node identity: sign a [`RevocationRecord`] declaring
     /// the loaded key dead (`reason` e.g. "compromised") and return its wire to
     /// publish. Any verifier that trusts the key will honor it. Requires the
-    /// `identity` feature + a loaded identity.
+    /// `identity` feature + an identity.
     pub fn revoke_identity(&self, reason: String) -> Result<Vec<u8>, NdnError> {
         self.identity_core.revoke_identity(reason)
     }
@@ -1984,9 +2125,7 @@ async fn build_engine(config: NdnEngineConfig) -> Result<(MobileEngine, InProcHa
     for face in &config.faces {
         match face {
             NdnFaceSpec::Multicast { iface } => {
-                let addr: Ipv4Addr = iface
-                    .parse()
-                    .map_err(|_| NdnError::invalid_addr(iface))?;
+                let addr: Ipv4Addr = iface.parse().map_err(|_| NdnError::invalid_addr(iface))?;
                 builder = builder.with_udp_multicast(addr);
             }
             NdnFaceSpec::Uplink { address } => {
@@ -2212,16 +2351,10 @@ mod identity_tests {
         *peer_of_a.lock().unwrap() = Some(engine_b.clone()); // A broadcasts → B
         *peer_of_b.lock().unwrap() = Some(engine_a.clone()); // B broadcasts → A
         engine_a
-            .attach_wifi_aware(
-                "ndn".to_string(),
-                Box::new(LoopbackNan { peer: peer_of_a }),
-            )
+            .attach_wifi_aware("ndn".to_string(), Box::new(LoopbackNan { peer: peer_of_a }))
             .unwrap();
         engine_b
-            .attach_wifi_aware(
-                "ndn".to_string(),
-                Box::new(LoopbackNan { peer: peer_of_b }),
-            )
+            .attach_wifi_aware("ndn".to_string(), Box::new(LoopbackNan { peer: peer_of_b }))
             .unwrap();
 
         // A's producer: a NdnClient over A's seam serves a signed RDR object.
@@ -2238,11 +2371,7 @@ mod identity_tests {
         let payload: Vec<u8> = (0..3_000u32).map(|i| (i % 251) as u8).collect();
         let to_publish = payload.clone();
         std::thread::spawn(move || {
-            let _ = producer.publish_object(
-                "/ndn/airdrop/alice/hi".to_string(),
-                to_publish,
-                0,
-            );
+            let _ = producer.publish_object("/ndn/airdrop/alice/hi".to_string(), to_publish, 0);
         });
         std::thread::sleep(Duration::from_millis(600));
 
@@ -2255,12 +2384,19 @@ mod identity_tests {
         let (c0, c1) = UnixStream::pair().unwrap();
         engine_b.mount_app_fd(c0.into_raw_fd()).unwrap();
         let consumer = NdnClient::from_fd(c1.into_raw_fd()).unwrap();
-        let a_cert = producer_cert.lock().unwrap().clone().expect("producer cert");
+        let a_cert = producer_cert
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("producer cert");
         assert!(consumer.pin_trust_anchor(a_cert).unwrap());
         let got = consumer
             .fetch_object_verified("/ndn/airdrop/alice/hi".to_string())
             .expect("verified RDR fetch over the seam must cross NAN and validate");
-        assert_eq!(got, payload, "verified content round-tripped over loopback NAN must match");
+        assert_eq!(
+            got, payload,
+            "verified content round-tripped over loopback NAN must match"
+        );
 
         engine_a.shutdown();
         engine_b.shutdown();
@@ -2342,7 +2478,10 @@ mod identity_tests {
         let got = consumer
             .fetch_object_verified("/ndn/airdrop/bob/file".to_string())
             .expect("verified RDR fetch must cross BLE and validate against the pinned cert");
-        assert_eq!(got, payload, "verified content round-tripped over loopback BLE must match");
+        assert_eq!(
+            got, payload,
+            "verified content round-tripped over loopback BLE must match"
+        );
 
         engine_a.shutdown();
         engine_b.shutdown();
@@ -2372,8 +2511,20 @@ mod identity_tests {
             String::new(),
         );
         // Our own id and empty ids never list.
-        engine.note_peer("node-a".to_string(), "me".to_string(), "ble".to_string(), 0, String::new());
-        engine.note_peer(String::new(), "ghost".to_string(), "ble".to_string(), 0, String::new());
+        engine.note_peer(
+            "node-a".to_string(),
+            "me".to_string(),
+            "ble".to_string(),
+            0,
+            String::new(),
+        );
+        engine.note_peer(
+            String::new(),
+            "ghost".to_string(),
+            "ble".to_string(),
+            0,
+            String::new(),
+        );
 
         let json = String::from_utf8(
             engine
@@ -2388,7 +2539,10 @@ mod identity_tests {
         assert!(json.contains("\"rssi\":-55"));
         // node-a is us: it appears under "self", never in the peers array.
         let peers_part = json.split("\"peers\":").nth(1).expect("peers array");
-        assert!(!peers_part.contains("node-a"), "self must not be a peer: {json}");
+        assert!(
+            !peers_part.contains("node-a"),
+            "self must not be a peer: {json}"
+        );
         assert!(!json.contains("ghost"), "empty-id peer must not appear");
         engine.shutdown();
     }
@@ -2402,7 +2556,8 @@ mod identity_tests {
         let signer = EcdsaP256Signer::from_seed(&[4u8; 32], kn.clone()).unwrap();
         let cert = DataBuilder::new(kn.clone(), b"cert").build();
         let bag =
-            ndn_security::safebag::SafeBag::encrypt(cert, &signer.to_pkcs8_der().unwrap(), b"pw").unwrap();
+            ndn_security::safebag::SafeBag::encrypt(cert, &signer.to_pkcs8_der().unwrap(), b"pw")
+                .unwrap();
         let bytes = bag.encode().to_vec();
 
         let engine = NdnEngine::new(test_config()).unwrap();
@@ -2413,13 +2568,23 @@ mod identity_tests {
                 .load_identity(bytes.clone(), b"wrong".to_vec(), key_name.to_string())
                 .is_err()
         );
-        // Correct load → the engine signs through the identity.
+        // Correct load → the engine signs through the identity: names under
+        // it, and management commands (the node's own traffic).
         engine
             .load_identity(bytes, b"pw".to_vec(), key_name.to_string())
             .unwrap();
         assert!(engine.has_identity());
-        let sig = engine.sign(b"a signed command".to_vec()).unwrap();
-        assert!(!sig.is_empty());
+        for name in ["/ndn/mobile/alice/doc", "/localhost/nfd/rib/register"] {
+            let sig = engine
+                .sign(name.into(), b"a signed packet".to_vec())
+                .unwrap();
+            assert!(!sig.is_empty());
+        }
+        // A name no identity covers is refused, saying why.
+        assert!(matches!(
+            engine.sign("/ndn/other/doc".into(), b"x".to_vec()),
+            Err(NdnError::NoSigningIdentity { follows: None, .. })
+        ));
         engine.shutdown();
     }
 
@@ -2432,7 +2597,9 @@ mod identity_tests {
         let seed = ndn_cert::RecoverySeed::generate().unwrap();
         let anchor = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(ndn_cert::recovery_anchor(std::sync::Arc::new(seed.signer(&ns))))
+            .block_on(ndn_cert::recovery_anchor(std::sync::Arc::new(
+                seed.signer(&ns),
+            )))
             .unwrap();
         let passphrase = ndn_cert::RootSecret::new(b"kit passphrase".to_vec());
         let uri = ndn_cert::seal_file_kit(&seed, &anchor, &ns, Some([7; 32]), &passphrase).unwrap();
@@ -2469,7 +2636,8 @@ mod identity_tests {
         let signer = EcdsaP256Signer::from_seed(&[6u8; 32], kn.clone()).unwrap();
         let cert = DataBuilder::new(kn.clone(), b"cert").build();
         let bag =
-            ndn_security::safebag::SafeBag::encrypt(cert, &signer.to_pkcs8_der().unwrap(), b"pw").unwrap();
+            ndn_security::safebag::SafeBag::encrypt(cert, &signer.to_pkcs8_der().unwrap(), b"pw")
+                .unwrap();
         let engine = NdnEngine::new(test_config()).unwrap();
         engine
             .load_identity(bag.encode().to_vec(), b"pw".to_vec(), key_name.to_string())
@@ -2523,8 +2691,8 @@ mod identity_tests {
     /// the dashboard's transport drives, exercised here over an in-proc face.
     #[test]
     fn serve_remote_signer_answers_a_sign_interest() {
-        use ndn_security::custodian::{WireSignRequest, WireSignResponse};
         use ndn_packet::encode::InterestBuilder;
+        use ndn_security::custodian::{WireSignRequest, WireSignResponse};
         use std::sync::Arc;
         use std::time::Duration;
 
@@ -2533,13 +2701,16 @@ mod identity_tests {
         let signer = EcdsaP256Signer::from_seed(&[9u8; 32], kn.clone()).unwrap();
         let cert = DataBuilder::new(kn.clone(), b"cert").build();
         let bag =
-            ndn_security::safebag::SafeBag::encrypt(cert, &signer.to_pkcs8_der().unwrap(), b"pw").unwrap();
+            ndn_security::safebag::SafeBag::encrypt(cert, &signer.to_pkcs8_der().unwrap(), b"pw")
+                .unwrap();
         let engine = Arc::new(NdnEngine::new(test_config()).unwrap());
         engine
             .load_identity(bag.encode().to_vec(), b"pw".to_vec(), key_name.to_string())
             .unwrap();
         // Open a Route grant so in-scope requests auto-approve (deny-gate below).
-        engine.grant_signing_scope(NdnActionClass::Route, 900).unwrap();
+        engine
+            .grant_signing_scope(NdnActionClass::Route, 900)
+            .unwrap();
 
         struct Deny;
         impl NdnApprovalGate for Deny {
@@ -2610,7 +2781,10 @@ mod identity_tests {
         let got = engine
             .fetch_object("/share/file.bin".to_string())
             .expect("fetch_object reassembles the published object");
-        assert_eq!(got, payload, "round-tripped object content must be identical");
+        assert_eq!(
+            got, payload,
+            "round-tripped object content must be identical"
+        );
 
         engine.shutdown();
     }
@@ -2643,7 +2817,10 @@ mod identity_tests {
         let got = engine
             .fetch_object_verified("/share/secure/file".to_string())
             .expect("verified fetch of a SIGNED object must succeed");
-        assert_eq!(got, payload, "verified round-tripped content must be identical");
+        assert_eq!(
+            got, payload,
+            "verified round-tripped content must be identical"
+        );
 
         engine.shutdown();
     }
@@ -2658,7 +2835,8 @@ mod identity_tests {
         let signer = EcdsaP256Signer::from_seed(&[7u8; 32], kn.clone()).unwrap();
         let cert = DataBuilder::new(kn.clone(), b"cert").build();
         let bag =
-            ndn_security::safebag::SafeBag::encrypt(cert, &signer.to_pkcs8_der().unwrap(), b"pw").unwrap();
+            ndn_security::safebag::SafeBag::encrypt(cert, &signer.to_pkcs8_der().unwrap(), b"pw")
+                .unwrap();
         let engine = NdnEngine::new(test_config()).unwrap();
         engine
             .load_identity(bag.encode().to_vec(), b"pw".to_vec(), key_name.to_string())
@@ -2740,7 +2918,8 @@ mod identity_tests {
         let pubkey = signer.public_key().unwrap().to_vec();
         let cert = DataBuilder::new(kn.clone(), b"cert").build();
         let bag =
-            ndn_security::safebag::SafeBag::encrypt(cert, &signer.to_pkcs8_der().unwrap(), b"pw").unwrap();
+            ndn_security::safebag::SafeBag::encrypt(cert, &signer.to_pkcs8_der().unwrap(), b"pw")
+                .unwrap();
         let engine = NdnEngine::new(test_config()).unwrap();
         engine
             .load_identity(bag.encode().to_vec(), b"pw".to_vec(), key_name.to_string())
@@ -2782,7 +2961,11 @@ mod identity_tests {
             enroll: false,
             mgmt: false,
         };
-        assert!(engine.add_device("/other/device/x".to_string(), bad).is_err());
+        assert!(
+            engine
+                .add_device("/other/device/x".to_string(), bad)
+                .is_err()
+        );
 
         engine.shutdown();
     }
@@ -2814,11 +2997,10 @@ mod identity_tests {
             enroll: false,
             mgmt: false,
         };
-        let wire =
-            SignedDelegation::issue(&principal, "/ndn/lab/device".parse().unwrap(), scope)
-                .unwrap()
-                .encode()
-                .to_vec();
+        let wire = SignedDelegation::issue(&principal, "/ndn/lab/device".parse().unwrap(), scope)
+            .unwrap()
+            .encode()
+            .to_vec();
 
         // The device loads its own (unrelated) key and receives the delegation.
         let dkey = "/ndn/mobile/alice/KEY/v=1";
@@ -2826,7 +3008,8 @@ mod identity_tests {
         let dsigner = EcdsaP256Signer::from_seed(&[5u8; 32], dkn.clone()).unwrap();
         let cert = DataBuilder::new(dkn.clone(), b"cert").build();
         let bag =
-            ndn_security::safebag::SafeBag::encrypt(cert, &dsigner.to_pkcs8_der().unwrap(), b"pw").unwrap();
+            ndn_security::safebag::SafeBag::encrypt(cert, &dsigner.to_pkcs8_der().unwrap(), b"pw")
+                .unwrap();
         let engine = NdnEngine::new(test_config()).unwrap();
         engine
             .load_identity(bag.encode().to_vec(), b"pw".to_vec(), dkey.to_string())
@@ -2873,7 +3056,8 @@ mod identity_tests {
         let signer = EcdsaP256Signer::from_seed(&[3u8; 32], kn.clone()).unwrap();
         let cert = DataBuilder::new(kn.clone(), b"cert").build();
         let bag =
-            ndn_security::safebag::SafeBag::encrypt(cert, &signer.to_pkcs8_der().unwrap(), b"pw").unwrap();
+            ndn_security::safebag::SafeBag::encrypt(cert, &signer.to_pkcs8_der().unwrap(), b"pw")
+                .unwrap();
         let engine = NdnEngine::new(test_config()).unwrap();
         engine
             .load_identity(bag.encode().to_vec(), b"pw".to_vec(), key_name.to_string())
@@ -2881,7 +3065,9 @@ mod identity_tests {
 
         // A user-held recovery key (private half stays with them).
         let rk = ndn_security::Ed25519Signer::from_seed(&[1u8; 32], "/r/KEY/r".parse().unwrap());
-        let bundle = engine.make_recoverable(rk.public_key_bytes().to_vec()).unwrap();
+        let bundle = engine
+            .make_recoverable(rk.public_key_bytes().to_vec())
+            .unwrap();
 
         // The bundle is a recoverable genesis (one proof, recovery committed).
         let history = ndn_identity::recovery_bundle::decode_history(&bundle).unwrap();
@@ -2916,15 +3102,19 @@ mod identity_tests {
         let signer = EcdsaP256Signer::from_seed(&[2u8; 32], kn.clone()).unwrap();
         let cert = DataBuilder::new(kn.clone(), b"cert").build();
         let bag =
-            ndn_security::safebag::SafeBag::encrypt(cert, &signer.to_pkcs8_der().unwrap(), b"pw").unwrap();
+            ndn_security::safebag::SafeBag::encrypt(cert, &signer.to_pkcs8_der().unwrap(), b"pw")
+                .unwrap();
         let device_a = NdnEngine::new(test_config()).unwrap();
         device_a
             .load_identity(bag.encode().to_vec(), b"pw".to_vec(), key_name.to_string())
             .unwrap();
 
         let recovery_seed = [4u8; 32];
-        let rk = ndn_security::Ed25519Signer::from_seed(&recovery_seed, "/r/KEY/r".parse().unwrap());
-        let bundle = device_a.make_recoverable(rk.public_key_bytes().to_vec()).unwrap();
+        let rk =
+            ndn_security::Ed25519Signer::from_seed(&recovery_seed, "/r/KEY/r".parse().unwrap());
+        let bundle = device_a
+            .make_recoverable(rk.public_key_bytes().to_vec())
+            .unwrap();
 
         // Device B (fresh, no identity): restore from bundle + recovery seed.
         let device_b = NdnEngine::new(test_config()).unwrap();
@@ -2939,7 +3129,12 @@ mod identity_tests {
             .expect("restore");
         // The recovered key is loaded and can sign immediately.
         assert!(device_b.has_identity());
-        assert!(!device_b.sign(b"after recovery".to_vec()).unwrap().is_empty());
+        assert!(
+            !device_b
+                .sign("/ndn/mobile/alice/after".into(), b"after recovery".to_vec())
+                .unwrap()
+                .is_empty()
+        );
 
         // The returned bundle carries the recovery link (genesis + recovery).
         let history = ndn_identity::recovery_bundle::decode_history(&restored.bundle).unwrap();
@@ -2956,7 +3151,12 @@ mod identity_tests {
         // A wrong-length recovery seed is rejected.
         assert!(
             device_b
-                .restore_identity(bundle, vec![0u8; 16], "/ndn/mobile/alice".into(), b"x".to_vec())
+                .restore_identity(
+                    bundle,
+                    vec![0u8; 16],
+                    "/ndn/mobile/alice".into(),
+                    b"x".to_vec()
+                )
                 .is_err()
         );
 
@@ -2978,13 +3178,16 @@ mod identity_tests {
         let signer = EcdsaP256Signer::from_seed(&[2u8; 32], kn.clone()).unwrap();
         let cert = DataBuilder::new(kn.clone(), b"cert").build();
         let bag =
-            ndn_security::safebag::SafeBag::encrypt(cert, &signer.to_pkcs8_der().unwrap(), b"pw").unwrap();
+            ndn_security::safebag::SafeBag::encrypt(cert, &signer.to_pkcs8_der().unwrap(), b"pw")
+                .unwrap();
         let device_a = NdnEngine::new(test_config()).unwrap();
         device_a
             .load_identity(bag.encode().to_vec(), b"pw".to_vec(), key_name.to_string())
             .unwrap();
         let rk = Ed25519Signer::from_seed(&[4u8; 32], "/r/KEY/r".parse().unwrap());
-        let bundle = device_a.make_recoverable(rk.public_key_bytes().to_vec()).unwrap();
+        let bundle = device_a
+            .make_recoverable(rk.public_key_bytes().to_vec())
+            .unwrap();
 
         // The recovery key lives behind a callback (here, a local Ed25519 key).
         struct LocalRecovery(Ed25519Signer);
@@ -3016,7 +3219,12 @@ mod identity_tests {
             )
             .expect("callback restore");
         assert!(device_b.has_identity());
-        assert!(!device_b.sign(b"x".to_vec()).unwrap().is_empty());
+        assert!(
+            !device_b
+                .sign("/ndn/mobile/alice/x".into(), b"x".to_vec())
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             ndn_identity::recovery_bundle::decode_history(&restored.bundle)
                 .unwrap()
@@ -3052,7 +3260,8 @@ mod identity_tests {
         let pubkey = signer.public_key().unwrap().to_vec();
         let cert = DataBuilder::new(kn.clone(), b"cert").build();
         let bag =
-            ndn_security::safebag::SafeBag::encrypt(cert, &signer.to_pkcs8_der().unwrap(), b"pw").unwrap();
+            ndn_security::safebag::SafeBag::encrypt(cert, &signer.to_pkcs8_der().unwrap(), b"pw")
+                .unwrap();
         let engine = NdnEngine::new(test_config()).unwrap();
         engine
             .load_identity(bag.encode().to_vec(), b"pw".to_vec(), key_name.to_string())
@@ -3186,7 +3395,11 @@ mod context_tests {
         else {
             panic!("expected an anchor envelope");
         };
-        engine.adopt_context(context_data.expect("inline context"), namespace, fingerprint)
+        engine.adopt_context(
+            context_data.expect("inline context"),
+            namespace,
+            fingerprint,
+        )
     }
 
     /// The participant model: adopt contexts, list them, anti-rollback on
@@ -3250,7 +3463,11 @@ mod context_tests {
         ));
         // Wrong namespace.
         assert!(matches!(
-            engine.adopt_context(context_data.clone(), "/home/eve".into(), fingerprint.clone()),
+            engine.adopt_context(
+                context_data.clone(),
+                "/home/eve".into(),
+                fingerprint.clone()
+            ),
             Err(NdnError::Identity { .. })
         ));
         // A context signed by an impostor, presented with Bob's real pin.
@@ -3287,7 +3504,9 @@ mod context_tests {
         assert!(crate::NdnTrust::parse(legacy.to_uri()).is_err());
 
         // The genuine triple is adopted.
-        engine.adopt_context(context_data, namespace, fingerprint).unwrap();
+        engine
+            .adopt_context(context_data, namespace, fingerprint)
+            .unwrap();
         assert_eq!(engine.list_contexts().len(), 1);
         engine.shutdown();
     }
@@ -3441,12 +3660,17 @@ mod context_tests {
         // Refused (by the forwarder's expectation or the continuity check),
         // not merely unreachable.
         assert!(
-            r.detail.contains("refused a trust-context update for /home/bob"),
+            r.detail
+                .contains("refused a trust-context update for /home/bob"),
             "{}",
             r.detail
         );
         assert!(r.context.is_none());
-        assert_eq!(engine.list_contexts()[0].version, 2, "the held version stays");
+        assert_eq!(
+            engine.list_contexts()[0].version,
+            2,
+            "the held version stays"
+        );
         engine.shutdown();
 
         // The next launch re-adopts what the host persisted.
@@ -3468,7 +3692,7 @@ mod enclave_identity_tests {
     use super::*;
     use crate::handlers::{NdnEnclaveBackend, NdnInterestHandler};
     use crate::types::{NdnRenewal, NdnSecurityProfile};
-    use ndn_security::{Certificate, EcdsaP256Signer, SecurityManager, Signer, SignedTrustContext};
+    use ndn_security::{Certificate, EcdsaP256Signer, SecurityManager, SignedTrustContext, Signer};
     use std::time::Duration;
 
     fn cfg() -> NdnEngineConfig {
@@ -3593,22 +3817,50 @@ mod enclave_identity_tests {
         let key = enclave_key();
         let key_name: Name = "/lab/alice/KEY/hw".parse().unwrap();
         let public_key = key.public_key().unwrap();
-        let genuine = certify(&lab.root, &key_name, public_key.clone(), &lab.root_key, 3_600_000);
+        let genuine = certify(
+            &lab.root,
+            &key_name,
+            public_key.clone(),
+            &lab.root_key,
+            3_600_000,
+        );
 
         let eve = SecurityManager::new();
         let eve_key: Name = "/lab/KEY/eve".parse().unwrap();
         eve.generate_ecdsa_p256(eve_key.clone()).unwrap();
         let eve_cert = eve
-            .issue_self_signed(&eve_key, eve.get_signer_sync(&eve_key).unwrap().public_key().unwrap(), u64::MAX)
+            .issue_self_signed(
+                &eve_key,
+                eve.get_signer_sync(&eve_key).unwrap().public_key().unwrap(),
+                u64::MAX,
+            )
             .unwrap();
         let forged = certify(&eve, &key_name, public_key, &eve_key, 3_600_000);
         let other = EcdsaP256Signer::generate(key_name.clone()).unwrap();
-        let other_key = certify(&lab.root, &key_name, other.public_key().unwrap(), &lab.root_key, 3_600_000);
+        let other_key = certify(
+            &lab.root,
+            &key_name,
+            other.public_key().unwrap(),
+            &lab.root_key,
+            3_600_000,
+        );
 
         let refused: [(&str, Vec<Certificate>, bool); 3] = [
-            ("signed by an impostor", vec![forged, eve_cert, lab.anchor.clone()], true),
-            ("certifying another public key", vec![other_key, lab.anchor.clone()], true),
-            ("chaining to no adopted context", vec![genuine.clone(), lab.anchor.clone()], false),
+            (
+                "signed by an impostor",
+                vec![forged, eve_cert, lab.anchor.clone()],
+                true,
+            ),
+            (
+                "certifying another public key",
+                vec![other_key, lab.anchor.clone()],
+                true,
+            ),
+            (
+                "chaining to no adopted context",
+                vec![genuine.clone(), lab.anchor.clone()],
+                false,
+            ),
         ];
         for (case, served, adopt) in refused {
             let engine = launch_serving(served);
@@ -3616,10 +3868,20 @@ mod enclave_identity_tests {
                 lab.adopt(&engine);
             }
             engine
-                .load_identity_enclave(key_name.to_string(), Box::new(SoftEnclave(Arc::clone(&key))), None)
+                .load_identity_enclave(
+                    key_name.to_string(),
+                    Box::new(SoftEnclave(Arc::clone(&key))),
+                    None,
+                )
                 .unwrap();
-            assert!(engine.principal_cert_wire().is_err(), "a certificate {case} was taken");
-            assert!(engine.certificate_validity().is_err(), "a certificate {case} was recorded");
+            assert!(
+                engine.principal_cert_wire().is_err(),
+                "a certificate {case} was taken"
+            );
+            assert!(
+                engine.certificate_validity().is_err(),
+                "a certificate {case} was recorded"
+            );
             engine.shutdown();
         }
 
@@ -3630,7 +3892,10 @@ mod enclave_identity_tests {
             .unwrap();
         let genuine_wire = genuine.data_wire().unwrap().to_vec();
         assert_eq!(engine.principal_cert_wire().unwrap(), genuine_wire);
-        assert_eq!(engine.certificate_validity().unwrap().cert_name, genuine.name.to_string());
+        assert_eq!(
+            engine.certificate_validity().unwrap().cert_name,
+            genuine.name.to_string()
+        );
         engine.shutdown();
     }
 
@@ -3649,13 +3914,23 @@ mod enclave_identity_tests {
             .unwrap();
         let self_cert = generated.certificate.clone().expect("a self-certificate");
         assert_eq!(engine.principal_cert_wire().unwrap(), self_cert);
-        assert_eq!(engine.principal_cert_wire().unwrap(), self_cert, "made once");
+        assert_eq!(
+            engine.principal_cert_wire().unwrap(),
+            self_cert,
+            "made once"
+        );
         engine.shutdown();
 
         // The namespace's CA certifies the enclave key.
         let lab = Lab::new();
         let key_name: Name = generated.key_name.parse().unwrap();
-        let issued = certify(&lab.root, &key_name, key.public_key().unwrap(), &lab.root_key, 3_600_000);
+        let issued = certify(
+            &lab.root,
+            &key_name,
+            key.public_key().unwrap(),
+            &lab.root_key,
+            3_600_000,
+        );
         let issued_wire = issued.data_wire().unwrap().to_vec();
         let enclave = || Box::new(SoftEnclave(Arc::clone(&key)));
 
@@ -3671,29 +3946,56 @@ mod enclave_identity_tests {
         // Offline with the persisted CA certificate: it is the one used.
         let next_launch = NdnEngine::new(cfg()).unwrap();
         next_launch
-            .load_identity_enclave(generated.key_name.clone(), enclave(), Some(issued_wire.clone()))
+            .load_identity_enclave(
+                generated.key_name.clone(),
+                enclave(),
+                Some(issued_wire.clone()),
+            )
             .unwrap();
         for _ in 0..2 {
             assert_eq!(next_launch.principal_cert_wire().unwrap(), issued_wire);
             let validity = next_launch.certificate_validity().unwrap();
             assert_eq!(validity.cert_name, issued.name.to_string());
-            assert_eq!(validity.valid_until_secs, issued.valid_until / 1_000_000_000);
+            assert_eq!(
+                validity.valid_until_secs,
+                issued.valid_until / 1_000_000_000
+            );
         }
         next_launch.shutdown();
 
         // A self-issued identity is re-bound with its own self-certificate.
         let relaunch = NdnEngine::new(cfg()).unwrap();
         relaunch
-            .load_identity_enclave(generated.key_name.clone(), enclave(), Some(self_cert.clone()))
+            .load_identity_enclave(
+                generated.key_name.clone(),
+                enclave(),
+                Some(self_cert.clone()),
+            )
             .unwrap();
         assert_eq!(relaunch.principal_cert_wire().unwrap(), self_cert);
 
         // A certificate of another key, or not certifying the enclave's key,
         // is refused.
         let other = EcdsaP256Signer::generate("/lab/bob/KEY/hw".parse().unwrap()).unwrap();
-        let bobs = certify(&lab.root, other.key_name(), other.public_key().unwrap(), &lab.root_key, 3_600_000);
-        let not_this_key = certify(&lab.root, &key_name, other.public_key().unwrap(), &lab.root_key, 3_600_000);
-        for wire in [bobs.data_wire().unwrap().to_vec(), not_this_key.data_wire().unwrap().to_vec(), vec![1, 2, 3]] {
+        let bobs = certify(
+            &lab.root,
+            other.key_name(),
+            other.public_key().unwrap(),
+            &lab.root_key,
+            3_600_000,
+        );
+        let not_this_key = certify(
+            &lab.root,
+            &key_name,
+            other.public_key().unwrap(),
+            &lab.root_key,
+            3_600_000,
+        );
+        for wire in [
+            bobs.data_wire().unwrap().to_vec(),
+            not_this_key.data_wire().unwrap().to_vec(),
+            vec![1, 2, 3],
+        ] {
             assert!(
                 relaunch
                     .load_identity_enclave(generated.key_name.clone(), enclave(), Some(wire))
@@ -3718,7 +4020,13 @@ mod enclave_identity_tests {
         let device = EcdsaP256Signer::generate("/lab/member/alice/KEY/k".parse().unwrap()).unwrap();
         let pkcs8 = device.to_pkcs8_der().unwrap();
         let bag = |validity_ms| {
-            let cert = certify(&lab.root, device.key_name(), device.public_key().unwrap(), &ca_key, validity_ms);
+            let cert = certify(
+                &lab.root,
+                device.key_name(),
+                device.public_key().unwrap(),
+                &ca_key,
+                validity_ms,
+            );
             SafeBag::encrypt(cert.data_wire().unwrap(), &pkcs8, b"pw")
                 .unwrap()
                 .encode()
@@ -3742,9 +4050,20 @@ mod enclave_identity_tests {
             engine.renew_certificate(expired, b"pw".to_vec(), Vec::new()),
             Ok(NdnRenewal::Refused { .. })
         ));
-        assert!(engine.renew_certificate(current, b"wrong".to_vec(), Vec::new()).is_err());
-        assert!(engine.renew_certificate(vec![1, 2, 3], b"pw".to_vec(), Vec::new()).is_err());
-        assert!(!engine.has_identity(), "nothing is loaded without a renewal");
+        assert!(
+            engine
+                .renew_certificate(current, b"wrong".to_vec(), Vec::new())
+                .is_err()
+        );
+        assert!(
+            engine
+                .renew_certificate(vec![1, 2, 3], b"pw".to_vec(), Vec::new())
+                .is_err()
+        );
+        assert!(
+            !engine.has_identity(),
+            "nothing is loaded without a renewal"
+        );
         engine.shutdown();
     }
 }

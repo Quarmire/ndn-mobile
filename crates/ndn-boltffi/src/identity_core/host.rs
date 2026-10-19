@@ -5,14 +5,21 @@
 //!   operation keeps is handed to the host (in the operation's result) to
 //!   persist and adopt again at launch; the app holds no root key and
 //!   publishes nothing.
-//! - [`AppVault`] ([`KeyVault`]): device keys live only in memory for the
-//!   call — generated here, or opened from a SafeBag / a sealed request key
-//!   under the host's password — and the certificate the CA issues is sealed
-//!   with its key into a SafeBag the result carries. Requests for an admin's
-//!   approval are recorded under `<storage_dir>/requests/` with their key
-//!   sealed beside them ([`ndn_cert::RequestStore`]); the issuer
-//!   certificates of a request issued there are kept under
-//!   `<storage_dir>/issuers/` ([`ndn_cert::issuers`]).
+//! - [`AppVault`] ([`KeyVault`]): the keys are the identities the app holds
+//!   ([`IdentityCore`]: every one it enrolled as, loaded, generated or
+//!   restored — the host persists each SafeBag and loads them all at
+//!   launch), or, for a renewal, the one identity the call opened from its
+//!   SafeBag. A key generated here, or opened from a sealed request key
+//!   under the host's password, lives in memory for the call, and the
+//!   certificate the CA issues is sealed with its key into a SafeBag the
+//!   result carries. Requests for an admin's approval are recorded under
+//!   `<storage_dir>/requests/` with their key sealed beside them
+//!   ([`ndn_cert::RequestStore`]); the issuer certificates of a request
+//!   issued there are kept under `<storage_dir>/issuers/`
+//!   ([`ndn_cert::issuers`]).
+//! - [`AppParticipant`]: the [`Participant`] a call works through; the
+//!   membership changes it reports reach the app's watchers
+//!   ([`IdentityCore::watch_memberships`]).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -22,6 +29,7 @@ use parking_lot::Mutex;
 
 use bytes::Bytes;
 use ndn_cert::RequestStore;
+use ndn_cert::report::MembershipEvent;
 use ndn_namespace::{
     Activation, ContextStore, HostWords, KeyUnavailable, KeyVault, Participant, ParticipantParts,
     StoredContext,
@@ -30,8 +38,8 @@ use ndn_packet::{Data, Name};
 use ndn_security::safebag::SafeBag;
 use ndn_security::{Certificate, EcdsaP256Signer, SignedTrustContext, Signer};
 
-use super::IdentityCore;
-use crate::types::{NdnContext, NdnEnrolledIdentity, NdnError};
+use super::{IdentityCore, identity_of_key};
+use crate::types::{NdnContext, NdnEnrolledIdentity, NdnError, NdnMembership};
 
 /// Where the outgoing requests live under the app's storage directory, as
 /// beside the daemon's PIB.
@@ -88,9 +96,11 @@ impl AppContexts {
 /// The request records under `storage_dir`.
 pub(crate) fn request_store(storage_dir: &str) -> Result<RequestStore, String> {
     if storage_dir.is_empty() {
-        return Err("no storage directory given: pass the app's private files directory, where \
+        return Err(
+            "no storage directory given: pass the app's private files directory, where \
                     its requests for an admin's approval are recorded"
-            .into());
+                .into(),
+        );
     }
     RequestStore::open(Path::new(storage_dir).join(REQUESTS_DIR))
         .map_err(|e| format!("cannot open the request records under {storage_dir}: {e}"))
@@ -127,8 +137,8 @@ struct Installed {
     issuers: Vec<Vec<u8>>,
 }
 
-/// The identity a call works with: the key it holds (a loaded SafeBag) and
-/// its certificate.
+/// The one identity a renewal works with: the key it holds (a loaded
+/// SafeBag) and its certificate.
 pub(crate) struct Held {
     pub(crate) key: Name,
     pub(crate) cert: Data,
@@ -144,7 +154,8 @@ pub(crate) struct AppVault<'a> {
     /// are kept; empty: none.
     storage_dir: String,
     password: Vec<u8>,
-    /// The identity the call works with, if any (renewal, approvals).
+    /// The one identity a renewal works with; `None`: every identity the
+    /// app holds.
     held: Option<Held>,
     /// The issuer certificates the host kept and passed in.
     passed_issuers: Vec<Bytes>,
@@ -153,6 +164,8 @@ pub(crate) struct AppVault<'a> {
 }
 
 impl<'a> AppVault<'a> {
+    /// A vault over every identity the app holds, generating and recording
+    /// requests under `storage_dir` with keys sealed under `password`.
     pub(crate) fn new(core: &'a IdentityCore, storage_dir: String, password: Vec<u8>) -> Self {
         Self {
             core,
@@ -165,11 +178,20 @@ impl<'a> AppVault<'a> {
         }
     }
 
-    /// A vault holding `held` (opened from its SafeBag by the host) and the
-    /// issuer certificates the host kept.
+    /// A vault over every identity the app holds, with the issuer
+    /// certificates the host kept for them.
+    pub(crate) fn with_issuers(core: &'a IdentityCore, issuers: Vec<Vec<u8>>) -> Self {
+        Self {
+            passed_issuers: issuers.into_iter().map(Bytes::from).collect(),
+            ..Self::new(core, String::new(), Vec::new())
+        }
+    }
+
+    /// A vault holding only `held` (opened from its SafeBag by the host) and
+    /// the issuer certificates the host kept: a renewal of that identity.
     pub(crate) fn holding(
         core: &'a IdentityCore,
-        held: Option<Held>,
+        held: Held,
         issuers: Vec<Vec<u8>>,
         password: Vec<u8>,
     ) -> Self {
@@ -177,16 +199,17 @@ impl<'a> AppVault<'a> {
             passed_issuers: issuers.into_iter().map(Bytes::from).collect(),
             ..Self::new(core, String::new(), password)
         };
-        if let Some(held) = &held {
-            vault.open.lock().insert(
-                held.key.clone(),
-                OpenKey {
-                    pkcs8: held.pkcs8.clone(),
-                    signer: Arc::clone(&held.signer),
-                },
-            );
+        vault.open.lock().insert(
+            held.key.clone(),
+            OpenKey {
+                pkcs8: held.pkcs8.clone(),
+                signer: Arc::clone(&held.signer),
+            },
+        );
+        Self {
+            held: Some(held),
+            ..vault
         }
-        Self { held, ..vault }
     }
 
     fn requests(&self) -> Result<RequestStore, String> {
@@ -199,7 +222,11 @@ impl<'a> AppVault<'a> {
         !self.storage_dir.is_empty()
             && self
                 .requests()
-                .and_then(|store| store.sealed_key(&key.to_string()).map_err(|e| e.to_string()))
+                .and_then(|store| {
+                    store
+                        .sealed_key(&key.to_string())
+                        .map_err(|e| e.to_string())
+                })
                 .is_ok_and(|sealed| sealed.is_some())
     }
 
@@ -218,6 +245,8 @@ impl<'a> AppVault<'a> {
             safebag: installed.safebag.clone(),
             adopted_context,
             issuers: installed.issuers.clone(),
+            node_identity: identity_of_key(&installed.key)
+                .is_some_and(|identity| self.core.is_node(&identity)),
         })
     }
 }
@@ -232,7 +261,7 @@ impl KeyVault for AppVault<'_> {
     }
 
     fn default_identity(&self) -> Result<Option<Name>, String> {
-        Ok(None)
+        Ok(self.core.node_identity())
     }
 
     fn request_store(&self) -> Result<RequestStore, String> {
@@ -269,11 +298,19 @@ impl KeyVault for AppVault<'_> {
         if let Some(opened) = self.open.lock().get(key) {
             return Ok(Arc::clone(&opened.signer));
         }
+        if self.held.is_none()
+            && let Some(signer) = self.core.signer_of_key(key)
+        {
+            return Ok(signer);
+        }
         let store = self.requests().map_err(KeyUnavailable::Unreadable)?;
         let sealed = match store.sealed_key(&key.to_string()) {
             Ok(Some(sealed)) => sealed,
             Ok(None) => {
-                return Err(KeyUnavailable::Gone(format!("gone from {}", self.storage_dir)));
+                return Err(KeyUnavailable::Gone(format!(
+                    "gone from {}",
+                    self.storage_dir
+                )));
             }
             Err(e) => return Err(KeyUnavailable::Unreadable(e.to_string())),
         };
@@ -315,13 +352,11 @@ impl KeyVault for AppVault<'_> {
         // Kept so a poll after a restart reports it again: the bag in
         // place of the bare request key.
         if self.is_request_key(key)
-            && let Err(e) = self
-                .requests()
-                .and_then(|store| {
-                    store
-                        .save_sealed_key(&key.to_string(), &safebag)
-                        .map_err(|e| e.to_string())
-                })
+            && let Err(e) = self.requests().and_then(|store| {
+                store
+                    .save_sealed_key(&key.to_string(), &safebag)
+                    .map_err(|e| e.to_string())
+            })
         {
             tracing::warn!(
                 target: "ndn_boltffi::identity",
@@ -339,8 +374,11 @@ impl KeyVault for AppVault<'_> {
         Ok(())
     }
 
-    fn make_default(&self, _identity: &Name) -> Result<(), String> {
-        // The host persists the SafeBag and loads it at launch.
+    fn make_default(&self, identity: &Name) -> Result<(), String> {
+        // The app's first identity: its node identity from now on. The
+        // host persists which identity it is (`node_identity` in the
+        // result) and chooses it again at launch.
+        self.core.record_node(identity);
         Ok(())
     }
 
@@ -349,7 +387,10 @@ impl KeyVault for AppVault<'_> {
         if let Some(installed) = installed.as_mut() {
             installed.issuers = issuers.iter().map(|d| d.raw().to_vec()).collect();
             // A link hello carries the chain too.
-            self.core.set_issuers(issuers.iter().map(|d| d.raw().clone()).collect());
+            self.core.set_issuers(
+                &installed.key,
+                issuers.iter().map(|d| d.raw().clone()).collect(),
+            );
             if self.is_request_key(&installed.key) {
                 ndn_cert::issuers::keep_issuer_certs(Path::new(&self.storage_dir), issuers)
                     .map_err(|e| e.to_string())?;
@@ -360,39 +401,108 @@ impl KeyVault for AppVault<'_> {
 
     fn issuers(&self) -> Vec<Bytes> {
         let mut issuers = self.passed_issuers.clone();
+        issuers.extend(self.core.kept_issuers());
         if !self.storage_dir.is_empty() {
-            issuers.extend(ndn_cert::issuers::stored_issuer_certs(Path::new(&self.storage_dir)));
+            issuers.extend(ndn_cert::issuers::stored_issuer_certs(Path::new(
+                &self.storage_dir,
+            )));
         }
         issuers
     }
 
     fn keys(&self) -> Result<Vec<Name>, String> {
-        Ok(self.held.iter().map(|held| held.key.clone()).collect())
+        Ok(match &self.held {
+            Some(held) => vec![held.key.clone()],
+            None => self.core.keys(),
+        })
     }
 
     fn certificate(&self, key: &Name) -> Option<Certificate> {
-        let held = self.held.as_ref().filter(|held| held.key == *key)?;
-        Certificate::decode(&held.cert).ok()
+        match &self.held {
+            Some(held) if held.key == *key => Certificate::decode(&held.cert).ok(),
+            Some(_) => None,
+            None => self.core.current_cert_of(key),
+        }
     }
 
     fn issued_certificate(&self, key: &Name) -> Result<Option<Bytes>, String> {
-        Ok(self
-            .held
-            .as_ref()
-            .filter(|held| held.key == *key)
-            .map(|held| held.cert.raw().clone()))
+        Ok(match &self.held {
+            Some(held) if held.key == *key => Some(held.cert.raw().clone()),
+            Some(_) => None,
+            None => self.core.current_cert_of(key).and_then(|c| c.data_wire()),
+        })
     }
 
-    fn activate(&self, _identity: &Name, key: &Name, signer: Arc<dyn Signer>) -> Activation {
+    fn activate(
+        &self,
+        _identity: &Name,
+        key: &Name,
+        signer: Arc<dyn Signer>,
+        _first_identity: bool,
+    ) -> Activation {
         if let Some(installed) = self.installed.lock().as_ref()
             && installed.key == *key
         {
             self.core.record_cert(&installed.cert);
         }
-        self.core.install_signer(signer);
-        Activation {
-            signing_now: true,
-            at_next_start: Vec::new(),
+        // Beside the app's other identities; the first one (recorded by
+        // `make_default`) is its node identity.
+        match self.core.add_identity(signer) {
+            Ok(node_identity) => Activation {
+                signing_now: true,
+                node_identity,
+                at_next_start: Vec::new(),
+            },
+            Err(e) => Activation {
+                signing_now: false,
+                node_identity: false,
+                at_next_start: vec![e.to_string()],
+            },
+        }
+    }
+}
+
+/// The [`Participant`] an FFI call works through; dropped at the end of the
+/// call, it hands the membership changes it reported to the app's watchers,
+/// each with the app's relation to the namespace after the call (judged
+/// over the identities the app holds, as [`IdentityCore::memberships`]: the
+/// library judges an event's relation by the engine's key store, which holds
+/// none of the app's identities).
+pub(crate) struct AppParticipant<'a> {
+    participant: Participant,
+    events: tokio::sync::broadcast::Receiver<MembershipEvent>,
+    core: &'a IdentityCore,
+}
+
+impl std::ops::Deref for AppParticipant<'_> {
+    type Target = Participant;
+
+    fn deref(&self) -> &Participant {
+        &self.participant
+    }
+}
+
+impl Drop for AppParticipant<'_> {
+    fn drop(&mut self) {
+        use tokio::sync::broadcast::error::TryRecvError;
+        let mut events = Vec::new();
+        loop {
+            match self.events.try_recv() {
+                Ok(event) => events.push(event),
+                Err(TryRecvError::Lagged(_)) => continue,
+                Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+            }
+        }
+        if events.is_empty() {
+            return;
+        }
+        let vault = AppVault::new(self.core, String::new(), Vec::new());
+        let now = ndn_namespace::membership::memberships(&self.participant, &vault);
+        for mut event in events {
+            if let Some(info) = now.iter().find(|m| m.namespace == event.namespace) {
+                event.relation = info.relation;
+            }
+            self.core.publish_membership(event);
         }
     }
 }
@@ -405,17 +515,35 @@ impl IdentityCore {
         &self,
         engine: &ndn_app::ForwarderEngine,
         contexts: &Arc<AppContexts>,
-    ) -> Participant {
-        Participant::new(ParticipantParts {
+    ) -> AppParticipant<'_> {
+        let participant = Participant::new(ParticipantParts {
             engine: engine.clone(),
             keyring: Arc::clone(&self.keyring),
             store: Arc::clone(contexts) as Arc<dyn ContextStore>,
             publisher: None,
             own_certs: None,
             sync: None,
-            ca: None,
+            cas: Vec::new(),
             words: app_words(),
-        })
+        });
+        AppParticipant {
+            events: participant.membership_events(),
+            participant,
+            core: self,
+        }
+    }
+
+    /// The app's membership in every trusted prefix it holds, sorted by
+    /// prefix ([`ndn_namespace::membership::memberships`] over the
+    /// identities the app holds).
+    pub(crate) fn memberships(&self, engine: &ndn_app::ForwarderEngine) -> Vec<NdnMembership> {
+        let contexts = Arc::new(AppContexts::default());
+        let participant = self.participant(engine, &contexts);
+        let vault = AppVault::new(self, String::new(), Vec::new());
+        ndn_namespace::membership::memberships(&participant, &vault)
+            .into_iter()
+            .map(NdnMembership::from_info)
+            .collect()
     }
 }
 
@@ -486,7 +614,15 @@ mod tests {
             w.already_certified(&ns, "/home/bob/member/phone/KEY/k1", ""),
         ];
         for m in &messages {
-            for forwarder in ["ndn-fwd", "PIB", "[security]", "`", " --", "{role}", "{namespace}"] {
+            for forwarder in [
+                "ndn-fwd",
+                "PIB",
+                "[security]",
+                "`",
+                " --",
+                "{role}",
+                "{namespace}",
+            ] {
                 assert!(!m.contains(forwarder), "{m:?} names {forwarder:?}");
             }
         }

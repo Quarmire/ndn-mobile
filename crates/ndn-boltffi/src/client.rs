@@ -32,7 +32,7 @@ use crate::types::{
     NdnActionClass, NdnDelegationScope, NdnEnrollConfig, NdnEnrolledIdentity, NdnRecoveredIdentity,
     NdnRevocation,
 };
-use crate::types::{NdnContext, NdnData, NdnError};
+use crate::types::{NdnContext, NdnData, NdnError, NdnIdentity};
 
 /// A pure NDN client bound to a forwarder over a duplex fd. Construct once with
 /// the fd handed across the platform IPC boundary, then drive it through
@@ -115,7 +115,9 @@ impl NdnClient {
         let parsed: Name = name.parse().map_err(|_| NdnError::invalid_name(&name))?;
         let mut guard = self.consumer.lock().unwrap();
         if guard.is_none() {
-            *guard = Some(Consumer::new(self.identity_core.demux.clone() as Arc<dyn Connection>));
+            *guard = Some(Consumer::new(
+                self.identity_core.demux.clone() as Arc<dyn Connection>
+            ));
         }
         let consumer = guard.as_mut().unwrap();
         self.rt
@@ -129,7 +131,9 @@ impl NdnClient {
         let parsed: Name = name.parse().map_err(|_| NdnError::invalid_name(&name))?;
         let mut guard = self.consumer.lock().unwrap();
         if guard.is_none() {
-            *guard = Some(Consumer::new(self.identity_core.demux.clone() as Arc<dyn Connection>));
+            *guard = Some(Consumer::new(
+                self.identity_core.demux.clone() as Arc<dyn Connection>
+            ));
         }
         let consumer = guard.as_mut().unwrap();
         self.rt
@@ -146,7 +150,9 @@ impl NdnClient {
         let parsed: Name = name.parse().map_err(|_| NdnError::invalid_name(&name))?;
         let mut guard = self.consumer.lock().unwrap();
         if guard.is_none() {
-            *guard = Some(Consumer::new(self.identity_core.demux.clone() as Arc<dyn Connection>));
+            *guard = Some(Consumer::new(
+                self.identity_core.demux.clone() as Arc<dyn Connection>
+            ));
         }
         let consumer = guard.as_mut().unwrap();
         self.rt
@@ -190,7 +196,7 @@ impl NdnClient {
     /// RDR whole-object publish: segments `content` under `<name>/v=<ver>` and
     /// serves it (metadata + segments) until the connection closes — blocking,
     /// run on a worker thread. `chunk_size == 0` uses the 8 KiB default. Signed
-    /// with the loaded operator identity if present. Pairs with
+    /// with the identity `name` chooses when this client holds any. Pairs with
     /// [`Self::fetch_object_verified`]; the core of file sharing over the node.
     pub fn publish_object(
         &self,
@@ -220,15 +226,19 @@ impl NdnClient {
         // the one connection.
         let handler: Arc<dyn NdnInterestHandler> = handler.into();
         self.rt
-            .block_on(self.identity_core.demux.serve(name, move |interest, responder| {
-                let name = interest.name.to_string();
-                let result = handler.handle_interest(name).map(Bytes::from);
-                async move {
-                    if let Some(wire) = result {
-                        responder.respond_bytes(wire).await.ok();
-                    }
-                }
-            }))
+            .block_on(
+                self.identity_core
+                    .demux
+                    .serve(name, move |interest, responder| {
+                        let name = interest.name.to_string();
+                        let result = handler.handle_interest(name).map(Bytes::from);
+                        async move {
+                            if let Some(wire) = result {
+                                responder.respond_bytes(wire).await.ok();
+                            }
+                        }
+                    }),
+            )
             .map(|()| true)
             .map_err(NdnError::engine)
     }
@@ -280,7 +290,8 @@ impl NdnClient {
     /// (blocking) fetch runs — these read atomics outside the fetch lock — to
     /// drive a download progress bar. Reset to 0 at the start of each fetch.
     pub fn fetch_progress_received(&self) -> u64 {
-        self.fetch_received.load(std::sync::atomic::Ordering::Relaxed)
+        self.fetch_received
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Total segments in the object being fetched (0 until the metadata lands).
@@ -297,12 +308,7 @@ impl NdnClient {
     /// Returns the total bytes written. Progress is reported through the same
     /// [`fetch_progress_received`](Self::fetch_progress_received) getters.
     #[cfg(unix)]
-    pub fn fetch_object_to_fd(
-        &self,
-        name: String,
-        hint: String,
-        fd: i32,
-    ) -> Result<u64, NdnError> {
+    pub fn fetch_object_to_fd(&self, name: String, hint: String, fd: i32) -> Result<u64, NdnError> {
         use std::os::fd::FromRawFd;
         let parsed: Name = name.parse().map_err(|_| NdnError::invalid_name(&name))?;
         let hint_name: Name = hint.parse().map_err(|_| NdnError::invalid_name(&hint))?;
@@ -338,7 +344,7 @@ impl NdnClient {
     /// `node_id` (read from the `self` field of `/localhost/discovery/peers`):
     /// serve the offerer cert at `/ndn/node/<id>/cert` and a signed manifest at
     /// `/ndn/node/<id>/offers`. Idempotent (replaces any prior board). Requires
-    /// a loaded identity. Pair with [`Self::add_offer`].
+    /// an identity (the node identity signs). Pair with [`Self::add_offer`].
     pub fn start_offer_board(&self, node_id: String) -> Result<bool, NdnError> {
         #[cfg(feature = "identity")]
         {
@@ -349,7 +355,9 @@ impl NdnClient {
         #[cfg(not(feature = "identity"))]
         {
             let _ = node_id;
-            Err(NdnError::engine("identity feature not enabled in this build"))
+            Err(NdnError::engine(
+                "identity feature not enabled in this build",
+            ))
         }
     }
 
@@ -480,25 +488,41 @@ impl NdnClient {
         self.identity_core.forget_context(namespace)
     }
 
-    /// Restore a software operator identity from a password-encrypted SafeBag.
+    /// Restore a software identity from a password-encrypted SafeBag and add
+    /// it to the identities this client signs as (see
+    /// [`NdnEngine::load_identity`](crate::NdnEngine::load_identity)).
     pub fn load_identity(
         &self,
         safebag: Vec<u8>,
         password: Vec<u8>,
         key_name: String,
     ) -> Result<String, NdnError> {
-        self.identity_core.load_identity(safebag, password, key_name)
+        self.identity_core
+            .load_identity(safebag, password, key_name)
     }
 
-    /// Whether an operator identity is loaded.
+    /// Whether this client holds any identity.
     pub fn has_identity(&self) -> bool {
         self.identity_core.has_identity()
     }
 
-    /// Become **keyless**: install a remote signer so every published object is
-    /// signed via the RemoteSigner served at `signer_prefix` (the device's Anchor),
-    /// presenting `cert_wire` (the Anchor's certificate) as this leaf's KeyLocator
-    /// and served cert. Replaces any loaded SafeBag. Requires the `identity` feature.
+    /// Every identity this client signs as (see
+    /// [`NdnEngine::identities`](crate::NdnEngine::identities)).
+    pub fn identities(&self) -> Vec<NdnIdentity> {
+        self.identity_core.identities()
+    }
+
+    /// Make `identity` the node identity (see
+    /// [`NdnEngine::set_node_identity`](crate::NdnEngine::set_node_identity)).
+    pub fn set_node_identity(&self, identity: String) -> Result<bool, NdnError> {
+        self.identity_core.set_node_identity(identity)
+    }
+
+    /// Sign through a remote signer: add the identity of `cert_wire` (the
+    /// Anchor's certificate, this leaf's KeyLocator and served cert), whose
+    /// every signature is made by the RemoteSigner served at `signer_prefix`
+    /// (the device's Anchor). It is the node identity when this client holds
+    /// no other (a keyless leaf). Requires the `identity` feature.
     #[cfg(feature = "identity")]
     pub fn use_remote_signer(
         &self,
@@ -509,9 +533,10 @@ impl NdnClient {
             .use_remote_signer(signer_prefix, cert_wire)
     }
 
-    /// Sign `region` with the loaded operator identity.
-    pub fn sign(&self, region: Vec<u8>) -> Result<Vec<u8>, NdnError> {
-        self.identity_core.sign(region)
+    /// Sign `region`, the signed portion of a packet named `name`, with the
+    /// identity `name` chooses (see [`NdnEngine::sign`](crate::NdnEngine::sign)).
+    pub fn sign(&self, name: String, region: Vec<u8>) -> Result<Vec<u8>, NdnError> {
+        self.identity_core.sign(name, region)
     }
 
     /// NDNCERT token-challenge enrollment over the forwarder seam; loads the
@@ -612,25 +637,25 @@ impl NdnClient {
         self.identity_core.grant_signing_scope(action, ttl_secs)
     }
 
-    /// The loaded operator identity's `did:ndn` URI. Requires the `identity` feature.
+    /// The node identity's `did:ndn` URI. Requires the `identity` feature.
     #[cfg(feature = "identity")]
     pub fn principal_did(&self) -> Result<String, NdnError> {
         self.identity_core.principal_did()
     }
 
-    /// The loaded operator identity's human-readable NDN name. Requires the
+    /// The node identity's human-readable NDN name. Requires the
     /// `identity` feature.
     #[cfg(feature = "identity")]
     pub fn principal_name(&self) -> Result<String, NdnError> {
         self.identity_core.principal_name()
     }
 
-    /// The loaded identity's raw public key.
+    /// The node identity's raw public key.
     pub fn principal_public_key(&self) -> Result<Vec<u8>, NdnError> {
         self.identity_core.principal_public_key()
     }
 
-    /// The loaded identity's current certificate — see
+    /// The node identity's current certificate — see
     /// [`NdnEngine::principal_cert_wire`](crate::NdnEngine::principal_cert_wire).
     /// Requires the `identity` feature.
     #[cfg(feature = "identity")]
@@ -690,7 +715,7 @@ impl NdnClient {
             .sign_delegated_named(name, payload, delegation_wire, principal_pubkey)
     }
 
-    /// Make the loaded identity recoverable. Requires the `identity` feature.
+    /// Make the node identity recoverable. Requires the `identity` feature.
     #[cfg(feature = "identity")]
     pub fn make_recoverable(&self, recovery_pubkey: Vec<u8>) -> Result<Vec<u8>, NdnError> {
         self.identity_core.make_recoverable(recovery_pubkey)
@@ -720,11 +745,15 @@ impl NdnClient {
         persist_password: Vec<u8>,
         recovery_signer: Box<dyn NdnRecoverySigner>,
     ) -> Result<NdnRecoveredIdentity, NdnError> {
-        self.identity_core
-            .restore_identity_remote(bundle, identity_name, persist_password, recovery_signer)
+        self.identity_core.restore_identity_remote(
+            bundle,
+            identity_name,
+            persist_password,
+            recovery_signer,
+        )
     }
 
-    /// Self-revoke the loaded identity. Requires the `identity` feature.
+    /// Self-revoke the node identity. Requires the `identity` feature.
     #[cfg(feature = "identity")]
     pub fn revoke_identity(&self, reason: String) -> Result<Vec<u8>, NdnError> {
         self.identity_core.revoke_identity(reason)

@@ -1,8 +1,9 @@
 //! The QUIC links this device hosts: [`ndn_link`] on the embedded engine,
 //! with the same admission, relay choice, link modes, held Interests, wake
 //! tokens and direct paths as the `ndn-fwd` daemon. This module only wires
-//! the app's parts in: the loaded identity (its key, certificate and
-//! issuers), the adopted trust contexts, the engine's faces and RIB, the
+//! the app's parts in: the node identity (the link key, its certificate and
+//! issuers), the app's membership in each trusted prefix it holds (shown on
+//! every link), the adopted trust contexts, the engine's faces and RIB, the
 //! socket the platform hands over, and the app's lifecycle and network
 //! changes.
 
@@ -13,10 +14,12 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_app::ForwarderEngine;
-use ndn_face_quic::{KeyError, KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig};
+use ndn_face_quic::{
+    KeyError, KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig,
+};
 use ndn_link::{
-    ConfiguredEndpoints, EngineFaces, HostCandidates, LinkHints, LinkMode, LinkReport, LinkSetup, LinkTrust,
-    Links, PeerId, PeerSpec, RelayOptions, RelaySource, RelayUse,
+    ConfiguredEndpoints, EngineFaces, HostCandidates, LinkHints, LinkMode, LinkReport, LinkSetup,
+    LinkTrust, Links, OwnMembership, PeerId, PeerSpec, RelayOptions, RelaySource, RelayUse,
 };
 use ndn_packet::Name;
 use ndn_security::{Certificate, Keyring};
@@ -28,9 +31,9 @@ use crate::types::{
     NdnRelaySource, NdnRelayStatus,
 };
 
-/// The key this device links with: the loaded identity, read at each
-/// handshake, so an identity installed later (an enrollment) is the one the
-/// next link presents.
+/// The key this device links with: the node identity's, read at each
+/// handshake, so a node identity chosen later is the one the next link
+/// presents.
 struct IdentityKey(Arc<IdentityCore>);
 
 impl LinkKeySource for IdentityKey {
@@ -44,9 +47,9 @@ impl LinkKeySource for IdentityKey {
     }
 }
 
-/// The trust data links are admitted from: the adopted trust contexts, this
-/// device's certificate and issuers, and the certificates the engine has
-/// validated.
+/// The trust data links are admitted from: the adopted trust contexts, the
+/// node identity's certificate and issuers, the app's memberships, and the
+/// certificates the engine has validated.
 struct AppTrust {
     core: Arc<IdentityCore>,
     engine: ForwarderEngine,
@@ -61,10 +64,16 @@ impl LinkTrust for AppTrust {
         self.core.own_chain()
     }
 
+    fn own_memberships(&self) -> Vec<OwnMembership> {
+        self.core.own_memberships()
+    }
+
     fn known_certificate(&self, name: &Name) -> Option<Certificate> {
-        self.core
-            .recorded_certificate(name)
-            .or_else(|| self.engine.validator().and_then(|v| v.cert_cache().get_valid(name)))
+        self.core.recorded_certificate(name).or_else(|| {
+            self.engine
+                .validator()
+                .and_then(|v| v.cert_cache().get_valid(name))
+        })
     }
 
     fn known_certificate_of_key(&self, fingerprint: &KeyFingerprint) -> Option<Certificate> {
@@ -77,7 +86,8 @@ impl LinkTrust for AppTrust {
 /// How a person at this device does what a refusal asks, in the app's terms.
 fn hints() -> LinkHints {
     LinkHints {
-        enroll: "enroll this device in the app with an invite link, or by an admin's approval".into(),
+        enroll: "enroll this device in the app with an invite link, or by an admin's approval"
+            .into(),
         renew: "renew this device's certificate in the app".into(),
         refresh: "refresh the namespace's trust context in the app".into(),
         peer_entry: "relay".into(),
@@ -115,14 +125,20 @@ fn refused(what: &str, why: impl std::fmt::Display) -> NdnError {
 fn adopt_socket(fd: i32) -> Result<std::net::UdpSocket, NdnError> {
     use std::os::fd::FromRawFd;
     if fd < 0 {
-        return Err(refused("link socket", format!("{fd} is not a file descriptor")));
+        return Err(refused(
+            "link socket",
+            format!("{fd} is not a file descriptor"),
+        ));
     }
     // SAFETY: the caller hands over an open UDP socket it no longer uses
     // (documented on every FFI call taking `socket_fd`).
     let socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
-    socket
-        .local_addr()
-        .map_err(|e| refused("link socket", format!("fd {fd} is not a bound UDP socket: {e}")))?;
+    socket.local_addr().map_err(|e| {
+        refused(
+            "link socket",
+            format!("fd {fd} is not a bound UDP socket: {e}"),
+        )
+    })?;
     Ok(socket)
 }
 
@@ -164,11 +180,21 @@ impl PhoneLinks {
         // loaded, an enclave key that signs only asynchronously, …).
         key.current().map_err(|e| refused("links not started", e))?;
         let transport = transport(&config)?;
-        if !config.issuers.is_empty() {
-            core.set_issuers(config.issuers.into_iter().map(Bytes::from).collect());
+        if !config.issuers.is_empty()
+            && let Some(node) = core.current_signer()
+        {
+            core.set_issuers(
+                node.key_name(),
+                config.issuers.into_iter().map(Bytes::from).collect(),
+            );
         }
         let socket = match config.socket_fd {
-            Some(fd) => LinkEndpoint::from_socket(adopt_socket(fd)?, Arc::clone(&key), &transport, config.listen),
+            Some(fd) => LinkEndpoint::from_socket(
+                adopt_socket(fd)?,
+                Arc::clone(&key),
+                &transport,
+                config.listen,
+            ),
             None => {
                 let bind = config.bind.as_deref().unwrap_or("0.0.0.0:0");
                 let addr: SocketAddr = bind.parse().map_err(|_| NdnError::invalid_addr(bind))?;
@@ -205,9 +231,9 @@ impl PhoneLinks {
         // An app starts links from the foreground; it says otherwise with
         // set_app_active(false).
         links.set_active(true);
-        tokio::spawn(relink_on_switch(
+        tokio::spawn(relink_on_change(
             Arc::downgrade(&links),
-            core.identity_switches(),
+            core.identity_changes(),
             cancel.clone(),
         ));
         Ok(Self {
@@ -227,7 +253,12 @@ impl PhoneLinks {
             .iter()
             .find(|l| l.label == label)
             .and_then(|l| l.peer)
-            .ok_or_else(|| refused(label, "no relay or peer of this device has this label (see link_status)"))
+            .ok_or_else(|| {
+                refused(
+                    label,
+                    "no relay or peer of this device has this label (see link_status)",
+                )
+            })
     }
 
     pub(crate) fn add_relay(&self, relay: NdnRelay) -> Result<(), NdnError> {
@@ -245,7 +276,10 @@ impl PhoneLinks {
         let key = relay
             .key
             .as_deref()
-            .map(|k| KeyFingerprint::from_hex(k).ok_or_else(|| refused(&what, "its key is not 64 hex digits")))
+            .map(|k| {
+                KeyFingerprint::from_hex(k)
+                    .ok_or_else(|| refused(&what, "its key is not 64 hex digits"))
+            })
             .transpose()?;
         let device = relay
             .device
@@ -310,8 +344,13 @@ impl PhoneLinks {
         self.links.set_active(active);
     }
 
-    pub(crate) fn set_wake_token(&self, label: &str, token: Option<Vec<u8>>) -> Result<(), NdnError> {
-        self.links.set_wake_token(self.peer(label)?, token.map(Bytes::from));
+    pub(crate) fn set_wake_token(
+        &self,
+        label: &str,
+        token: Option<Vec<u8>>,
+    ) -> Result<(), NdnError> {
+        self.links
+            .set_wake_token(self.peer(label)?, token.map(Bytes::from));
         Ok(())
     }
 
@@ -371,7 +410,9 @@ fn report(r: &LinkReport, local: Option<SocketAddr>, active: bool) -> NdnLinkRep
                     .map(|p| NdnPathStatus {
                         kind: p.kind.as_str().to_owned(),
                         remote: p.remote.map(|a| a.to_string()),
-                        rtt_ms: p.rtt.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+                        rtt_ms: p
+                            .rtt
+                            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
                         age_secs: p.age.as_secs(),
                         via: p.via.clone(),
                     })
@@ -385,19 +426,20 @@ fn report(r: &LinkReport, local: Option<SocketAddr>, active: bool) -> NdnLinkRep
     }
 }
 
-/// Each time another identity is installed (an enrollment), make the
-/// enrollment links of its namespace again as full links.
-async fn relink_on_switch(
+/// Each time an identity is added or the node identity changes, show the
+/// device's memberships on its links again (enrollment links of a prefix it
+/// is now a member of become full links).
+async fn relink_on_change(
     links: std::sync::Weak<Links>,
-    mut switches: tokio::sync::watch::Receiver<u64>,
+    mut changes: tokio::sync::watch::Receiver<u64>,
     cancel: CancellationToken,
 ) {
     loop {
         tokio::select! {
             () = cancel.cancelled() => return,
-            changed = switches.changed() => if changed.is_err() { return },
+            changed = changes.changed() => if changed.is_err() { return },
         }
         let Some(links) = links.upgrade() else { return };
-        links.key_switched();
+        links.identities_changed();
     }
 }

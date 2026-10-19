@@ -10,8 +10,8 @@ use ndn_discovery_core::DiscoveryProtocol;
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, RoutingProtocol, ShutdownHandle};
 use ndn_face::local::{InProcFace, InProcHandle, IpcListener};
 use ndn_face::net::{MulticastUdpFace, UdpFace, tcp_face_connect};
-use ndn_face_websocket::WebSocketFace;
 use ndn_face_serial::serial_face_open;
+use ndn_face_websocket::WebSocketFace;
 use ndn_packet::Name;
 use ndn_security::SecurityProfile;
 use ndn_strategy::{BestRouteStrategy, MeasuredStrategy, MulticastStrategy};
@@ -312,12 +312,15 @@ pub struct MobileEngineBuilder {
     #[cfg_attr(not(feature = "management"), allow(dead_code))]
     enable_management: bool,
     /// `Some` once `with_management_secured` is called: the validator that
-    /// authenticates signed command Interests and the signer for control
-    /// responses. When set, command auth + anti-replay + a locked-down
-    /// runtime policy are installed; when `None`, management is mounted open
-    /// (suitable only for a trusted local IPC face).
+    /// authenticates signed command Interests and the node identity's signer
+    /// for control responses. When set, command auth + anti-replay + a
+    /// locked-down runtime policy are installed; when `None`, management is
+    /// mounted open (suitable only for a trusted local IPC face).
     #[cfg(feature = "management")]
-    secured_mgmt: Option<(Arc<ndn_security::Validator>, Arc<dyn ndn_security::Signer>)>,
+    secured_mgmt: Option<(
+        Arc<ndn_security::Validator>,
+        Arc<ndn_security::ActiveSigner>,
+    )>,
     /// Host-owned log ring for the `/localhost/nfd/log` module. The binary
     /// owns tracing init, so it supplies this; libraries never install it.
     #[cfg(feature = "management")]
@@ -342,10 +345,7 @@ pub struct MobileEngineBuilder {
     enable_fec: bool,
     #[cfg(feature = "tun")]
     tun_config: Option<TunConfig>,
-    #[cfg_attr(
-        not(any(feature = "fjall", feature = "sqlite-cs")),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(any(feature = "fjall", feature = "sqlite-cs")), allow(dead_code))]
     persistent_cs_path: Option<PathBuf>,
 }
 
@@ -498,23 +498,30 @@ impl MobileEngineBuilder {
 
     /// Mount the management dispatcher with **command authentication**:
     /// `command_validator` verifies signed command Interests against its trust
-    /// schema, `command_response_signer` signs control responses, signed
-    /// commands are required, and an anti-replay `SignatureTime` cache plus a
-    /// locked-down runtime policy are installed. This is the secure default for
-    /// any engine exposed to a UI/VPN client.
+    /// schema, `node_signer` signs control responses, signed commands are
+    /// required, and an anti-replay `SignatureTime` cache plus a locked-down
+    /// runtime policy are installed. This is the secure default for any
+    /// engine exposed to a UI/VPN client.
     ///
-    /// The identity typically comes from [`enrollment`](crate::enroll): persist
-    /// the [`EnrolledIdentity`](crate::enroll::EnrolledIdentity) as a SafeBag on
-    /// first run, then on later runs `load_identity` it and build a `Validator`
-    /// anchored on the CA, passing both here. Requires the `management` feature.
+    /// Management responses are the node's own traffic: `node_signer` is the
+    /// node identity's signer — the device's first identity unless the app
+    /// chose another — whichever namespaces the device is also a member of.
+    /// The host keeps the handle and [`replace`](ndn_security::ActiveSigner::replace)s
+    /// its signer when the node identity changes; enrolling in another
+    /// namespace never changes it. The identity typically comes from
+    /// [`enrollment`](crate::enroll): persist the
+    /// [`EnrolledIdentity`](crate::enroll::EnrolledIdentity) as a SafeBag on
+    /// first run, then on later runs `load_identity` it and build a
+    /// `Validator` anchored on the CA, passing both here. Requires the
+    /// `management` feature.
     #[cfg(feature = "management")]
     pub fn with_management_secured(
         mut self,
         command_validator: Arc<ndn_security::Validator>,
-        command_response_signer: Arc<dyn ndn_security::Signer>,
+        node_signer: Arc<ndn_security::ActiveSigner>,
     ) -> Self {
         self.enable_management = true;
-        self.secured_mgmt = Some((command_validator, command_response_signer));
+        self.secured_mgmt = Some((command_validator, node_signer));
         self
     }
 
@@ -725,10 +732,17 @@ impl MobileEngineBuilder {
             #[cfg(all(feature = "sqlite-cs", target_os = "android"))]
             let opened = ndn_store::SqliteCs::open(path, max_bytes)
                 .map(|cs| Arc::new(cs) as Arc<dyn ndn_store::ErasedContentStore>);
-            #[cfg(all(feature = "sqlite-cs", not(feature = "fjall"), not(target_os = "android")))]
+            #[cfg(all(
+                feature = "sqlite-cs",
+                not(feature = "fjall"),
+                not(target_os = "android")
+            ))]
             let opened = ndn_store::SqliteCs::open(path, max_bytes)
                 .map(|cs| Arc::new(cs) as Arc<dyn ndn_store::ErasedContentStore>);
-            #[cfg(all(feature = "fjall", not(all(feature = "sqlite-cs", target_os = "android"))))]
+            #[cfg(all(
+                feature = "fjall",
+                not(all(feature = "sqlite-cs", target_os = "android"))
+            ))]
             let opened = ndn_store::FjallCs::open(path, max_bytes)
                 .map(|cs| Arc::new(cs) as Arc<dyn ndn_store::ErasedContentStore>);
             // The persistent CS is a cache, not storage: if it can't open — e.g. a
@@ -1002,9 +1016,9 @@ impl MobileEngineBuilder {
                 runtime_policy,
                 security_is_ephemeral,
             ) = match self.secured_mgmt {
-                Some((validator, signer)) => (
+                Some((validator, node_signer)) => (
                     Some(validator),
-                    Some(Arc::new(ndn_security::ActiveSigner::new(signer))),
+                    Some(node_signer),
                     true,
                     Some(Arc::new(std::sync::Mutex::new(
                         std::collections::HashMap::new(),
@@ -1117,11 +1131,8 @@ impl MobileEngine {
     #[cfg(unix)]
     pub fn mount_app_fd(&self, fd: std::os::fd::RawFd) -> std::io::Result<FaceId> {
         let face_id = self.engine.faces().alloc_id();
-        let face = ndn_face::local::ipc_face_from_raw_fd(
-            face_id,
-            ndn_transport::FaceKind::App,
-            fd,
-        )?;
+        let face =
+            ndn_face::local::ipc_face_from_raw_fd(face_id, ndn_transport::FaceKind::App, fd)?;
         self.engine
             .add_face(face, self.shutdown.cancel_token().child_token());
         Ok(face_id)
@@ -1286,7 +1297,9 @@ impl MobileEngine {
             FaceKind::WifiAware => self.wifi_aware.as_ref().map(|(id, _)| *id),
             #[cfg(feature = "ble")]
             FaceKind::Bluetooth => self.ble.as_ref().map(|(id, _)| *id),
-            FaceKind::Udp => (self.multicast_face_id != FaceId(0)).then_some(self.multicast_face_id),
+            FaceKind::Udp => {
+                (self.multicast_face_id != FaceId(0)).then_some(self.multicast_face_id)
+            }
             _ => None,
         };
         let Some(id) = face_id else { return };
@@ -1483,8 +1496,7 @@ impl MobileEngine {
         // traffic keeps the data path warm. Wi-Fi Direct does not idle-teardown,
         // but the keepalive is harmless there and keeps the face symmetric.)
         let socket = Arc::new(tokio::net::UdpSocket::from_std(std_sock)?);
-        let face =
-            UdpFace::from_shared_socket(face_id, Arc::clone(&socket), peer).with_kind(kind);
+        let face = UdpFace::from_shared_socket(face_id, Arc::clone(&socket), peer).with_kind(kind);
         // Real Wi-Fi data path (link MTU 1500): bump the per-fragment UDP payload
         // from the conservative 1400 default to 1452 (= 1500 − 40-byte IPv6 −
         // 8-byte UDP; also safe over IPv4's smaller header) so each NDNLP fragment
@@ -1502,7 +1514,10 @@ impl MobileEngine {
         );
         // Pin: a later discovery beacon must not flip this prefix back to a radio
         // fan (see note_peer_route) — the discovery radios are never bulk.
-        self.bulk_pinned.lock().unwrap().insert(prefix.clone(), face_id);
+        self.bulk_pinned
+            .lock()
+            .unwrap()
+            .insert(prefix.clone(), face_id);
         // Keepalive: a tiny datagram every 20s keeps the data path warm (and, on
         // NAN, prevents idle-teardown). The peer decodes it as a malformed packet
         // and drops it harmlessly. Bound to the network cancel token.
@@ -1586,7 +1601,10 @@ impl MobileEngine {
                     as Arc<dyn ndn_strategy::ErasedStrategy>,
             );
         }
-        tracing::info!(face_id, "NDP bulk face detached (Wi-Fi Aware data path lost)");
+        tracing::info!(
+            face_id,
+            "NDP bulk face detached (Wi-Fi Aware data path lost)"
+        );
     }
 
     /// Declare a **producer region** this node hosts (NFD `NetworkRegionTable`):
@@ -1613,7 +1631,8 @@ impl MobileEngine {
     fn ensure_mesh_strategy(&self) {
         self.engine.strategy_table().insert(
             &Name::root(),
-            Arc::new(ndn_strategy::MulticastStrategy::new()) as Arc<dyn ndn_strategy::ErasedStrategy>,
+            Arc::new(ndn_strategy::MulticastStrategy::new())
+                as Arc<dyn ndn_strategy::ErasedStrategy>,
         );
     }
 
@@ -1825,7 +1844,10 @@ mod cost_route_tests {
             .expect("peer route installed")
             .1;
         let costs: Vec<u32> = entry.nexthops.iter().map(|n| n.cost).collect();
-        assert!(costs.contains(&20), "Wi-Fi Aware cost (20) present: {costs:?}");
+        assert!(
+            costs.contains(&20),
+            "Wi-Fi Aware cost (20) present: {costs:?}"
+        );
         assert!(costs.contains(&50), "BLE cost (50) present: {costs:?}");
         // BestRoute prefers the lowest cost → Wi-Fi Aware over BLE.
         assert_eq!(costs.iter().min(), Some(&20));
@@ -1865,7 +1887,10 @@ mod ndp_face_tests {
             .expect("ndp route installed")
             .1;
         let costs: Vec<u32> = entry.nexthops.iter().map(|n| n.cost).collect();
-        assert!(costs.contains(&10), "UDP-cost (10) NDP nexthop present: {costs:?}");
+        assert!(
+            costs.contains(&10),
+            "UDP-cost (10) NDP nexthop present: {costs:?}"
+        );
         assert!(
             entry.nexthops.iter().any(|n| n.face_id == face_id),
             "the NDP face is a nexthop on the peer prefix",

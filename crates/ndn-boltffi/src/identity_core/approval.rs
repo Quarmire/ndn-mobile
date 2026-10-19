@@ -12,9 +12,9 @@
 //!   to its end across restarts — with held status Interests at the CA,
 //!   answered the moment an admin decides. Asking again while it is pending
 //!   answers with the same request.
-//! - **approver**: the loaded identity, when it is a current admin
-//!   certificate of the namespace, lists what is pending at the CA and
-//!   pushes a signed approval or denial.
+//! - **approver**: each identity of the app that is a current admin
+//!   certificate of a namespace lists what is pending at that namespace's
+//!   CA and pushes a signed approval or denial.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,7 +31,7 @@ use ndn_security::safebag::SafeBag;
 use tokio_util::sync::CancellationToken;
 
 use super::IdentityCore;
-use super::host::{AppContexts, AppVault, Held, app_words, request_store, unseal};
+use super::host::{AppContexts, AppParticipant, AppVault, app_words, request_store, unseal};
 use crate::types::{
     NdnApprovalOutcome, NdnEnrolledIdentity, NdnEnrollmentRequest, NdnError, NdnPendingApproval,
 };
@@ -102,7 +102,9 @@ impl IdentityCore {
             .map_err(|e| refused(e.reason))?;
         let namespace = link.namespace().clone();
         let role: Role = role.parse().map_err(|e| {
-            refused(format!("{e}: ask as admin or node (the roles a namespace certifies on an admin's approval)"))
+            refused(format!(
+                "{e}: ask as admin or node (the roles a namespace certifies on an admin's approval)"
+            ))
         })?;
         let identity = device_identity(&namespace, role, &device)
             .map_err(|e| refused(format!("enrollment refused: {e}")))?;
@@ -118,20 +120,19 @@ impl IdentityCore {
             .rt
             .block_on(ndn_namespace::enroll::ensure_context(&participant, &link))
             .map_err(fail)?;
-        let (ca_prefix, token) = match ndn_namespace::enroll::route(&participant, &link, role)
-            .map_err(fail)?
-        {
-            Route::Approval { ca_prefix, token } => (ca_prefix, token),
-            Route::Invite => {
-                return Err(fail(ndn_namespace::refusal(
-                    400,
-                    format!(
-                        "{namespace} certifies {role} devices by invite, not on an admin's \
+        let (ca_prefix, token) =
+            match ndn_namespace::enroll::route(&participant, &link, role).map_err(fail)? {
+                Route::Approval { ca_prefix, token } => (ca_prefix, token),
+                Route::Invite => {
+                    return Err(fail(ndn_namespace::refusal(
+                        400,
+                        format!(
+                            "{namespace} certifies {role} devices by invite, not on an admin's \
                          approval: enroll with the invite (enroll_with_invite)"
-                    ),
-                )));
-            }
-        };
+                        ),
+                    )));
+                }
+            };
         let enrolling = Enrolling {
             namespace: namespace.clone(),
             identity: identity.clone(),
@@ -251,13 +252,15 @@ impl IdentityCore {
 
         let contexts = Arc::new(AppContexts::default());
         let participant = self.participant(engine, &contexts);
-        let waited = self.rt.block_on(ndn_namespace::approval_wait::wait_for_decision(
-            &participant,
-            &vault,
-            &outgoing.key_name,
-            Some(deadline),
-            &CancellationToken::new(),
-        ));
+        let waited = self
+            .rt
+            .block_on(ndn_namespace::approval_wait::wait_for_decision(
+                &participant,
+                &vault,
+                &outgoing.key_name,
+                Some(deadline),
+                &CancellationToken::new(),
+            ));
         match waited {
             Waited::Pending {
                 request,
@@ -296,8 +299,8 @@ impl IdentityCore {
     }
 
     /// The `Issued` outcome of a request issued at an earlier poll, loaded
-    /// again from the SafeBag kept for it (the identity becomes the loaded
-    /// one).
+    /// again from the SafeBag kept for it (the identity is added beside the
+    /// app's others).
     fn reissued(
         &self,
         storage_dir: &str,
@@ -315,7 +318,8 @@ impl IdentityCore {
             .key_name
             .parse()
             .map_err(|_| lost("its record names no valid key".into()))?;
-        let bag = SafeBag::decode(sealed).map_err(|e| lost(format!("its SafeBag is unreadable ({e})")))?;
+        let bag = SafeBag::decode(sealed)
+            .map_err(|e| lost(format!("its SafeBag is unreadable ({e})")))?;
         let data = ndn_packet::Data::decode(bag.certificate.clone())
             .map_err(|e| lost(format!("its certificate is unreadable ({e})")))?;
         let cert = Certificate::decode(&data)
@@ -329,7 +333,7 @@ impl IdentityCore {
         let signer = ndn_security::EcdsaP256Signer::from_pkcs8_der(pkcs8, key_name.clone())
             .map_err(|e| refused(format!("device key: {e}")))?;
         self.record_cert(data.raw());
-        self.install_signer(Arc::new(signer));
+        let node_identity = self.add_identity(Arc::new(signer))?;
         Ok(NdnApprovalOutcome::Issued {
             request: request_of(outgoing),
             identity: NdnEnrolledIdentity {
@@ -339,6 +343,7 @@ impl IdentityCore {
                 safebag: sealed.to_vec(),
                 adopted_context: None,
                 issuers,
+                node_identity,
             },
         })
     }
@@ -357,66 +362,63 @@ impl IdentityCore {
 
     // ── Approver ───────────────────────────────────────────────────────
 
-    /// The loaded identity as an admin of its namespace
-    /// ([`ndn_namespace::approver::admin_credentials`] over a vault holding
-    /// only it), or why it decides nothing. `issuers`: the issuer
-    /// certificates persisted with it.
-    fn admin_credential(
+    /// The app's identities that are admins of a namespace whose trust
+    /// context it holds, one per namespace
+    /// ([`ndn_namespace::approver::admin_credentials`] over every identity
+    /// the app holds), or why none decides anything. `issuers`: the issuer
+    /// certificates persisted with the admin identities.
+    fn admin_credentials(
         &self,
         engine: &ndn_app::ForwarderEngine,
         issuers: Vec<Vec<u8>>,
-    ) -> Result<(ndn_namespace::Participant, AdminCredential), NdnError> {
-        let signer = self.identity.lock().unwrap().clone().ok_or_else(|| {
-            refused(
+    ) -> Result<(AppParticipant<'_>, Vec<AdminCredential>), NdnError> {
+        if !self.has_identity() {
+            return Err(refused(
                 "no identity is loaded: load this device's admin identity (its SafeBag) before \
                  listing or deciding requests",
-            )
-        })?;
-        let key = signer.key_name().clone();
-        let found = self.keyring.contexts().into_iter().find_map(|ctx| {
-            parse_device_key(ctx.namespace(), &key).map(|device| (ctx, device))
-        });
-        let Some((ctx, device)) = found else {
-            return Err(refused(format!(
-                "the loaded identity {key} is not a device key of a namespace whose trust \
-                 context this app holds: adopt the namespace's context (adopt_context) and load \
-                 its admin identity"
-            )));
-        };
-        let namespace = ctx.namespace().clone();
-        if device.role != Role::Admin {
-            return Err(refused(format!(
-                "the loaded identity {key} is a {} device of {namespace}, not an admin: only an \
-                 admin's key decides requests. Decide on an admin device of {namespace} or on its \
-                 root device (`ndn-fwd approvals`)",
-                device.role
-            )));
+            ));
         }
-        let wire = self.require_cert_wire()?;
-        let cert = ndn_packet::Data::decode(wire)
-            .map_err(|e| refused(format!("the admin certificate is unreadable: {e}")))?;
-        let held = Held {
-            key,
-            cert,
-            pkcs8: None,
-            signer,
-        };
-        let vault = AppVault::holding(self, Some(held), issuers, Vec::new());
+        let vault = AppVault::with_issuers(self, issuers);
         let contexts = Arc::new(AppContexts::default());
         let participant = self.participant(engine, &contexts);
-        let cred = admin_credentials(&participant, &vault, None)
-            .map_err(|e| refused(e.reason))?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                refused(format!(
-                    "the loaded identity's admin certificate of {namespace} decides nothing: it is \
-                     not valid now, its namespace's trust context revokes it, or it names no CA \
-                     of {namespace} as its issuer — renew it (renew_certificate) or ask an admin \
-                     to enroll this device again"
-                ))
-            })?;
-        Ok((participant, cred))
+        let creds = admin_credentials(&participant, &vault, &[]).map_err(|e| refused(e.reason))?;
+        if !creds.is_empty() {
+            return Ok((participant, creds));
+        }
+        // Why each identity decides nothing.
+        let why: Vec<String> = vault
+            .keys()
+            .unwrap_or_default()
+            .iter()
+            .map(|key| {
+                let found = self.keyring.contexts().into_iter().find_map(|ctx| {
+                    parse_device_key(ctx.namespace(), key).map(|device| (ctx, device))
+                });
+                match found {
+                    None => format!(
+                        "{key} is not a device key of a namespace whose trust context this app \
+                         holds (adopt the namespace's context with adopt_context)"
+                    ),
+                    Some((ctx, device)) if device.role != Role::Admin => format!(
+                        "{key} is a {} device of {}, not an admin",
+                        device.role,
+                        ctx.namespace()
+                    ),
+                    Some((ctx, _)) => format!(
+                        "{key}'s admin certificate of {ns} is not valid now, its trust context \
+                         revokes it, or it names no CA of {ns} as its issuer (renew it with \
+                         renew_certificate, or ask an admin to enroll this device again)",
+                        ns = ctx.namespace()
+                    ),
+                }
+            })
+            .collect();
+        Err(refused(format!(
+            "no identity of this app decides requests: {}. Only an admin's key decides \
+             requests: decide on an admin device of the namespace or on its root device \
+             (`ndn-fwd approvals`)",
+            why.join("; ")
+        )))
     }
 
     /// The requests pending at the loaded admin identity's CA. See
@@ -426,10 +428,12 @@ impl IdentityCore {
         engine: &ndn_app::ForwarderEngine,
         issuers: Vec<Vec<u8>>,
     ) -> Result<Vec<NdnPendingApproval>, NdnError> {
-        let (participant, cred) = self.admin_credential(engine, issuers)?;
+        let (participant, creds) = self.admin_credentials(engine, issuers)?;
         let listing = self
             .rt
-            .block_on(ndn_namespace::approver::list(&participant, None, || Ok(vec![cred])))
+            .block_on(ndn_namespace::approver::list(&participant, &[], || {
+                Ok(creds)
+            }))
             .map_err(|e| refused(e.reason))?;
         if let Some(note) = listing.notes.first()
             && listing.records.is_empty()
@@ -440,7 +444,7 @@ impl IdentityCore {
     }
 
     /// Approve (`reason` `None`) or deny the pending request `target` (its
-    /// id or verification code) as the loaded admin identity.
+    /// id or verification code) as the app's admin identity of its namespace.
     pub(crate) fn decide_request(
         &self,
         engine: &ndn_app::ForwarderEngine,
@@ -448,16 +452,17 @@ impl IdentityCore {
         decision: Decision,
         issuers: Vec<Vec<u8>>,
     ) -> Result<NdnPendingApproval, NdnError> {
-        let (participant, cred) = self.admin_credential(engine, issuers)?;
-        let operator = cred.key.to_string();
+        let (participant, creds) = self.admin_credentials(engine, issuers)?;
+        // Names the decider of a local CA's request only; the app runs none.
+        let operator = "this app";
         self.rt
             .block_on(ndn_namespace::approver::decide(
                 &participant,
-                None,
-                || Ok(vec![cred]),
+                &[],
+                || Ok(creds),
                 &target,
                 decision,
-                &operator,
+                operator,
             ))
             .map(|r| pending_approval(&r))
             .map_err(|e| refused(e.reason))

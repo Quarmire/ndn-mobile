@@ -4,7 +4,7 @@
 
 use boltffi::export;
 
-use crate::types::NdnSample;
+use crate::types::{NdnMembershipEvent, NdnSample};
 
 /// Answers Interests under a served prefix. Return `Some(payload)` to satisfy
 /// the Interest with a Data packet, or `None` to drop it.
@@ -17,6 +17,13 @@ pub trait NdnInterestHandler: Send + Sync {
 #[export]
 pub trait NdnSampleHandler: Send + Sync {
     fn on_sample(&self, sample: NdnSample);
+}
+
+/// Receives the app's membership changes
+/// ([`NdnEngine::watch_memberships`](crate::NdnEngine::watch_memberships)).
+#[export]
+pub trait NdnMembershipHandler: Send + Sync {
+    fn on_membership(&self, event: NdnMembershipEvent);
 }
 
 /// Supplies the out-of-band PIN during NDNCERT enrollment

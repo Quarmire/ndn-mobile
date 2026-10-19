@@ -103,16 +103,16 @@ pub use codec::{NdnCodec, NdntsReassembler};
 pub use engine::NdnEngine;
 pub use trust::NdnTrust;
 pub use handlers::{
-    NdnApprovalGate, NdnEnclaveBackend, NdnInterestHandler, NdnPinHandler, NdnRecoverySigner,
-    NdnSampleHandler,
+    NdnApprovalGate, NdnEnclaveBackend, NdnInterestHandler, NdnMembershipHandler, NdnPinHandler,
+    NdnRecoverySigner, NdnSampleHandler,
 };
 pub use types::{
     NdnActionClass, NdnApprovalOutcome, NdnCertValidity, NdnContext, NdnContextRefresh, NdnData,
     NdnDelegationScope, NdnEngineConfig, NdnEnrollConfig, NdnEnrolledIdentity,
-    NdnEnrollmentRequest, NdnError, NdnFaceSpec, NdnLinkMode, NdnLinkReport, NdnLinkStatus,
-    NdnLinksConfig, NdnPathStatus, NdnPendingApproval, NdnRecoveredIdentity, NdnRelay,
-    NdnRelaySource, NdnRelayStatus, NdnRenewal, NdnRevocation, NdnSample, NdnSecurityProfile,
-    NdnTrustEnvelope,
+    NdnEnrollmentRequest, NdnError, NdnFaceSpec, NdnIdentity, NdnLinkMode, NdnLinkReport,
+    NdnLinkStatus, NdnLinksConfig, NdnMembership, NdnMembershipEvent, NdnPathStatus,
+    NdnPendingApproval, NdnRecoveredIdentity, NdnRelay, NdnRelaySource, NdnRelayStatus,
+    NdnRenewal, NdnRevocation, NdnSample, NdnSecurityProfile, NdnTrustEnvelope,
 };
 pub use ble::NdnBleBackend;
 pub use wifi_aware::NdnNanBackend;

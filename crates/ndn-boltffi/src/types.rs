@@ -58,8 +58,9 @@ pub struct NdnEnrollConfig {
     pub persist_password: Vec<u8>,
 }
 
-/// The result of a successful enrollment. The identity is also loaded into the
-/// engine (so `sign` works); `safebag` is the encrypted bag the host persists.
+/// The result of a successful enrollment. The identity is added to the
+/// identities the app signs as (so `sign` works for names under it) beside
+/// the others; `safebag` is the encrypted bag the host persists.
 #[data]
 #[derive(Debug, Clone)]
 pub struct NdnEnrolledIdentity {
@@ -84,12 +85,19 @@ pub struct NdnEnrolledIdentity {
     /// generated or enclave identity: those paths do not check the chain
     /// against a trust context, so they have no verified chain to keep.
     pub issuers: Vec<Vec<u8>>,
+    /// Whether this identity is the node identity: the one the app signs
+    /// its own traffic as (principal operations, RemoteSigner responses,
+    /// management commands, its link key) — the first identity the app
+    /// held, unless it chose another (`set_node_identity`). Persist which
+    /// identity it is and choose it again at launch after loading the
+    /// identities (or load its SafeBag first).
+    pub node_identity: bool,
 }
 
-/// The validity of the loaded identity's certificate, so the host can
-/// schedule its renewal with `renew_certificate` (before `renew_at_secs`,
-/// and well before `valid_until_secs`: an expired certificate is never
-/// renewed — the device then needs a new invite).
+/// The validity of an identity's certificate, so the host can schedule its
+/// renewal with `renew_certificate` (before `renew_at_secs`, and well before
+/// `valid_until_secs`: an expired certificate is never renewed — the device
+/// then needs a new invite).
 #[data]
 #[derive(Debug, Clone)]
 pub struct NdnCertValidity {
@@ -360,6 +368,113 @@ pub struct NdnRevocation {
     pub reason: String,
     pub revoked_at_ms: u64,
     pub self_revocation: bool,
+}
+
+/// One identity the app signs as
+/// ([`NdnEngine::identities`](crate::NdnEngine::identities)): a packet whose
+/// name is under a trusted prefix is signed by the app's identity in that
+/// prefix; one under no held prefix by the identity whose name is the
+/// longest prefix of it.
+#[data]
+#[derive(Debug, Clone)]
+pub struct NdnIdentity {
+    /// The identity, e.g. `/home/bob/member/phone`.
+    pub identity: String,
+    /// The key it signs with.
+    pub key_name: String,
+    /// The trusted prefix (namespace) whose trust context covers it; empty
+    /// when no held trust context does (a self-issued identity).
+    pub namespace: String,
+    /// Its current certificate (Data wire); `None` when none of its key is
+    /// held.
+    pub certificate: Option<Vec<u8>>,
+    /// That certificate's validity and when to renew it.
+    pub validity: Option<NdnCertValidity>,
+    /// Whether it is the node identity (see
+    /// [`NdnEnrolledIdentity::node_identity`]).
+    pub node_identity: bool,
+}
+
+/// How the app takes part in one trusted prefix it holds
+/// ([`NdnEngine::memberships`](crate::NdnEngine::memberships)), as a
+/// forwarder reports it (`security/memberships`).
+#[data]
+#[derive(Debug, Clone)]
+pub struct NdnMembership {
+    /// The trusted prefix (namespace).
+    pub namespace: String,
+    /// The version of its trust context held.
+    pub version: u64,
+    /// `following` (its trust context is adopted: the app verifies its Data
+    /// and cannot publish under it), `member` (the app holds a currently
+    /// valid, unrevoked certificate in it and publishes under it) or `owner`
+    /// (the device holds its root key; never an app).
+    pub relation: String,
+    /// The app's role there (`admin`, `member`, `node`, `guest`); empty when
+    /// it holds no certificate there.
+    pub role: String,
+    /// The identity the app signs the prefix's Data as; empty when none.
+    pub identity: String,
+    /// That identity's key; empty when none.
+    pub key_name: String,
+    /// The key's certificate validity end, ISO 8601 (UTC); empty when none.
+    pub valid_until: String,
+    /// Whether `identity` is the node identity.
+    pub node_identity: bool,
+    /// Hex of the SHA-256 fingerprint of the prefix's root: what its anchor
+    /// link names as the expected fingerprint.
+    pub root_fingerprint: String,
+}
+
+impl NdnMembership {
+    pub(crate) fn from_info(info: ndn_cert::report::MembershipInfo) -> Self {
+        Self {
+            namespace: info.namespace,
+            version: info.version,
+            relation: info.relation.as_str().to_string(),
+            role: info.role,
+            identity: info.identity,
+            key_name: info.key,
+            valid_until: info.valid_until,
+            node_identity: info.node_identity,
+            root_fingerprint: info.root_fingerprint,
+        }
+    }
+}
+
+/// A change of the app's membership in one trusted prefix
+/// ([`NdnEngine::watch_memberships`](crate::NdnEngine::watch_memberships)).
+#[data]
+#[derive(Debug, Clone)]
+pub struct NdnMembershipEvent {
+    pub namespace: String,
+    /// The app's relation to it after the change (as
+    /// [`NdnMembership::relation`]).
+    pub relation: String,
+    /// What changed: `adopted`, `enrolled`, `renewed`, `revoked` or
+    /// `root-changed` (a recovery replaced the prefix's root).
+    pub change: String,
+    /// What changed, in words.
+    pub detail: String,
+}
+
+impl NdnMembershipEvent {
+    pub(crate) fn from_event(event: ndn_cert::report::MembershipEvent) -> Self {
+        use ndn_cert::report::MembershipChange;
+        Self {
+            namespace: event.namespace,
+            relation: event.relation.as_str().to_string(),
+            change: match event.change {
+                MembershipChange::Adopted => "adopted",
+                MembershipChange::Enrolled => "enrolled",
+                MembershipChange::Renewed => "renewed",
+                MembershipChange::Revoked => "revoked",
+                MembershipChange::RootChanged => "root-changed",
+            }
+            .to_string(),
+            detail: event.detail,
+        }
+    }
 }
 
 /// The scope a §3 device delegation grants
@@ -708,6 +823,17 @@ pub enum NdnError {
     InvalidAddress { addr: String },
     #[error("identity error: {msg}")]
     Identity { msg: String },
+    /// No identity the app holds may sign `name`. `follows` is the trusted
+    /// prefix covering `name` that the app only follows (it verifies that
+    /// prefix's Data; enroll in it to publish under it); `None` when no
+    /// identity of the app covers `name` at all. `why` says which and what
+    /// to do. Never answered with another prefix's key.
+    #[error("cannot sign {name}: {why}")]
+    NoSigningIdentity {
+        name: String,
+        follows: Option<String>,
+        why: String,
+    },
     /// An enrollment that produced no certificate. When it adopted the
     /// namespace's trust context on the way, that context stays adopted (it
     /// passed the fingerprint check by itself): persist `adopted_context`
@@ -748,6 +874,9 @@ impl NdnError {
             AppError::Unsupported(why) => NdnError::Engine {
                 msg: format!("unsupported: {why}"),
             },
+            // A producer refused to sign `name`; its text says why and what
+            // to do.
+            AppError::Signing(e) => NdnError::Identity { msg: e.to_string() },
         }
     }
 
