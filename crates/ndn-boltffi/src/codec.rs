@@ -164,6 +164,16 @@ fn tlv_packet_end(buf: &[u8]) -> Option<usize> {
     (buf.len() >= total).then_some(total)
 }
 
+/// Overwrites the Nonce TLV (`0x0A`, length 4) inside an encoded Interest.
+fn patch_nonce(buf: &mut [u8], nonce: u32) {
+    for i in 0..buf.len().saturating_sub(5) {
+        if buf[i] == 0x0A && buf[i + 1] == 0x04 {
+            buf[i + 2..i + 6].copy_from_slice(&nonce.to_be_bytes());
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,15 +218,5 @@ mod tests {
         // Round-trips back as a decodable Interest with our nonce patched in.
         let interest = ndn_packet::Interest::decode(Bytes::from(wire)).unwrap();
         assert_eq!(interest.name.to_string(), "/ndn/ble/test");
-    }
-}
-
-/// Overwrites the Nonce TLV (`0x0A`, length 4) inside an encoded Interest.
-fn patch_nonce(buf: &mut [u8], nonce: u32) {
-    for i in 0..buf.len().saturating_sub(5) {
-        if buf[i] == 0x0A && buf[i + 1] == 0x04 {
-            buf[i + 2..i + 6].copy_from_slice(&nonce.to_be_bytes());
-            return;
-        }
     }
 }

@@ -84,8 +84,10 @@ async fn build_engine() -> ForwarderEngine {
 /// object-larger-than-CS case the demand-paced relay must survive.
 async fn build_engine_cs(cs_bytes: usize) -> ForwarderEngine {
     let validator = Arc::new(Validator::new(TrustSchema::accept_all()));
-    let mut config = EngineConfig::default();
-    config.cs_capacity_bytes = cs_bytes;
+    let config = EngineConfig {
+        cs_capacity_bytes: cs_bytes,
+        ..EngineConfig::default()
+    };
     let (engine, shutdown) = EngineBuilder::new(config)
         .validator(validator)
         .build()

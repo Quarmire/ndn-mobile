@@ -29,8 +29,8 @@ use std::os::fd::IntoRawFd;
 use std::sync::Arc;
 
 use ndn_boltffi::{
-    NdnEngine, NdnEngineConfig, NdnLinkMode, NdnLinkReport, NdnLinksConfig, NdnRelay, NdnRelaySource,
-    NdnSecurityProfile,
+    NdnEngine, NdnEngineConfig, NdnLinkMode, NdnLinkReport, NdnLinksConfig, NdnRelay,
+    NdnRelaySource, NdnSecurityProfile,
 };
 
 const PASSWORD: &[u8] = b"phone-host";
@@ -60,12 +60,14 @@ fn opt(word: &str) -> Option<String> {
 }
 
 fn hex(text: &str) -> Result<Vec<u8>, String> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return Err(format!("{text:?} is not hex"));
     }
     (0..text.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).map_err(|_| format!("{text:?} is not hex")))
+        .map(|i| {
+            u8::from_str_radix(&text[i..i + 2], 16).map_err(|_| format!("{text:?} is not hex"))
+        })
         .collect()
 }
 
@@ -87,7 +89,10 @@ fn status_lines(r: &NdnLinkReport) -> Vec<String> {
         lines.push(format!("link {}", l.label));
         lines.push(format!("  key {}", or_dash(&l.key)));
         lines.push(format!("  device {}", or_dash(&l.device)));
-        lines.push(format!("  mode {}", l.mode.as_ref().map_or_else(|| "-".to_owned(), mode_word)));
+        lines.push(format!(
+            "  mode {}",
+            l.mode.as_ref().map_or_else(|| "-".to_owned(), mode_word)
+        ));
         if let Some(down) = &l.down {
             lines.push(format!("  down {down}"));
         }
@@ -115,7 +120,10 @@ fn status_lines(r: &NdnLinkReport) -> Vec<String> {
             .direct_retry_secs
             .map(|s| format!(" retry-in-s={s}"))
             .unwrap_or_default();
-        lines.push(format!("  direct {}{retry} {}", l.direct_state, l.direct_text));
+        lines.push(format!(
+            "  direct {}{retry} {}",
+            l.direct_state, l.direct_text
+        ));
     }
     lines
 }
@@ -125,7 +133,9 @@ fn run(engine: &Arc<NdnEngine>, line: &str) -> Result<Vec<String>, String> {
     let e = |r: ndn_boltffi::NdnError| r.to_string();
     match words.as_slice() {
         ["generate", identity] => {
-            let id = engine.generate_identity((*identity).to_owned(), PASSWORD.to_vec()).map_err(e)?;
+            let id = engine
+                .generate_identity((*identity).to_owned(), PASSWORD.to_vec())
+                .map_err(e)?;
             Ok(vec![id.key_name])
         }
         ["links", bind, rest @ ..] => {
@@ -171,10 +181,17 @@ fn run(engine: &Arc<NdnEngine>, line: &str) -> Result<Vec<String>, String> {
             engine.add_relay(relay).map_err(e)?;
             Ok(Vec::new())
         }
-        ["unrelay", label] => engine.remove_relay((*label).to_owned()).map(|_| Vec::new()).map_err(e),
+        ["unrelay", label] => engine
+            .remove_relay((*label).to_owned())
+            .map(|_| Vec::new())
+            .map_err(e),
         ["enroll", invite, device] => {
             let id = engine
-                .enroll_with_invite((*invite).to_owned(), (*device).to_owned(), PASSWORD.to_vec())
+                .enroll_with_invite(
+                    (*invite).to_owned(),
+                    (*device).to_owned(),
+                    PASSWORD.to_vec(),
+                )
                 .map_err(e)?;
             Ok(vec![id.cert_name])
         }
@@ -182,15 +199,32 @@ fn run(engine: &Arc<NdnEngine>, line: &str) -> Result<Vec<String>, String> {
             .set_link_mode((*label).to_owned(), mode(link_mode)?)
             .map(|_| Vec::new())
             .map_err(e),
-        ["connect", label] => engine.connect_link((*label).to_owned()).map(|_| Vec::new()).map_err(e),
-        ["disconnect", label] => engine.disconnect_link((*label).to_owned()).map(|_| Vec::new()).map_err(e),
+        ["connect", label] => engine
+            .connect_link((*label).to_owned())
+            .map(|_| Vec::new())
+            .map_err(e),
+        ["disconnect", label] => engine
+            .disconnect_link((*label).to_owned())
+            .map(|_| Vec::new())
+            .map_err(e),
         ["active", active] => {
-            engine.set_app_active(active.parse().map_err(|_| format!("{active:?}: true or false"))?);
+            engine.set_app_active(
+                active
+                    .parse()
+                    .map_err(|_| format!("{active:?}: true or false"))?,
+            );
             Ok(Vec::new())
         }
         ["wake", label, token] => {
-            let token = if *token == "-" { None } else { Some(hex(token)?) };
-            engine.set_wake_token((*label).to_owned(), token).map(|_| Vec::new()).map_err(e)
+            let token = if *token == "-" {
+                None
+            } else {
+                Some(hex(token)?)
+            };
+            engine
+                .set_wake_token((*label).to_owned(), token)
+                .map(|_| Vec::new())
+                .map_err(e)
         }
         ["net"] => engine.network_changed(None).map(|_| Vec::new()).map_err(e),
         ["net", bind] => engine
@@ -200,7 +234,11 @@ fn run(engine: &Arc<NdnEngine>, line: &str) -> Result<Vec<String>, String> {
         ["status"] => engine.link_status().map(|r| status_lines(&r)).map_err(e),
         ["publish", name, text @ ..] => {
             // Serves until the engine stops: a worker thread, as an app would.
-            let (engine, name, content) = (Arc::clone(engine), (*name).to_owned(), text.join(" ").into_bytes());
+            let (engine, name, content) = (
+                Arc::clone(engine),
+                (*name).to_owned(),
+                text.join(" ").into_bytes(),
+            );
             std::thread::spawn(move || {
                 if let Err(why) = engine.publish_object(name.clone(), content, 0) {
                     eprintln!("phone-host: publishing {name} ended: {why}");
