@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_app::{Consumer, DemuxConnection};
-use ndn_security::custodian::{WireSignRequest, WireSignResponse};
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Interest, Name, SignatureType};
+use ndn_security::custodian::{WireSignRequest, WireSignResponse};
 use ndn_security::{Signer, TrustError};
 
 type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
@@ -144,7 +144,9 @@ impl Signer for RemoteSignerClient {
                 }
                 Ok(WireSignResponse::Denied { .. }) => {
                     tracing::warn!(target: "ndn_boltffi::remote_signer", req_id, "remote sign denied");
-                    Err(TrustError::KeyStore("remote signer denied the request".into()))
+                    Err(TrustError::KeyStore(
+                        "remote signer denied the request".into(),
+                    ))
                 }
                 Err(e) => Err(TrustError::KeyStore(format!(
                     "remote signer: undecodable reply: {e:?}"

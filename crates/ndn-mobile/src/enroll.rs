@@ -303,7 +303,9 @@ impl MobileEngine {
 
         // The KeyLocator names the key; verifiers resolve it to the newest
         // valid certificate (this one, or a renewed one later).
-        let exportable = ecdsa.to_pkcs8_der().map_err(|e| EnrollError::Key(e.to_string()))?;
+        let exportable = ecdsa
+            .to_pkcs8_der()
+            .map_err(|e| EnrollError::Key(e.to_string()))?;
         Ok(EnrolledIdentity {
             signer: ecdsa,
             key_name,
@@ -336,7 +338,9 @@ impl MobileEngine {
         let (cert_name, certificate) = self.run_ndncert_token(&cfg, &signer, &token).await?;
 
         // The KeyLocator names the key (as enroll_pin).
-        let exportable = ecdsa.to_pkcs8_der().map_err(|e| EnrollError::Key(e.to_string()))?;
+        let exportable = ecdsa
+            .to_pkcs8_der()
+            .map_err(|e| EnrollError::Key(e.to_string()))?;
         Ok(EnrolledIdentity {
             signer: ecdsa,
             key_name,
@@ -364,7 +368,8 @@ impl MobileEngine {
         // the object-fetch throughput ceiling once the link is fast. The cert
         // path is algorithm-generic (`Signer::public_key` returns SPKI for both).
         let key = Arc::new(
-            Ed25519Signer::generate(key_name.clone()).map_err(|e| EnrollError::Key(e.to_string()))?,
+            Ed25519Signer::generate(key_name.clone())
+                .map_err(|e| EnrollError::Key(e.to_string()))?,
         );
         let pubkey = key
             .public_key()
@@ -377,16 +382,16 @@ impl MobileEngine {
         let until_ns = now_ns.saturating_add(validity_secs.saturating_mul(1_000_000_000));
         // A self-signed certificate `<key>/self/<version>` (NDN Certificate
         // Format v2); the KeyLocator names the key, which resolves to it.
-        let cert_name = ndn_security::cert_name::new_cert_name(
-            &key_name,
-            ndn_security::cert_name::SELF_ISSUER,
-        );
+        let cert_name =
+            ndn_security::cert_name::new_cert_name(&key_name, ndn_security::cert_name::SELF_ISSUER);
         let cert_wire =
             ndn_security::encode_cert_data(&cert_name, &pubkey, key.as_ref(), now_ns, until_ns)
                 .await
                 .map_err(|e| EnrollError::Cert(e.to_string()))?;
 
-        let pkcs8 = key.to_pkcs8_der().map_err(|e| EnrollError::Key(e.to_string()))?;
+        let pkcs8 = key
+            .to_pkcs8_der()
+            .map_err(|e| EnrollError::Key(e.to_string()))?;
         Ok(EnrolledIdentity {
             signer: key,
             key_name,
@@ -433,10 +438,13 @@ pub async fn enroll_token_conn(
     let signer: Arc<dyn Signer> = ecdsa.clone();
 
     let mut consumer = Consumer::new(conn);
-    let (cert_name, certificate) = run_ndncert_token_on(&mut consumer, &cfg, &signer, &token).await?;
+    let (cert_name, certificate) =
+        run_ndncert_token_on(&mut consumer, &cfg, &signer, &token).await?;
 
     // The KeyLocator names the key (as enroll_token).
-    let exportable = ecdsa.to_pkcs8_der().map_err(|e| EnrollError::Key(e.to_string()))?;
+    let exportable = ecdsa
+        .to_pkcs8_der()
+        .map_err(|e| EnrollError::Key(e.to_string()))?;
     Ok(EnrolledIdentity {
         signer: ecdsa,
         key_name,
@@ -469,7 +477,8 @@ pub async fn enroll_token_custodian_conn(
     ));
 
     let mut consumer = Consumer::new(conn);
-    let (cert_name, certificate) = run_ndncert_token_on(&mut consumer, &cfg, &signer, &token).await?;
+    let (cert_name, certificate) =
+        run_ndncert_token_on(&mut consumer, &cfg, &signer, &token).await?;
 
     Ok(EnrolledIdentity {
         signer,
@@ -577,7 +586,11 @@ impl MobileEngine {
         run_ndncert_on(&mut consumer, cfg, signer, "pin", |round| {
             // Round 0 is the trigger (select "pin", no code yet); round 1
             // submits the code; anything further is incomplete.
-            let cb = if round.round == 1 { pin_cb.take() } else { None };
+            let cb = if round.round == 1 {
+                pin_cb.take()
+            } else {
+                None
+            };
             async move {
                 match (round.round, cb) {
                     (0, _) => Ok(Some(serde_json::Map::new())),
@@ -607,8 +620,8 @@ impl MobileEngine {
         password: &[u8],
         key_name: impl Into<Name>,
     ) -> Result<Arc<dyn Signer>, EnrollError> {
-        use ndn_security::safebag::SafeBagAlgorithm;
         use ndn_security::Ed25519Signer;
+        use ndn_security::safebag::SafeBagAlgorithm;
 
         let key_name = key_name.into();
         let pkcs8 = bag

@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 
 use ndn_app::demux::ServeGuard;
 use ndn_app::{Connection, DemuxConnection};
-use ndn_packet::encode::DataBuilder;
 use ndn_packet::Name;
+use ndn_packet::encode::DataBuilder;
 use std::sync::Arc;
 
 /// The dataset name a leaf fetches to read the nearby-peer list.

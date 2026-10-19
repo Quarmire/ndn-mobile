@@ -39,7 +39,10 @@ async fn test_in_process_roundtrip() {
             .ok();
     });
 
-    let data = consumer.fetch(ndn_packet::name!("/test/data")).await.expect("fetch failed");
+    let data = consumer
+        .fetch(ndn_packet::name!("/test/data"))
+        .await
+        .expect("fetch failed");
     assert_eq!(
         data.content().map(|b| b.as_ref()),
         Some(b"hello ndn".as_ref())

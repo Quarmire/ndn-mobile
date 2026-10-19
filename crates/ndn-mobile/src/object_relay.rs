@@ -165,8 +165,9 @@ pub fn spawn_object_relay(
                 let demand = demand.clone();
                 let refetch = refetch.clone();
                 async move {
-                    if let Ok(Some(wire)) =
-                        meta.answer_interest(&interest.name, Some(signer.as_ref())).await
+                    if let Ok(Some(wire)) = meta
+                        .answer_interest(&interest.name, Some(signer.as_ref()))
+                        .await
                     {
                         // Metadata discovery.
                         responder.respond_bytes(wire).await.ok();
@@ -206,7 +207,12 @@ pub fn spawn_object_relay(
 
 /// One-shot pull of a single evicted segment from the leaf, re-signed under the
 /// public name and served to the pending Interest (and re-cached).
-async fn backward_refetch(refetch: Refetch, source_versioned: Name, seg: u64, responder: Responder) {
+async fn backward_refetch(
+    refetch: Refetch,
+    source_versioned: Name,
+    seg: u64,
+    responder: Responder,
+) {
     let src_seg = source_versioned.append_segment(seg);
     let interest = InterestBuilder::new(src_seg)
         .lifetime(REFETCH_TIMEOUT)
@@ -285,7 +291,10 @@ async fn run_relay(inp: RelayInputs) {
         if cancel.is_cancelled() {
             return;
         }
-        let mut sub = match consumer.subscribe(source_prefix.clone(), opts.clone()).await {
+        let mut sub = match consumer
+            .subscribe(source_prefix.clone(), opts.clone())
+            .await
+        {
             Ok(s) => s,
             Err(_) => {
                 tokio::select! {
@@ -297,7 +306,8 @@ async fn run_relay(inp: RelayInputs) {
         loop {
             // Pace: don't read (so the leaf doesn't stream) more than `lookahead`
             // past the demand front. Pausing the read back-pressures the leaf.
-            while produced.load(Ordering::Relaxed) > demand.front.load(Ordering::Relaxed) + lookahead
+            while produced.load(Ordering::Relaxed)
+                > demand.front.load(Ordering::Relaxed) + lookahead
                 && produced.load(Ordering::Relaxed) <= last_seg
             {
                 tokio::select! {

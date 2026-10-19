@@ -50,19 +50,22 @@ pub(crate) fn init_platform_tracing() {
         INIT.call_once(|| {
             use tracing_subscriber::layer::SubscriberExt;
             use tracing_subscriber::util::SubscriberInitExt;
-            let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(
-                    "info,ndn_engine=debug,ndn_face=debug,ndn_mobile=debug,\
+            let filter =
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new(
+                        "info,ndn_engine=debug,ndn_face=debug,ndn_mobile=debug,\
                      ndn_face_wifi_aware=debug,ndn_mgmt=info,ndn_boltffi=debug,\
                      ndn_app::fetch=debug",
-                )
-            });
+                    )
+                });
             let _ = tracing_subscriber::registry()
                 .with(filter)
                 .with(
                     tracing_subscriber::fmt::layer()
                         .with_ansi(false)
-                        .with_writer(paranoid_android::AndroidLogMakeWriter::new("ndn".to_owned())),
+                        .with_writer(paranoid_android::AndroidLogMakeWriter::new(
+                            "ndn".to_owned(),
+                        )),
                 )
                 .try_init();
         });
@@ -75,9 +78,9 @@ mod discovery;
 pub mod engine;
 pub mod handlers;
 pub(crate) mod identity_core;
-pub(crate) mod offer;
 #[cfg(all(unix, feature = "identity"))]
 pub(crate) mod links;
+pub(crate) mod offer;
 #[cfg(feature = "identity")]
 pub(crate) mod remote_signer_client;
 pub mod trust;
@@ -91,28 +94,28 @@ pub mod wifi_aware;
 #[cfg(all(test, feature = "identity"))]
 mod approval_tests;
 
+pub use ble::NdnBleBackend;
 #[cfg(unix)]
 pub use client::NdnClient;
+pub use codec::{NdnCodec, NdntsReassembler};
 #[cfg(all(unix, feature = "dashboard"))]
 pub use dashboard::{
     NdnCsInfo, NdnDashboard, NdnDashboardState, NdnFaceInfo, NdnFibEntry, NdnForwarderStatus,
     NdnIdentityState, NdnMgmtResponse, NdnNextHop, NdnSecurityKey, NdnStrategyEntry,
     NdnTrustAnchor,
 };
-pub use codec::{NdnCodec, NdntsReassembler};
 pub use engine::NdnEngine;
-pub use trust::NdnTrust;
 pub use handlers::{
     NdnApprovalGate, NdnEnclaveBackend, NdnInterestHandler, NdnMembershipHandler, NdnPinHandler,
     NdnRecoverySigner, NdnSampleHandler,
 };
+pub use trust::NdnTrust;
 pub use types::{
     NdnActionClass, NdnApprovalOutcome, NdnCertValidity, NdnContext, NdnContextRefresh, NdnData,
     NdnDelegationScope, NdnEngineConfig, NdnEnrollConfig, NdnEnrolledIdentity,
     NdnEnrollmentRequest, NdnError, NdnFaceSpec, NdnIdentity, NdnLinkMode, NdnLinkReport,
     NdnLinkStatus, NdnLinksConfig, NdnMembership, NdnMembershipEvent, NdnPathStatus,
-    NdnPendingApproval, NdnRecoveredIdentity, NdnRelay, NdnRelaySource, NdnRelayStatus,
-    NdnRenewal, NdnRevocation, NdnSample, NdnSecurityProfile, NdnTrustEnvelope,
+    NdnPendingApproval, NdnRecoveredIdentity, NdnRelay, NdnRelaySource, NdnRelayStatus, NdnRenewal,
+    NdnRevocation, NdnSample, NdnSecurityProfile, NdnTrustEnvelope,
 };
-pub use ble::NdnBleBackend;
 pub use wifi_aware::NdnNanBackend;

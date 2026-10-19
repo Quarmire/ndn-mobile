@@ -15,10 +15,10 @@ use std::sync::{Arc, Mutex};
 
 use boltffi::{data, export};
 use ndn_config::ControlParameters;
+use ndn_dashboard_core::types::{AnchorInfo, SecurityKeyInfo};
 use ndn_dashboard_core::types::{
     CsInfo, FaceInfo, FibEntry, ForwarderStatus, NextHop, StrategyEntry,
 };
-use ndn_dashboard_core::types::{AnchorInfo, SecurityKeyInfo};
 use ndn_dashboard_core::{
     DashboardEngine, DashboardState, IdentityState, ManagementClient, MgmtResponse,
 };
@@ -570,7 +570,10 @@ mod tests {
 
         assert_eq!(vm.faces.len(), 1);
         assert_eq!(vm.faces[0].face_id, 256);
-        assert_eq!(vm.faces[0].remote_uri.as_deref(), Some("udp4://1.2.3.4:6363"));
+        assert_eq!(
+            vm.faces[0].remote_uri.as_deref(),
+            Some("udp4://1.2.3.4:6363")
+        );
         assert_eq!(vm.faces[0].mtu, Some(1500));
         assert_eq!(vm.faces[0].n_out_bytes, 200);
         assert_eq!(vm.faces[0].flags, 1);

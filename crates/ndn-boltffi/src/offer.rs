@@ -110,7 +110,11 @@ impl OfferBoard {
         // add/remove, keeping the last [`MANIFEST_HISTORY`] versions servable.
         let manifest = {
             let mut ring = VecDeque::with_capacity(MANIFEST_HISTORY);
-            ring.push_front(build_manifest(&manifest_name, &node_prefix, &BTreeMap::new()));
+            ring.push_front(build_manifest(
+                &manifest_name,
+                &node_prefix,
+                &BTreeMap::new(),
+            ));
             Arc::new(Mutex::new(ring))
         };
 
@@ -135,7 +139,8 @@ impl OfferBoard {
             let cert_guard = demux.serve_scoped(cert_name.clone(), move |interest, responder| {
                 let cert_object = Arc::clone(&cert_object);
                 async move {
-                    if let Ok(Some(wire)) = cert_object.answer_interest(&interest.name, None).await {
+                    if let Ok(Some(wire)) = cert_object.answer_interest(&interest.name, None).await
+                    {
                         responder.respond_bytes(wire).await.ok();
                     }
                 }
@@ -155,8 +160,9 @@ impl OfferBoard {
                         // names — so a fetch that began before a rebuild still
                         // completes from the kept history instead of getting `None`.
                         for m in &versions {
-                            if let Ok(Some(wire)) =
-                                m.answer_interest(&interest.name, Some(signer.as_ref())).await
+                            if let Ok(Some(wire)) = m
+                                .answer_interest(&interest.name, Some(signer.as_ref()))
+                                .await
                             {
                                 responder.respond_bytes(wire).await.ok();
                                 return;
@@ -232,7 +238,14 @@ impl OfferBoard {
             size,
             OFFER_CHUNK,
         ));
-        self.serve_prepared(file_id, display_name, mime, object_name, prepared, size as usize)
+        self.serve_prepared(
+            file_id,
+            display_name,
+            mime,
+            object_name,
+            prepared,
+            size as usize,
+        )
     }
 
     /// Shared tail of `add_offer` / `add_offer_file`: install the per-object
@@ -256,8 +269,9 @@ impl OfferBoard {
                     let prepared = Arc::clone(&prepared_for_serve);
                     let signer = Arc::clone(&signer);
                     async move {
-                        if let Ok(Some(wire)) =
-                            prepared.answer_interest(&interest.name, Some(signer.as_ref())).await
+                        if let Ok(Some(wire)) = prepared
+                            .answer_interest(&interest.name, Some(signer.as_ref()))
+                            .await
                         {
                             responder.respond_bytes(wire).await.ok();
                         }
@@ -345,7 +359,11 @@ impl OfferBoard {
     /// segment aged out of its window). Mirrors [`ndn_app::serve_object_stream`]
     /// but over `serve_scoped` (the leaf serves on the shared seam, so it must
     /// not drain the demux fallback that the consumer's fetches read).
-    fn serve_content_stream(&self, internal_name: Name, prepared: Arc<PreparedObject>) -> ServeGuard {
+    fn serve_content_stream(
+        &self,
+        internal_name: Name,
+        prepared: Arc<PreparedObject>,
+    ) -> ServeGuard {
         let budget = Arc::new(Semaphore::new(0));
         let last = prepared.last_seg;
 
