@@ -82,7 +82,9 @@ impl NdnClient {
         // IdentityCore wraps the seam in a DemuxConnection; share that one demux
         // for ALL of this client's I/O (fetch / get / serve) so there is a single
         // reader of the data plane. (ForwarderClient already demuxes mgmt below.)
-        let identity_core = IdentityCore::new(rt.clone(), conn as Arc<dyn Connection>);
+        // No forwarder in this process: the core keeps its own keyring.
+        let identity_core =
+            IdentityCore::new(rt.clone(), conn as Arc<dyn Connection>, Arc::default());
         Ok(Self {
             rt,
             consumer: Mutex::new(None),

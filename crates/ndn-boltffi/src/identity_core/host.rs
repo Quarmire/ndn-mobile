@@ -348,6 +348,8 @@ impl KeyVault for AppVault<'_> {
         let mut installed = self.installed.lock();
         if let Some(installed) = installed.as_mut() {
             installed.issuers = issuers.iter().map(|d| d.raw().to_vec()).collect();
+            // A link hello carries the chain too.
+            self.core.set_issuers(issuers.iter().map(|d| d.raw().clone()).collect());
             if self.is_request_key(&installed.key) {
                 ndn_cert::issuers::keep_issuer_certs(Path::new(&self.storage_dir), issuers)
                     .map_err(|e| e.to_string())?;
@@ -387,7 +389,7 @@ impl KeyVault for AppVault<'_> {
         {
             self.core.record_cert(&installed.cert);
         }
-        *self.core.identity.lock().unwrap() = Some(signer);
+        self.core.install_signer(signer);
         Activation {
             signing_now: true,
             at_next_start: Vec::new(),

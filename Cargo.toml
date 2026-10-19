@@ -31,6 +31,10 @@ ndn-face-websocket   = { path = "../ndn-ext/crates/faces/ndn-face-websocket" }
 ndn-face-webtransport = { path = "../ndn-ext/crates/faces/ndn-face-webtransport" }
 ndn-phy-ble           = { path = "../ndn-radio/crates/faces/ndn-phy-ble" }
 ndn-face-wifi-aware   = { path = "../ndn-ext/crates/faces/ndn-face-wifi-aware" }
+# QUIC links (the link protocol and its admission): the phone hosts links
+# to relays and direct paths with the same library ndn-fwd runs.
+ndn-face-quic         = { path = "../ndn-ext/crates/faces/ndn-face-quic" }
+ndn-link              = { path = "../ndn-ext/crates/faces/ndn-link" }
 ndn-strategy  = { path = "../ndn-rs/crates/forwarding/ndn-strategy" }
 ndn-security  = { path = "../ndn-rs/crates/security/ndn-security" }
 ndn-engine    = { path = "../ndn-rs/crates/forwarding/ndn-engine" }

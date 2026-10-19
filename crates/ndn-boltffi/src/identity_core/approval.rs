@@ -329,7 +329,7 @@ impl IdentityCore {
         let signer = ndn_security::EcdsaP256Signer::from_pkcs8_der(pkcs8, key_name.clone())
             .map_err(|e| refused(format!("device key: {e}")))?;
         self.record_cert(data.raw());
-        *self.identity.lock().unwrap() = Some(Arc::new(signer));
+        self.install_signer(Arc::new(signer));
         Ok(NdnApprovalOutcome::Issued {
             request: request_of(outgoing),
             identity: NdnEnrolledIdentity {

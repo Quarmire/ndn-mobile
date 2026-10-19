@@ -19,6 +19,16 @@
 //! [`NdnDashboard`](dashboard::NdnDashboard) — the operator console that polls a
 //! forwarder's management plane for faces / routes / CS / strategies / status.
 //!
+//! The engine also hosts this device's **QUIC links** (behind `identity`):
+//! `start_links` with the loaded identity, relays the user adds
+//! (`add_relay`) or the namespace's trust context lists, a mode per relay
+//! (`set_link_mode`: always, on-demand, off), the app's lifecycle
+//! (`set_app_active`), a wake token for the relay's notifier
+//! (`set_wake_token`), network changes (`network_changed`, with a socket
+//! the platform bound to the new network) and `link_status`. Admission,
+//! relay choice, held Interests and direct paths are `ndn_link`'s — the
+//! library the `ndn-fwd` daemon runs.
+//!
 //! Generate bindings with `boltffi generate <lang>`; package with
 //! `boltffi pack android|apple`.
 
@@ -66,6 +76,8 @@ pub mod engine;
 pub mod handlers;
 pub(crate) mod identity_core;
 pub(crate) mod offer;
+#[cfg(all(unix, feature = "identity"))]
+pub(crate) mod links;
 #[cfg(feature = "identity")]
 pub(crate) mod remote_signer_client;
 pub mod trust;
@@ -97,8 +109,10 @@ pub use handlers::{
 pub use types::{
     NdnActionClass, NdnApprovalOutcome, NdnCertValidity, NdnContext, NdnContextRefresh, NdnData,
     NdnDelegationScope, NdnEngineConfig, NdnEnrollConfig, NdnEnrolledIdentity,
-    NdnEnrollmentRequest, NdnError, NdnFaceSpec, NdnPendingApproval, NdnRecoveredIdentity,
-    NdnRenewal, NdnRevocation, NdnSample, NdnSecurityProfile, NdnTrustEnvelope,
+    NdnEnrollmentRequest, NdnError, NdnFaceSpec, NdnLinkMode, NdnLinkReport, NdnLinkStatus,
+    NdnLinksConfig, NdnPathStatus, NdnPendingApproval, NdnRecoveredIdentity, NdnRelay,
+    NdnRelaySource, NdnRelayStatus, NdnRenewal, NdnRevocation, NdnSample, NdnSecurityProfile,
+    NdnTrustEnvelope,
 };
 pub use ble::NdnBleBackend;
 pub use wifi_aware::NdnNanBackend;

@@ -39,9 +39,10 @@ sqlite-cs = ["ndn-mobile/sqlite-cs"]
 ## (incl. management) to the engine over the socketpair seam. Native-only.
 management = ["ndn-mobile/management"]
 ## Operator identity + signing on the engine (`load_identity` / `sign`, NDNCERT
-## enrollment, and the RemoteSigner responder). Native-only — pulls
-## ndn-cert (not wasm-safe).
-identity = ["ndn-mobile/enroll", "ndn-security/custodian", "dep:ndn-identity", "dep:ndn-namespace", "dep:tokio-util", "dep:getrandom", "dep:async-trait", "dep:ndn-config", "dep:p256"]
+## enrollment, and the RemoteSigner responder), and the QUIC links this
+## device hosts with that identity (`start_links`, relays, direct paths).
+## Native-only — pulls ndn-cert and quinn (not wasm-safe).
+identity = ["ndn-mobile/enroll", "ndn-security/custodian", "dep:ndn-identity", "dep:ndn-namespace", "dep:tokio-util", "dep:getrandom", "dep:async-trait", "dep:ndn-config", "dep:p256", "dep:ndn-link", "dep:ndn-face-quic"]
 ## Operator console (`NdnDashboard`): poll a forwarder's management plane for
 ## faces / routes / CS / strategies / status. Native-only — pulls
 ## ndn-dashboard-core (not wasm-safe).
@@ -77,9 +78,13 @@ async-trait     = { workspace = true, optional = true }
 ndn-face-wifi-aware = { workspace = true, optional = true }
 # BLE advertising face (`ble` feature).
 ndn-phy-ble = { workspace = true, optional = true }
+# QUIC links (`identity`): the link endpoint, admission, relays, modes and
+# direct paths — the library ndn-fwd runs, on the engine's faces and RIB.
+ndn-face-quic   = { workspace = true, optional = true }
+ndn-link        = { workspace = true, optional = true, features = ["engine"] }
 # Remote backend (NdnClient): a bare client over a forwarder connection fd.
 ndn-ipc         = { workspace = true }
-tokio           = { workspace = true, features = ["rt-multi-thread"] }
+tokio           = { workspace = true, features = ["rt-multi-thread", "sync"] }
 bytes           = { workspace = true, features = ["std"] }
 thiserror       = { workspace = true }
 tracing         = { workspace = true }
@@ -103,6 +108,22 @@ tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 # The approval tests serve an in-process CA on an app engine
 # (`register_producer` ties its face to a token).
 tokio-util = { workspace = true }
+# The link tests run a relay and a desktop device in-process: an engine
+# with the same link library, as ndn-fwd runs it.
+ndn-engine    = { workspace = true }
+ndn-link      = { workspace = true, features = ["engine"] }
+ndn-face-quic = { workspace = true }
+tokio         = { workspace = true, features = ["full"] }
+
+# The app's link flow driven over stdin, for the end-to-end harness
+# (ndn-fwd/testbed/e2e, scenario phone-links).
+[[example]]
+name = "phone_host"
+required-features = ["identity"]
+
+[[test]]
+name = "phone_links"
+required-features = ["identity"]
 
 [build-dependencies]
 boltffi = "0.25"

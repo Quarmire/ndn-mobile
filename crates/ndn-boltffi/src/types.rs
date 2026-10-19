@@ -508,6 +508,170 @@ pub struct NdnEngineConfig {
     pub persistent_cs_path: Option<String>,
 }
 
+/// When a link to a relay is up — the user's choice per relay, with its
+/// battery and data cost: `Always` keeps the link and its keep-alives
+/// (reachable at once; the radio wakes for every keep-alive), `OnDemand`
+/// links while the app is active or when there is something to send and
+/// closes after `idle_secs` without traffic (reachable only while linked,
+/// unless the relay holds Interests or wakes the app), `Off` links only
+/// when the app asks ([`NdnEngine::connect_link`](crate::NdnEngine::connect_link)).
+#[data]
+#[derive(Debug, Clone)]
+pub enum NdnLinkMode {
+    Always,
+    OnDemand { idle_secs: u32 },
+    Off,
+}
+
+/// Where a relay this device uses comes from.
+#[data]
+#[derive(Debug, Clone)]
+pub enum NdnRelaySource {
+    /// The user added it ([`NdnEngine::add_relay`](crate::NdnEngine::add_relay)).
+    User,
+    /// The signed trust context of `namespace` lists it: every member uses
+    /// it without configuring anything.
+    Namespace { namespace: String },
+}
+
+/// A relay the user adds: their own server, a community relay or a hosted
+/// service. It is identified by its key, never by an address.
+#[data]
+#[derive(Debug, Clone)]
+pub struct NdnRelay {
+    /// How status and errors name it; unique among this device's relays.
+    pub label: String,
+    /// The expected fingerprint of the relay's key (64 hex digits). Needed
+    /// for a relay of another namespace; the link fails unless the relay
+    /// presents exactly this key.
+    pub key: Option<String>,
+    /// The relay's device name (`/<namespace>/<role>/<device>`), for a relay
+    /// of a namespace this device holds: it must prove to be that device.
+    pub device: Option<String>,
+    /// `host:port` endpoints, tried in order.
+    pub endpoints: Vec<String>,
+    /// Lower is preferred; the most preferred reachable relays are used
+    /// (`NdnLinksConfig.relay_count` of them) and the next takes over when
+    /// one is lost.
+    pub preference: u32,
+    pub mode: NdnLinkMode,
+    /// Ask the relay to hold Interests for this device while it is not
+    /// linked (up to their lifetime), delivered when it links again.
+    pub hold: bool,
+    /// The prefixes routed over the relay's link; empty = the default (its
+    /// namespace, for a relay of this device's namespace; its device name
+    /// otherwise). `/` sends everything this device does not reach
+    /// otherwise through the relay.
+    pub routes: Vec<String>,
+}
+
+/// How this device hosts QUIC links
+/// ([`NdnEngine::start_links`](crate::NdnEngine::start_links)).
+#[data]
+#[derive(Debug, Clone)]
+pub struct NdnLinksConfig {
+    /// A UDP socket the platform made and bound to the network to use
+    /// (Android `Network.bindSocket`, iOS a socket on the chosen
+    /// interface); the engine takes ownership. `None`: the engine binds
+    /// `bind` itself.
+    pub socket_fd: Option<i32>,
+    /// The address to bind when no `socket_fd` is given (default
+    /// `0.0.0.0:0`, a port the system picks).
+    pub bind: Option<String>,
+    /// Accept links other devices dial to this one. A phone usually dials
+    /// only; direct paths of its punches are accepted either way.
+    pub listen: bool,
+    /// How many relays to keep linked at once (at least 1).
+    pub relay_count: u32,
+    /// Use the relays the trust contexts of this device's namespaces list.
+    pub use_namespace_relays: bool,
+    /// The mode of those relays' links.
+    pub namespace_relay_mode: NdnLinkMode,
+    /// Ask those relays to hold Interests while this device is not linked.
+    pub namespace_relay_hold: bool,
+    /// The issuer certificates (Data wires, nearest first) of this device's
+    /// certificate, as persisted from its enrollment or renewal
+    /// (`NdnEnrolledIdentity.issuers`); a link hello carries them.
+    pub issuers: Vec<Vec<u8>>,
+    /// Seconds between keep-alives on a link (2–60; `None`: 10). Shorter
+    /// keeps NAT bindings and a lost link noticed sooner, at the cost of
+    /// waking the radio more often.
+    pub keep_alive_secs: Option<u32>,
+    /// Seconds without anything heard before a link counts as lost (at
+    /// least 3 × the keep-alive, at most 600; `None`: 30).
+    pub idle_timeout_secs: Option<u32>,
+}
+
+/// What reaches a device now.
+#[data]
+#[derive(Debug, Clone)]
+pub struct NdnPathStatus {
+    /// `link` (a dialled or accepted link), `direct` (a punched direct
+    /// path) or `relay` (through the relay named in `via`).
+    pub kind: String,
+    /// The address the connection reaches (for a relay path, the relay's).
+    pub remote: Option<String>,
+    pub rtt_ms: Option<u64>,
+    pub age_secs: u64,
+    pub via: Option<String>,
+}
+
+/// A relay's part in this device's links.
+#[data]
+#[derive(Debug, Clone)]
+pub struct NdnRelayStatus {
+    pub source: NdnRelaySource,
+    pub preference: u32,
+    /// `linked`, `trying`, `down` (not reachable now; `text` says why),
+    /// `standby` (more preferred relays are linked; it takes over when one
+    /// is lost) or `off`.
+    pub state: String,
+    /// For a person: why, and what to do if anything.
+    pub text: String,
+}
+
+/// One device this device links with, is configured to, or punched.
+#[data]
+#[derive(Debug, Clone)]
+pub struct NdnLinkStatus {
+    pub label: String,
+    /// Its key's fingerprint, once known.
+    pub key: Option<String>,
+    pub device: Option<String>,
+    /// Its link mode; `None` for a device that is not configured (one that
+    /// linked to this one, or a direct path by membership).
+    pub mode: Option<NdnLinkMode>,
+    /// Set for a relay.
+    pub relay: Option<NdnRelayStatus>,
+    /// The ways it is reached now; empty when it is not.
+    pub paths: Vec<NdnPathStatus>,
+    /// Why a configured relay or peer is not linked now, and what to do if
+    /// anything.
+    pub down: Option<String>,
+    /// Its direct path: `none`, `off`, `trying`, `up`, `not-possible`,
+    /// `refused`.
+    pub direct_state: String,
+    /// Why, and what to do if anything.
+    pub direct_text: String,
+    pub direct_retry_secs: Option<u64>,
+}
+
+/// This device's links ([`NdnEngine::link_status`](crate::NdnEngine::link_status)).
+#[data]
+#[derive(Debug, Clone)]
+pub struct NdnLinkReport {
+    /// The fingerprint of the key this device links with (what another
+    /// device names as its expected key); `None` with no usable key.
+    pub key: Option<String>,
+    /// The address of the link socket.
+    pub local_address: Option<String>,
+    /// Whether the app last said it is active.
+    pub active: bool,
+    pub probes_sent: u64,
+    pub punches_refused: u64,
+    pub links: Vec<NdnLinkStatus>,
+}
+
 #[data]
 #[derive(Debug, thiserror::Error)]
 pub enum NdnError {

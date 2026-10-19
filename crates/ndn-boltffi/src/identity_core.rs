@@ -44,8 +44,16 @@ pub(crate) struct IdentityCore {
     pub(crate) conn: Arc<dyn Connection>,
     pub(crate) demux: Arc<DemuxConnection>,
     /// The loaded operator identity (signs management commands / RemoteSigner
-    /// responses). Set by `load_identity`; used by `sign`.
+    /// responses). Set by `load_identity` and every other install, always
+    /// through [`Self::install_signer`]; used by `sign`.
     identity: Mutex<Option<Arc<dyn ndn_security::Signer>>>,
+    /// Bumped by [`Self::install_signer`]: the device now has another key, so
+    /// its links present it ([`ndn_link::Links::key_switched`]).
+    switches: tokio::sync::watch::Sender<u64>,
+    /// The issuer certificates (Data wires, nearest first) of the loaded
+    /// identity's certificate, as kept from its enrollment or renewal or
+    /// passed by the host: the rest of the chain a link hello carries.
+    issuers: parking_lot::Mutex<Vec<Bytes>>,
     /// The certificates of this core's identities, by key: the one each was
     /// installed with (CA-issued, renewed, or a self-issued identity's own
     /// self-certificate) and any fetched by key name that chains to an
@@ -72,8 +80,16 @@ pub(crate) struct IdentityCore {
 }
 
 impl IdentityCore {
-    /// Build a core over `conn` (the forwarder seam) sharing runtime `rt`.
-    pub(crate) fn new(rt: Arc<Runtime>, conn: Arc<dyn Connection>) -> Self {
+    /// Build a core over `conn` (the forwarder seam) sharing runtime `rt`,
+    /// adopting trust contexts into `keyring`: the embedded engine's
+    /// validator keyring, so the forwarder validates Data under an adopted
+    /// namespace against its context (as `ndn-fwd` does), or a keyring of
+    /// its own without an engine validator.
+    pub(crate) fn new(
+        rt: Arc<Runtime>,
+        conn: Arc<dyn Connection>,
+        keyring: Arc<ndn_security::Keyring>,
+    ) -> Self {
         // `DemuxConnection::new` spawns its recv loop with `tokio::spawn`, which
         // needs an entered runtime — `IdentityCore::new` is called from plain
         // (non-async) constructors, so enter `rt` for the spawn.
@@ -86,10 +102,12 @@ impl IdentityCore {
             conn: demux.clone(),
             demux,
             identity: Mutex::new(None),
+            switches: tokio::sync::watch::Sender::new(0),
+            issuers: parking_lot::Mutex::new(Vec::new()),
             certs: ndn_security::CertCache::new(),
             #[cfg(feature = "identity")]
             sign_policy: Mutex::new(ndn_security::custodian::ScopedSigningPolicy::new()),
-            keyring: Arc::new(ndn_security::Keyring::new()),
+            keyring,
             pinned_anchors: Mutex::new(Vec::new()),
         }
     }
@@ -421,7 +439,7 @@ impl IdentityCore {
                 if let Some(cert) = &identity.certificate {
                     self.record_cert(&Bytes::from(cert.clone()));
                 }
-                *self.identity.lock().unwrap() = Some(signer);
+                self.install_signer(signer);
                 Ok(NdnRenewal::Renewed { identity })
             }
             RenewalState::Refused => Ok(NdnRenewal::Refused { detail: info.detail }),
@@ -500,8 +518,8 @@ impl IdentityCore {
             &cert_wire,
         )
         .map_err(|e| NdnError::engine(format!("remote signer setup: {e}")))?;
-        *self.identity.lock().unwrap() = Some(Arc::new(signer));
         self.record_cert(&Bytes::from(cert_wire));
+        self.install_signer(Arc::new(signer));
         Ok(true)
     }
 
@@ -612,7 +630,7 @@ impl IdentityCore {
             // Retain the CA-issued cert (inside the bag) so we can serve it to a
             // gateway that fetches it reflexively during localhop registration.
             self.record_cert(&bag.certificate);
-            *self.identity.lock().unwrap() = Some(signer);
+            self.install_signer(signer);
             Ok(self.loaded_identity()?.did())
         }
         #[cfg(not(feature = "identity"))]
@@ -628,6 +646,50 @@ impl IdentityCore {
         self.identity.lock().unwrap().is_some()
     }
 
+    /// Make `signer` the loaded identity (after recording its certificate,
+    /// so a link presents it) and tell the device's links it switched keys.
+    fn install_signer(&self, signer: Arc<dyn ndn_security::Signer>) {
+        *self.identity.lock().unwrap() = Some(signer);
+        self.switches.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Ticks each time another identity is installed.
+    #[cfg(feature = "identity")]
+    pub(crate) fn identity_switches(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.switches.subscribe()
+    }
+
+    /// The adopted trust contexts links are admitted under.
+    #[cfg(feature = "identity")]
+    pub(crate) fn keyring(&self) -> &Arc<ndn_security::Keyring> {
+        &self.keyring
+    }
+
+    /// Keep `issuers` (Data wires, nearest first) as the loaded identity's
+    /// issuer chain.
+    #[cfg(feature = "identity")]
+    pub(crate) fn set_issuers(&self, issuers: Vec<Bytes>) {
+        *self.issuers.lock() = issuers;
+    }
+
+    /// The loaded identity's certificate among those recorded, then its
+    /// issuers — never fetched (links ask for it inside a handshake).
+    #[cfg(feature = "identity")]
+    pub(crate) fn own_chain(&self) -> Vec<Bytes> {
+        let Some(leaf) = self.current_cert().and_then(|c| c.data_wire()) else {
+            return Vec::new();
+        };
+        let mut chain = vec![leaf];
+        chain.extend(self.issuers.lock().iter().cloned());
+        chain
+    }
+
+    /// A certificate of this core's identities, by certificate or key name.
+    #[cfg(feature = "identity")]
+    pub(crate) fn recorded_certificate(&self, name: &Name) -> Option<ndn_security::Certificate> {
+        self.certs.get_valid(name)
+    }
+
     /// Install a signer as the loaded operator identity with its
     /// certificate, if one was issued — used by `NdnEngine`'s engine-bound
     /// enroll variants (the PIN challenge) that produce a signer through the
@@ -641,7 +703,7 @@ impl IdentityCore {
         if let Some(wire) = certificate {
             self.record_cert(wire);
         }
-        *self.identity.lock().unwrap() = Some(signer);
+        self.install_signer(signer);
     }
 
     pub(crate) fn sign(&self, region: Vec<u8>) -> Result<Vec<u8>, NdnError> {
@@ -700,7 +762,7 @@ impl IdentityCore {
             if let Some(wire) = enrolled.certificate() {
                 self.record_cert(wire);
             }
-            *self.identity.lock().unwrap() = Some(enrolled.signer());
+            self.install_signer(enrolled.signer());
             Ok(result)
         }
         #[cfg(not(feature = "identity"))]
@@ -774,7 +836,7 @@ impl IdentityCore {
             if let Some(wire) = enrolled.certificate() {
                 self.record_cert(wire);
             }
-            *self.identity.lock().unwrap() = Some(enrolled.signer());
+            self.install_signer(enrolled.signer());
             Ok(result)
         }
         #[cfg(not(feature = "identity"))]
@@ -816,7 +878,7 @@ impl IdentityCore {
             if let Some(wire) = generated.certificate() {
                 self.record_cert(wire);
             }
-            *self.identity.lock().unwrap() = Some(generated.signer());
+            self.install_signer(generated.signer());
             Ok(result)
         }
         #[cfg(not(feature = "identity"))]
@@ -898,7 +960,7 @@ impl IdentityCore {
                 issuers: Vec::new(),
             };
             self.record_cert(&cert_wire);
-            *self.identity.lock().unwrap() = Some(signer);
+            self.install_signer(signer);
             Ok(result)
         }
         #[cfg(not(feature = "identity"))]
@@ -958,7 +1020,7 @@ impl IdentityCore {
             if let Some(wire) = certificate {
                 self.record_cert(&wire);
             }
-            *self.identity.lock().unwrap() = Some(signer);
+            self.install_signer(signer);
             Ok(true)
         }
         #[cfg(not(feature = "identity"))]
@@ -1805,7 +1867,7 @@ impl IdentityCore {
             .map_err(|e| NdnError::Identity {
                 msg: format!("safebag: {e}"),
             })?;
-        *self.identity.lock().unwrap() = Some(op_arc);
+        self.install_signer(op_arc);
 
         Ok(NdnRecoveredIdentity {
             key_name: key_name.to_string(),

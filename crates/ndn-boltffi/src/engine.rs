@@ -20,10 +20,40 @@ use crate::identity_core::IdentityCore;
 use crate::types::{
     NdnActionClass, NdnCertValidity, NdnContext, NdnData, NdnDelegationScope, NdnEngineConfig,
     NdnEnrollConfig,
-    NdnEnrolledIdentity, NdnError, NdnFaceSpec, NdnRecoveredIdentity, NdnRenewal, NdnRevocation,
+    NdnEnrolledIdentity, NdnError, NdnFaceSpec, NdnLinkMode, NdnLinkReport, NdnLinksConfig,
+    NdnRecoveredIdentity, NdnRelay, NdnRenewal, NdnRevocation,
     NdnSample,
     into_security_profile,
 };
+
+/// Why a link call cannot work in this build.
+#[cfg(not(all(unix, feature = "identity")))]
+fn links_unavailable() -> NdnError {
+    NdnError::engine("QUIC links need the identity feature (on by default) on a unix target")
+}
+
+/// `$body` on the running links (bound to `$links`), inside the engine's
+/// runtime (link calls spawn tasks), or why it cannot run: links do not
+/// run, or this build has none (`$arg`s are then unused).
+macro_rules! on_links {
+    ($self:ident, [$($arg:ident),*], |$links:ident| $body:expr) => {{
+        #[cfg(all(unix, feature = "identity"))]
+        {
+            match $self.links.lock().as_ref() {
+                Some($links) => {
+                    let _runtime = $self.rt.enter();
+                    $body
+                }
+                None => Err(NdnError::engine("links do not run: call start_links first")),
+            }
+        }
+        #[cfg(not(all(unix, feature = "identity")))]
+        {
+            $(let _ = $arg;)*
+            Err(links_unavailable())
+        }
+    }};
+}
 
 /// Embedded NDN forwarder with an owned Tokio runtime. Construct once at app
 /// startup, then drive it through `fetch` / `get` / `serve` / `subscribe`.
@@ -48,8 +78,13 @@ pub struct NdnEngine {
     consumer_conn: Mutex<Option<Arc<dyn Connection>>>,
     /// Identity + signing + trust-context state, run over an in-proc connection
     /// to this engine's own embedded forwarder. The shared core that both
-    /// `NdnEngine` and `NdnClient` delegate identity operations to.
-    identity_core: IdentityCore,
+    /// `NdnEngine` and `NdnClient` delegate identity operations to; shared
+    /// with the links, which present its identity.
+    identity_core: Arc<IdentityCore>,
+    /// The QUIC links this device hosts; `Some` between
+    /// [`Self::start_links`] and [`Self::stop_links`].
+    #[cfg(all(unix, feature = "identity"))]
+    links: parking_lot::Mutex<Option<crate::links::PhoneLinks>>,
     /// Engine-side receive end of the Wi-Fi Aware (NAN) seam; `Some` once
     /// [`Self::attach_wifi_aware`] has been called. `nan_deliver_followup` /
     /// `nan_on_match` push the radio's events into it.
@@ -108,7 +143,11 @@ impl NdnEngine {
             let _guard = rt.enter();
             mobile_engine.new_registering_app_connection()
         };
-        let identity_core = IdentityCore::new(rt.clone(), id_conn);
+        // Contexts the app adopts land in the forwarder validator's keyring:
+        // Data under an adopted namespace (a CA's answer during enrollment,
+        // a member's content) validates against its context's anchors.
+        let keyring = mobile_engine.engine().keyring().unwrap_or_default();
+        let identity_core = Arc::new(IdentityCore::new(rt.clone(), id_conn, keyring));
 
         Ok(Self {
             inner: Mutex::new(Some(mobile_engine)),
@@ -116,6 +155,8 @@ impl NdnEngine {
             default_handle: Mutex::new(Some(default_handle)),
             consumer_conn: Mutex::new(None),
             identity_core,
+            #[cfg(all(unix, feature = "identity"))]
+            links: parking_lot::Mutex::new(None),
             #[cfg(feature = "wifi-aware")]
             nan_seam: Mutex::new(None),
             #[cfg(feature = "ble")]
@@ -149,10 +190,145 @@ impl NdnEngine {
     }
 
     /// Drains in-flight packets; the engine is unusable after this returns.
+    /// Linked devices are told first that this one is going.
     pub fn shutdown(&self) {
+        self.stop_links();
         if let Some(engine) = self.inner.lock().unwrap().take() {
             self.rt.block_on(engine.shutdown());
         }
+    }
+
+    // ── QUIC links: relays, link modes, lifecycle, network changes ──
+
+    /// Start hosting QUIC links with the loaded identity: admitted from the
+    /// adopted trust contexts like any device's, through the relays the
+    /// user adds ([`Self::add_relay`]) and — with
+    /// `config.use_namespace_relays` — those the namespaces' trust contexts
+    /// list, with direct paths to other members where the networks allow.
+    /// `config.socket_fd`, when given, is a UDP socket the platform bound to
+    /// the network to use; the engine owns it from here on. Returns this
+    /// device's link key fingerprint (what another device names as its
+    /// expected key). Errors when no identity is loaded, the identity
+    /// cannot link (an enclave key that signs only asynchronously), the
+    /// socket cannot be used, or links already run. Requires the `identity`
+    /// feature.
+    pub fn start_links(&self, config: NdnLinksConfig) -> Result<String, NdnError> {
+        #[cfg(all(unix, feature = "identity"))]
+        {
+            let mut slot = self.links.lock();
+            if slot.is_some() {
+                return Err(NdnError::engine(
+                    "links already run: call stop_links first to start them with another configuration",
+                ));
+            }
+            let engine = self
+                .inner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|e| e.engine().clone())
+                .ok_or_else(|| NdnError::engine("engine shut down"))?;
+            let _guard = self.rt.enter();
+            let links = crate::links::PhoneLinks::start(
+                &self.identity_core,
+                &engine,
+                config,
+                tokio_util::sync::CancellationToken::new(),
+            )?;
+            let key = links.report().key.unwrap_or_default();
+            *slot = Some(links);
+            Ok(key)
+        }
+        #[cfg(not(all(unix, feature = "identity")))]
+        {
+            let _ = config;
+            Err(links_unavailable())
+        }
+    }
+
+    /// Stop the links: linked devices are told this one is going, link
+    /// faces and their routes go. No-op when links do not run.
+    pub fn stop_links(&self) {
+        #[cfg(all(unix, feature = "identity"))]
+        {
+            let links = self.links.lock().take();
+            if let Some(links) = links {
+                self.rt.block_on(links.shutdown());
+            }
+        }
+    }
+
+    /// Use another relay: identified by its expected key (a relay of
+    /// another namespace — a community relay or hosted service) or its
+    /// device name (a relay of this device's namespace), reached at its
+    /// endpoints, in `relay.mode`. Errors say why a relay is not added (a
+    /// label in use, a malformed key, no endpoint).
+    pub fn add_relay(&self, relay: NdnRelay) -> Result<bool, NdnError> {
+        on_links!(self, [relay], |links| links.add_relay(relay).map(|()| true))
+    }
+
+    /// Stop using the relay (or the namespace-listed relay) called `label`:
+    /// its link closes and its routes go.
+    pub fn remove_relay(&self, label: String) -> Result<bool, NdnError> {
+        on_links!(self, [label], |links| links.remove_relay(&label).map(|()| true))
+    }
+
+    /// Change when the link to `label` is up (see [`NdnLinkMode`]).
+    pub fn set_link_mode(&self, label: String, mode: NdnLinkMode) -> Result<bool, NdnError> {
+        on_links!(self, [label, mode], |links| links.set_mode(&label, &mode).map(|()| true))
+    }
+
+    /// Link to `label` now, whatever its mode (an `Off` link stays up until
+    /// [`Self::disconnect_link`]; an `OnDemand` one until it idles).
+    pub fn connect_link(&self, label: String) -> Result<bool, NdnError> {
+        on_links!(self, [label], |links| links.connect(&label).map(|()| true))
+    }
+
+    /// Close the link to `label` now; it links again as its mode says.
+    pub fn disconnect_link(&self, label: String) -> Result<bool, NdnError> {
+        on_links!(self, [label], |links| links.disconnect(&label).map(|()| true))
+    }
+
+    /// The app became active (`true`: foreground, `Activity.onStart` /
+    /// `applicationDidBecomeActive`) or went to the background (`false`).
+    /// `OnDemand` links link while active; in the background they close
+    /// after their idle time and link again when there is something to
+    /// send. `Always` and `Off` links are unaffected. No-op when links do
+    /// not run.
+    pub fn set_app_active(&self, active: bool) {
+        #[cfg(all(unix, feature = "identity"))]
+        if let Some(links) = self.links.lock().as_ref() {
+            let _runtime = self.rt.enter();
+            links.set_active(active);
+        }
+        #[cfg(not(all(unix, feature = "identity")))]
+        let _ = active;
+    }
+
+    /// Give the relay `label` an opaque wake token (a platform push token):
+    /// when Interests arrive for this device while it is not linked, the
+    /// relay hands the token to its deployer's notifier, which wakes the
+    /// app. `None` withdraws it.
+    pub fn set_wake_token(&self, label: String, token: Option<Vec<u8>>) -> Result<bool, NdnError> {
+        on_links!(self, [label, token], |links| links
+            .set_wake_token(&label, token)
+            .map(|()| true))
+    }
+
+    /// The device moved to another network (Wi-Fi ↔ cellular, a new
+    /// address). `socket_fd`: a UDP socket the platform bound to the new
+    /// network (the engine owns it from here on); `None`: a fresh socket.
+    /// Links migrate to it, dropped ones are dialled again and direct paths
+    /// punched again now.
+    pub fn network_changed(&self, socket_fd: Option<i32>) -> Result<bool, NdnError> {
+        on_links!(self, [socket_fd], |links| links.network_changed(socket_fd).map(|()| true))
+    }
+
+    /// This device's links: each relay and device, its mode, the paths
+    /// reaching it, its direct path's state and why. Errors when links do
+    /// not run.
+    pub fn link_status(&self) -> Result<NdnLinkReport, NdnError> {
+        on_links!(self, [], |links| Ok(links.report()))
     }
 
     /// Blocking fetch; returns the full Data (name + content). Blocks up to the
