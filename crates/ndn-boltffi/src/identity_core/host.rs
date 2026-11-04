@@ -72,6 +72,17 @@ impl ContextStore for AppContexts {
     fn holds_root_key(&self, _ctx: &SignedTrustContext) -> bool {
         false
     }
+
+    /// The app serves no trust contexts (it keeps none here), so it serves
+    /// no cut manifest packets either; its validator fetches them from the
+    /// network when it needs them.
+    fn persist_cut_manifest(&self, _namespace: &Name, _wire: &Bytes) -> Result<String, String> {
+        Ok("not kept: the app serves no trust contexts".into())
+    }
+
+    fn stored_cut_manifests(&self, _namespace: &Name) -> Result<Vec<Bytes>, String> {
+        Ok(Vec::new())
+    }
 }
 
 impl AppContexts {
