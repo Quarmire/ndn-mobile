@@ -16,6 +16,7 @@
 use std::net::SocketAddr;
 use std::os::fd::IntoRawFd;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -33,7 +34,7 @@ use ndn_link::{
     RelaySource, RelayUse, WakeNotifier, WakeRequest,
 };
 use ndn_packet::Name;
-use ndn_packet::encode::DataBuilder;
+use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_security::{
     Certificate, EcdsaP256Signer, Ed25519Signer, Keyring, SecurityManager, SecurityProfile,
     SignedTrustContext, Signer,
@@ -268,17 +269,24 @@ impl Host {
         });
     }
 
-    /// The content of `name`, fetched from this device.
+    /// The content of `name`, answered now by the device that serves it:
+    /// asked with MustBeFresh, so no Content Store on the way (this
+    /// engine's caches every Data, as NFD's does) answers with its copy of
+    /// an earlier answer — the devices here answer with FreshnessPeriod 0.
     fn get(&self, name: &str) -> Option<Vec<u8>> {
         let _guard = self.rt.enter();
         let mut consumer = self.engine.app_consumer(self.cancel.child_token());
+        let interest = InterestBuilder::new(n(name))
+            .must_be_fresh()
+            .lifetime(Duration::from_secs(4));
         self.rt
             .block_on(async {
-                tokio::time::timeout(Duration::from_secs(5), consumer.get(n(name))).await
+                tokio::time::timeout(Duration::from_secs(5), consumer.fetch_with(interest)).await
             })
             .ok()?
-            .ok()
-            .map(|b| b.to_vec())
+            .ok()?
+            .content()
+            .map(|c| c.to_vec())
     }
 }
 
@@ -424,8 +432,14 @@ fn until(what: &str, mut done: impl FnMut() -> bool) -> Duration {
     start.elapsed()
 }
 
+/// The content the device serving `name` answers now, fetched by the app.
+/// The app's `get` takes a name only, so each call asks a name of its own
+/// (`name` and a component no earlier call used), which no Content Store
+/// holds a copy of; the devices here answer every name under their prefix.
 fn phone_gets(phone: &NdnEngine, name: &str) -> Result<Vec<u8>, NdnError> {
-    phone.get(name.into())
+    static ASKED: AtomicU64 = AtomicU64::new(0);
+    let asked = ASKED.fetch_add(1, Ordering::Relaxed);
+    phone.get(format!("{name}/ask-{asked}"))
 }
 
 #[test]
