@@ -159,6 +159,12 @@ fn convert(e: TrustEnvelope) -> Result<NdnTrustEnvelope, NdnError> {
             nonce: c.nonce.to_vec(),
             grant: c.grant.map(|b| b.to_vec()),
         },
+        TrustEnvelope::Intro(_) => {
+            return Err(NdnError::engine(
+                "this is an introduction code: it is joined by the data layer's join verb with \
+                 the whole code, not opened as a trust envelope",
+            ));
+        }
     })
 }
 
