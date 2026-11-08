@@ -139,7 +139,7 @@ impl Home {
 
     fn keyring(&self) -> Arc<Keyring> {
         let keyring = Arc::new(Keyring::new());
-        assert!(keyring.adopt(Arc::clone(&self.context)));
+        keyring.adopt(Arc::clone(&self.context)).unwrap();
         keyring
     }
 }
