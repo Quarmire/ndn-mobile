@@ -376,9 +376,12 @@ impl NdnEngine {
     }
 
     /// Verified whole-object fetch — the **secure** counterpart to
-    /// [`Self::fetch_object`]: metadata + every segment are verified against this
-    /// node's trust anchors (own self-cert + any pinned via
-    /// [`Self::pin_trust_anchor`]) before reassembly; unsigned/untrusted is refused.
+    /// [`Self::fetch_object`]: metadata + every segment are verified before
+    /// reassembly; unsigned/untrusted is refused. A name under an adopted
+    /// trust context is judged by that context alone; a person's name
+    /// (`/user/<hash>/…`) whose namespace is not adopted is refused (adopt it
+    /// by its anchor link first); any other name by this node's own
+    /// certificates and those pinned via [`Self::pin_trust_anchor`].
     pub fn fetch_object_verified(&self, name: String) -> Result<Vec<u8>, NdnError> {
         let parsed: Name = name.parse().map_err(|_| NdnError::invalid_name(&name))?;
         let validator = std::sync::Arc::new(self.identity_core.build_validator());
@@ -449,7 +452,8 @@ impl NdnEngine {
     }
 
     /// Pin a certificate (Data wire) as a trust anchor for
-    /// [`Self::fetch_object_verified`].
+    /// [`Self::fetch_object_verified`], for names no adopted trust context
+    /// governs and outside every person's `/user/<hash>` namespace.
     pub fn pin_trust_anchor(&self, cert_wire: Vec<u8>) -> Result<bool, NdnError> {
         self.identity_core.pin_trust_anchor(cert_wire)
     }
@@ -1038,14 +1042,14 @@ impl NdnEngine {
 
     // ── Trust contexts (§6: the participant's memberships) ─────────────────
 
-    /// Adopt a trust context from a scanned anchor envelope
-    /// ([`NdnTrustEnvelope::Anchor`](crate::types::NdnTrustEnvelope::Anchor)):
-    /// its signed `context_data`, the `namespace` and anchor `fingerprint` it
-    /// pins. The context is adopted only if its signature verifies under the
-    /// pinned anchor and it roots `namespace` (TOFU); its anchors then become
-    /// trusted for that namespace. A mismatched pin, a tampered context, or a
-    /// version strictly older than one already held is an error. A prefix new
-    /// to the app is told to the membership watchers as `adopted`
+    /// Adopt a trust context the app persisted — the offline path, which
+    /// fetches nothing: its signed `context_data`, the `namespace` and
+    /// anchor `fingerprint` it pins. The context is adopted only if its
+    /// signature verifies under the pinned anchor and it roots `namespace`
+    /// (TOFU); its anchors then become trusted for that namespace. A
+    /// mismatched pin, a tampered context, or a version strictly older than
+    /// one already held is an error. A prefix new to the app is told to the
+    /// membership watchers as `adopted`
     /// ([`watch_memberships`](Self::watch_memberships)), as every adoption
     /// is — a launch restoring the persisted contexts included.
     ///
@@ -1055,8 +1059,16 @@ impl NdnEngine {
     /// self-certifying namespace (`/user/<hash>`), which is taken only from
     /// its genesis: its versions from version 1 on, oldest first, are
     /// adopted first, each by continuity from the one before (the
-    /// fingerprint is not checked for them: the name is). A scanned
-    /// envelope passes none.
+    /// fingerprint is not checked for them: the name is). Such a genesis is
+    /// taken here without checking the network, and the result says so
+    /// (`offline_genesis`).
+    ///
+    /// A scanned anchor envelope
+    /// ([`NdnTrustEnvelope::Anchor`](crate::types::NdnTrustEnvelope::Anchor))
+    /// goes through [`adopt_context_link`](Self::adopt_context_link), which
+    /// adopts a self-certifying namespace not held by name — version 1
+    /// fetched and compared with an inline one, a different one refused as
+    /// a fork — instead of trusting the link's own version 1.
     pub fn adopt_context(
         &self,
         context_data: Vec<u8>,
@@ -3950,6 +3962,127 @@ mod context_tests {
         );
         assert!(engine.list_contexts().is_empty(), "nothing adopted");
         engine.shutdown();
+    }
+
+    /// Data named `name`, signed by the key `key` in `mgr`.
+    fn signed_data(mgr: &SecurityManager, name: &str, key: &ndn_packet::Name) -> ndn_packet::Data {
+        let signer = mgr.get_signer_sync(key).unwrap();
+        let name: ndn_packet::Name = name.parse().unwrap();
+        let wire = ndn_packet::encode::DataBuilder::new(name, b"photo").sign_sync(
+            signer.sig_type(),
+            Some(signer.key_name()),
+            |region| signer.sign_sync(region).unwrap(),
+        );
+        ndn_packet::Data::decode(wire).unwrap()
+    }
+
+    /// A phone holding Alice's self-certifying `/user/<hAlice>` (adopted
+    /// from her genesis) with Carol pinned for tap-to-share: the verified
+    /// fetch's validator judges Alice's names by Alice's context, so Data
+    /// under them signed by Carol's pinned key is refused, and Alice's own
+    /// content verifies. A person's namespace the phone does not hold is
+    /// judged by no pin either: it is refused, saying to adopt it first.
+    #[test]
+    fn a_pinned_peer_cannot_sign_in_a_held_person_namespace() {
+        let alice = SecurityManager::new();
+        let (alice_ns, alice_key, alice_anchor) = person(&alice, 1);
+        let carol = SecurityManager::new();
+        let (carol_ns, carol_key, carol_anchor) = person(&carol, 2);
+        let engine = NdnEngine::new(cfg()).unwrap();
+        engine
+            .adopt_context(
+                version_of(&alice, &alice_ns, 1, &[&alice_anchor], &alice_key)
+                    .raw()
+                    .to_vec(),
+                alice_ns.to_string(),
+                ndn_cert::anchor_fingerprint(&alice_anchor).to_vec(),
+                Vec::new(),
+            )
+            .expect("Alice's genesis adopted");
+        assert!(
+            engine
+                .pin_trust_anchor(carol_anchor.data_wire().unwrap().to_vec())
+                .unwrap()
+        );
+
+        let validator = engine.identity_core.build_validator();
+        let verdict = |data: ndn_packet::Data| engine.rt.block_on(validator.validate_chain(&data));
+        let photo = format!("{alice_ns}/photo");
+        let forged = verdict(signed_data(&carol, &photo, &carol_key));
+        assert!(
+            matches!(forged, ndn_security::ValidationResult::Invalid(_)),
+            "Carol's key signing in Alice's namespace: {forged:?}"
+        );
+        let genuine = verdict(signed_data(&alice, &photo, &alice_key));
+        assert!(
+            matches!(genuine, ndn_security::ValidationResult::Valid(_)),
+            "Alice's own content: {genuine:?}"
+        );
+        // Carol's own namespace is not held: her pinned key does not vouch
+        // for it either, and the refusal names the namespace to adopt.
+        let unheld = verdict(signed_data(&carol, &format!("{carol_ns}/note"), &carol_key));
+        match unheld {
+            ndn_security::ValidationResult::Invalid(e) => assert!(
+                e.to_string().contains(&carol_ns.to_string()),
+                "the refusal names {carol_ns}: {e}"
+            ),
+            other => panic!("an unheld person's namespace verified: {other:?}"),
+        }
+        engine.shutdown();
+    }
+
+    /// A scanned link carrying an inline version 1 of a self-certifying
+    /// namespace not held is adopted by name: Alice's genesis key stolen,
+    /// the thief's own version 1 inline is compared with the version 1 her
+    /// devices serve and refused as a fork. The offline path
+    /// (`adopt_context`, what the app persisted) takes a version 1 without
+    /// the network and says so; an adoption by name does not.
+    #[test]
+    fn an_inline_genesis_is_compared_with_the_served_one() {
+        let alice = SecurityManager::new();
+        let (ns, k, k_anchor) = person(&alice, 1);
+        let thief_key = ns.clone().append("KEY").append("thief");
+        let thief_anchor = root_of(&alice, &thief_key);
+        let genuine = version_of(&alice, &ns, 1, &[&k_anchor], &k);
+        let forked = version_of(&alice, &ns, 1, &[&k_anchor, &thief_anchor], &k);
+        let link = |v1: &ndn_packet::Data| {
+            TrustEnvelope::Anchor {
+                namespace: Some(ns.to_string()),
+                fingerprint: None,
+                version: None,
+                context_data: Some(v1.raw().clone()),
+                context_content: None,
+            }
+            .to_uri()
+        };
+
+        let engine = NdnEngine::new(cfg()).unwrap();
+        serve_versions(&engine, &ns, std::slice::from_ref(&genuine));
+        let refused = engine.adopt_context_link(link(&forked));
+        assert!(
+            matches!(&refused, Err(NdnError::Identity { msg }) if msg.contains("fork")),
+            "{refused:?}"
+        );
+        assert!(engine.list_contexts().is_empty(), "nothing adopted");
+        let adopted = engine.adopt_context_link(link(&genuine)).unwrap();
+        assert_eq!(adopted.version, 1);
+        assert_eq!(adopted.offline_genesis, None, "version 1 was fetched");
+        engine.shutdown();
+
+        let offline = NdnEngine::new(cfg()).unwrap();
+        let restored = offline
+            .adopt_context(
+                genuine.raw().to_vec(),
+                ns.to_string(),
+                ndn_cert::anchor_fingerprint(&k_anchor).to_vec(),
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            restored.offline_genesis.as_deref(),
+            Some(ndn_cert::LinkAdoption::OFFLINE_GENESIS_NOTE)
+        );
+        offline.shutdown();
     }
 }
 

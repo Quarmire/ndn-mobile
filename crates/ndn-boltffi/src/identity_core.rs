@@ -100,6 +100,10 @@ pub(crate) struct IdentityCore {
 /// some (it is told, and reads `memberships` for the current state).
 const TRUST_EVENTS: usize = 64;
 
+/// How many certificate hops a verified fetch walks to a trust anchor (the
+/// `Validator::new` default it was built with before).
+const VERIFIED_FETCH_MAX_CHAIN: usize = 5;
+
 /// The versions of each self-certifying namespace (`/user/<hash>`) the app
 /// holds, from its genesis on, oldest first (signed Data wires). Such a
 /// namespace is taken only from its genesis and then by continuity, so a
@@ -151,6 +155,10 @@ struct Tofu {
     /// The versions of a self-certifying namespace adopted before it,
     /// oldest first, with their signed Data.
     earlier: Vec<(Arc<ndn_security::SignedTrustContext>, ndn_packet::Data)>,
+    /// Whether a self-certifying namespace not held was taken from the
+    /// version 1 passed, without checking the network
+    /// ([`ndn_cert::LinkAdoption::offline_genesis`]).
+    offline_genesis: bool,
 }
 
 impl IdentityCore {
@@ -194,7 +202,9 @@ impl IdentityCore {
 
     /// Pin a certificate (Data wire) as a trust anchor for verifying fetched
     /// content — a peer's cert, or an operator/context root. Verified fetches
-    /// then accept objects signed by a key that chains to it.
+    /// then accept objects signed by a key that chains to it, under names no
+    /// held context governs and outside every person's `/user/<hash>`
+    /// ([`Self::build_validator`]).
     pub(crate) fn pin_trust_anchor(&self, cert_wire: Vec<u8>) -> Result<bool, NdnError> {
         let data = ndn_packet::Data::decode(Bytes::from(cert_wire))
             .map_err(|e| NdnError::engine(format!("trust anchor not a Data: {e}")))?;
@@ -210,11 +220,32 @@ impl IdentityCore {
         Ok(true)
     }
 
-    /// A hierarchical [`Validator`](ndn_security::Validator) trusting this node's
-    /// own identities' certificates (for content it published) plus every
-    /// pinned anchor. The trust root for verified fetches.
+    /// A [`Validator`](ndn_security::Validator) over the held keyring itself:
+    /// a name under a held context is judged by that context, live (an
+    /// adoption, update or revocation is seen at once); a person's name
+    /// (`/user/<hash>/…`) whose namespace is not held is refused, saying to
+    /// adopt it first; any other name is judged by a hierarchical ambient
+    /// trusting this node's own identities' certificates (for content it
+    /// published) plus every pinned anchor. The trust root for verified
+    /// fetches.
     pub(crate) fn build_validator(&self) -> ndn_security::Validator {
-        let v = ndn_security::Validator::new(ndn_security::TrustSchema::hierarchical());
+        // F20 (NDF D-45) and H2: a peer's content named under a context we
+        // hold verifies against that context's anchors and schema — no
+        // per-transfer `pin_trust_anchor` (TOFU) — and no pin, ours or a
+        // peer's, vouches for names a held context governs. The view shares
+        // the held contexts (a self-certifying `/user/<hash>` included,
+        // which only its genesis admits into a keyring, so it is never
+        // copied into another) and keeps the pins apart, in its ambient.
+        let pins = Arc::new(ndn_security::SignedTrustContext::ambient(
+            ndn_security::TrustSchema::hierarchical(),
+            Arc::default(),
+        ));
+        let v = ndn_security::Validator::with_keyring(
+            Arc::new(self.keyring.with_ambient_view(pins)),
+            Arc::new(ndn_security::CertCache::new()),
+            None,
+            VERIFIED_FETCH_MAX_CHAIN,
+        );
         // Our ACTUAL signing certs — the ones our Data's KeyLocators reference
         // (set by generate_identity / enroll / load) — so content we published
         // under any of our identities chains. (Not a reconstruction: a
@@ -231,27 +262,21 @@ impl IdentityCore {
         for cert in self.pinned_anchors.lock().unwrap().iter() {
             v.add_trust_anchor(cert.clone());
         }
-        // F20 (NDF D-45): verify via held context. Seed the validator with every
-        // adopted trust context (adopted via `adopt_context` / context-sync), so a
-        // peer's content named under a context we hold verifies against that
-        // context's anchors + schema — no per-transfer `pin_trust_anchor` (TOFU).
-        // Validation dispatches per-namespace (longest-prefix `context_for`), with
-        // the own-cert + pinned anchors above as the ambient fallback. TOFU pinning
-        // stays available as the bootstrap, not the steady state.
-        for ctx in self.keyring.contexts() {
-            v.adopt_context(ctx);
-        }
         v
     }
 
     // ── Trust contexts (§6: the participant's memberships) ─────────────────
 
-    /// Adopt a scanned anchor envelope's signed context — only if its
-    /// signature verifies under the anchor `fingerprint` pins and it roots
-    /// `namespace` (TOFU; `ndn_cert::adopt_with_tofu`). A mismatched pin, a
-    /// tampered context, or an older version than the one held is an error.
-    /// A self-certifying namespace's `earlier` versions, from its genesis,
-    /// are adopted first (see [`Self::adopt_tofu`]).
+    /// Adopt a signed context the app persisted (or scanned, with no
+    /// network) — only if its signature verifies under the anchor
+    /// `fingerprint` pins and it roots `namespace` (TOFU;
+    /// `ndn_cert::adopt_with_tofu`). A mismatched pin, a tampered context,
+    /// or an older version than the one held is an error. A self-certifying
+    /// namespace's `earlier` versions, from its genesis, are adopted first
+    /// (see [`Self::adopt_tofu`]); a genesis taken here is not checked
+    /// against the network, which the result says
+    /// ([`NdnContext::offline_genesis`]). A scanned link goes through
+    /// [`Self::adopt_context_link`], which fetches by name.
     /// Nothing is told: a client without an engine has no watchers
     /// ([`Self::adopt_context_on`] tells them).
     pub(crate) fn adopt_context(
@@ -266,7 +291,12 @@ impl IdentityCore {
             self.chains.keep(ctx, data);
         }
         self.chains.keep(&adopted.context, &adopted.data);
-        Ok(self.adopted_context(&adopted.context, &adopted.data, &adopted.fingerprint))
+        Ok(self.adopted_context(
+            &adopted.context,
+            &adopted.data,
+            &adopted.fingerprint,
+            adopted.offline_genesis,
+        ))
     }
 
     /// [`Self::adopt_context`] on the engine's side: the version is kept as
@@ -292,6 +322,7 @@ impl IdentityCore {
             data,
             fingerprint,
             earlier,
+            offline_genesis,
         } = self.adopt_tofu(context_data, namespace, fingerprint, earlier)?;
         let mut steps = Vec::with_capacity(earlier.len());
         for (context, data) in earlier {
@@ -312,30 +343,43 @@ impl IdentityCore {
             data,
             fetched: false,
             earlier: steps,
+            offline_genesis,
         };
         ndn_namespace::keep::keep_adopted(&participant, &adopted, &fingerprint).map_err(|e| {
             NdnError::Identity {
                 msg: format!("trust context refused: {}", host::app_text(&e)),
             }
         })?;
-        Ok(self.adopted_context(&adopted.context, &adopted.data, &fingerprint))
+        Ok(self.adopted_context(
+            &adopted.context,
+            &adopted.data,
+            &fingerprint,
+            adopted.offline_genesis,
+        ))
     }
 
     /// What the host persists of `ctx`, just adopted from `data`: the
     /// context, its signed Data, the fingerprint it was checked against and,
-    /// for a self-certifying namespace, the versions held before it.
+    /// for a self-certifying namespace, the versions held before it — and,
+    /// when its genesis was taken without the network (`offline_genesis`),
+    /// what to tell the user.
     fn adopted_context(
         &self,
         ctx: &ndn_security::SignedTrustContext,
         data: &ndn_packet::Data,
         fingerprint: &[u8; 32],
+        offline_genesis: bool,
     ) -> NdnContext {
-        NdnContext::adopted(
-            ctx,
-            data,
-            fingerprint,
-            self.chains.before(ctx.namespace(), ctx.version()),
-        )
+        NdnContext {
+            offline_genesis: offline_genesis
+                .then(|| ndn_cert::LinkAdoption::OFFLINE_GENESIS_NOTE.to_owned()),
+            ..NdnContext::adopted(
+                ctx,
+                data,
+                fingerprint,
+                self.chains.before(ctx.namespace(), ctx.version()),
+            )
+        }
     }
 
     /// Adopt `context_data` into the keyring (see [`Self::adopt_context`]),
@@ -371,6 +415,10 @@ impl IdentityCore {
         let self_certifying = ndn_security::self_certifying::self_certifying_digest(&ns)
             .map_err(|e| refused(e.into()))?
             .is_some();
+        // A self-certifying namespace not held is taken from the version 1
+        // passed (the keyring admits it only as a genesis): offline, so the
+        // result says so.
+        let offline_genesis = self_certifying && self.keyring.version_of(&ns).is_none();
         if !earlier.is_empty() && !self_certifying {
             return Err(NdnError::engine(format!(
                 "{ns} is not self-certifying: it is taken again from its newest version alone, \
@@ -402,6 +450,7 @@ impl IdentityCore {
             data,
             fingerprint,
             earlier: adopted_earlier,
+            offline_genesis,
         })
     }
 

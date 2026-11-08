@@ -308,6 +308,14 @@ pub struct NdnContext {
     /// so a launch needs them all. Empty for any other namespace, which is
     /// taken again from its newest version alone.
     pub earlier: Vec<Vec<u8>>,
+    /// Set when this adoption took the version 1 (genesis) of a
+    /// self-certifying namespace not held from the bytes passed, without
+    /// checking the network (`adopt_context` is the offline path): the text
+    /// to show the user. The genesis checks against the name, but nothing
+    /// shows it is the version 1 the owner's devices serve. `None` for an
+    /// adoption that fetched version 1 by name (`adopt_context_link` with an
+    /// engine), for every other namespace, and in `list_contexts`.
+    pub offline_genesis: Option<String>,
 }
 
 impl NdnContext {
@@ -320,6 +328,7 @@ impl NdnContext {
             context_data: None,
             expected_fingerprint: None,
             earlier: Vec::new(),
+            offline_genesis: None,
         }
     }
 
@@ -531,13 +540,15 @@ pub struct NdnDelegationScope {
 #[data]
 #[derive(Debug, Clone)]
 pub enum NdnTrustEnvelope {
-    /// Adopt a namespace's trust context. With `context_data` (root-signed
-    /// Data inline) and a `fingerprint`, feed them to
-    /// `adopt_context(context_data, namespace, fingerprint, [])`, which
-    /// verifies the signature against the pinned anchor (TOFU) before
-    /// adopting. Otherwise pass the scanned URI to `adopt_context_link`: it
-    /// fetches a context not inline by name, and checks a self-certifying
-    /// namespace against its name.
+    /// Adopt a namespace's trust context: pass the scanned URI to
+    /// `adopt_context_link`. An inline context (`context_data`, root-signed)
+    /// is verified against the pinned `fingerprint` (TOFU); a context not
+    /// inline is fetched by name; a self-certifying namespace not held is
+    /// always adopted by name — version 1 fetched and checked against the
+    /// name, an inline version 1 only compared with it (a different one is
+    /// refused as a fork). `adopt_context` is the offline path, for what the
+    /// app itself persisted (or with no network): it takes an inline
+    /// version 1 without checking the network (`NdnContext::offline_genesis`).
     Anchor {
         /// The context namespace the envelope pins (NDN URI).
         namespace: String,

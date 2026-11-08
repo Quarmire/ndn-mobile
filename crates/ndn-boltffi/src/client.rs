@@ -163,9 +163,12 @@ impl NdnClient {
 
     /// Verified whole-object fetch — the **secure** counterpart to
     /// [`Self::fetch_object`]: the metadata Data and every segment are verified
-    /// against this node's trust anchors (its own self-cert + any pinned via
-    /// [`Self::pin_trust_anchor`]) before reassembly, so an unsigned or untrusted
-    /// object is refused. Prefer this for received content.
+    /// before reassembly, so an unsigned or untrusted object is refused. A name
+    /// under an adopted trust context is judged by that context alone; a
+    /// person's name (`/user/<hash>/…`) whose namespace is not adopted is
+    /// refused (adopt it first); any other name by this node's own
+    /// certificates and those pinned via [`Self::pin_trust_anchor`]. Prefer
+    /// this for received content.
     pub fn fetch_object_verified(&self, name: String) -> Result<Vec<u8>, NdnError> {
         let parsed: Name = name.parse().map_err(|_| NdnError::invalid_name(&name))?;
         let validator = std::sync::Arc::new(self.identity_core.build_validator());
@@ -188,7 +191,9 @@ impl NdnClient {
 
     /// Pin a certificate (Data wire — e.g. a peer's exported
     /// [`Self::principal_cert_wire`]) as a trust anchor for
-    /// [`Self::fetch_object_verified`]. The explicit cross-peer trust decision.
+    /// [`Self::fetch_object_verified`], for names no adopted trust context
+    /// governs and outside every person's `/user/<hash>` namespace. The
+    /// explicit cross-peer trust decision.
     pub fn pin_trust_anchor(&self, cert_wire: Vec<u8>) -> Result<bool, NdnError> {
         self.identity_core.pin_trust_anchor(cert_wire)
     }
@@ -466,9 +471,13 @@ impl NdnClient {
     // seam) exactly as `NdnEngine`'s identity methods run over its embedded
     // engine. Same names / signatures / feature gates as `NdnEngine`.
 
-    /// Adopt a scanned anchor envelope's signed trust context, verified
-    /// against the anchor `fingerprint` it pins, after a self-certifying
-    /// namespace's `earlier` versions (see `NdnEngine::adopt_context`).
+    /// Adopt a signed trust context the app persisted (or scanned, the
+    /// client fetching nothing), verified against the anchor `fingerprint`
+    /// it pins, after a self-certifying namespace's `earlier` versions (see
+    /// `NdnEngine::adopt_context`). A self-certifying genesis taken here is
+    /// not checked against the network: the result says so
+    /// (`offline_genesis`); `NdnEngine::adopt_context_link` adopts such a
+    /// namespace by name.
     pub fn adopt_context(
         &self,
         context_data: Vec<u8>,
