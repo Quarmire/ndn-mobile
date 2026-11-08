@@ -20,11 +20,14 @@ impl NdnTrust {
     /// `ndn-ctx:1:…` anchor form and the `https://<domain>/t/<kind>#…`
     /// universal-link mirror). Errors with [`NdnError::Engine`] on a malformed
     /// or unrecognized payload (including a `<kind>` that differs from the
-    /// envelope's); on an anchor without a namespace and expected fingerprint;
-    /// and on an unsigned legacy anchor (`ndn-ctx:1:` or bare content), which
-    /// cannot be verified and is never adopted. An anchor without an inline
-    /// context (fingerprint only) parses with `context_data: None`: hand the
-    /// URI to `adopt_context_link`, which fetches the context by name.
+    /// envelope's); on an anchor that is not one `ndn_cert::AnchorLink`
+    /// takes — no namespace, no expected fingerprint for a namespace that
+    /// is not self-certifying, a misplaced self-certifying component, an
+    /// inline context that is not a Data packet; and on an unsigned legacy
+    /// anchor (`ndn-ctx:1:` or bare content), which cannot be verified and
+    /// is never adopted. An anchor without an inline context, or without a
+    /// fingerprint (a self-certifying `/user/<hash>` name alone), parses for
+    /// `adopt_context_link`, which fetches the context by name.
     pub fn parse(uri: String) -> Result<NdnTrustEnvelope, NdnError> {
         let env = TrustEnvelope::from_uri(&uri).map_err(NdnError::engine)?;
         convert(env)
@@ -93,26 +96,22 @@ fn convert(e: TrustEnvelope) -> Result<NdnTrustEnvelope, NdnError> {
             context_data,
             context_content,
         } => {
-            let context_data = match (context_data, context_content) {
-                (Some(data), _) => Some(data.to_vec()),
-                (None, Some(_)) => {
-                    return Err(NdnError::engine(
-                        "anchor envelope carries an unsigned legacy context, which cannot be \
-                         verified (ask for a re-issued, signed envelope)",
-                    ));
-                }
-                (None, None) => None,
-            };
-            let (Some(namespace), Some(fingerprint)) = (namespace, fingerprint) else {
-                return Err(NdnError::engine(
-                    "anchor envelope pins no namespace + anchor fingerprint, so it cannot be TOFU-verified",
-                ));
-            };
-            NdnTrustEnvelope::Anchor {
+            // The anchor rule is ndn-cert's: a namespace, and an expected
+            // fingerprint unless the namespace is self-certifying (its name
+            // is the hash of the key that signs its genesis).
+            let link = ndn_cert::AnchorLink::from_envelope(&TrustEnvelope::Anchor {
                 namespace,
-                fingerprint: fingerprint.to_vec(),
+                fingerprint,
                 version,
                 context_data,
+                context_content,
+            })
+            .map_err(|refused| NdnError::engine(format!("anchor link refused: {refused}")))?;
+            NdnTrustEnvelope::Anchor {
+                namespace: link.namespace.to_string(),
+                fingerprint: fingerprint.map(|fp| fp.to_vec()),
+                version: link.min_version,
+                context_data: link.context_data.map(|data| data.raw().to_vec()),
             }
         }
         TrustEnvelope::Invite {

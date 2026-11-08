@@ -354,6 +354,7 @@ fn member(bob: &Namespace) -> NdnEngine {
             bob.context.raw().to_vec(),
             NS.into(),
             bob.fingerprint.to_vec(),
+            Vec::new(),
         )
         .unwrap();
     engine
@@ -463,6 +464,7 @@ fn only_an_admin_decides_and_the_requester_learns_the_outcome() {
             bob.context.raw().to_vec(),
             NS.into(),
             bob.fingerprint.to_vec(),
+            Vec::new(),
         )
         .unwrap();
     match restarted
@@ -669,6 +671,7 @@ fn an_app_takes_part_in_several_trusted_prefixes() {
             club.context.raw().to_vec(),
             "/club".into(),
             club.fingerprint.to_vec(),
+            Vec::new(),
         )
         .unwrap();
         match app.sign("/club/news".into(), b"x".to_vec()) {
@@ -759,6 +762,7 @@ fn an_app_takes_part_in_several_trusted_prefixes() {
                 ns.context.raw().to_vec(),
                 ns.ns.to_string(),
                 ns.fingerprint.to_vec(),
+                Vec::new(),
             )
             .unwrap();
     }
@@ -805,6 +809,7 @@ fn a_plain_adoption_is_told_once() {
                 ns.context.raw().to_vec(),
                 ns.ns.to_string(),
                 ns.fingerprint.to_vec(),
+                Vec::new(),
             )
             .unwrap();
         }

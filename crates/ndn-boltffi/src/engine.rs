@@ -1048,11 +1048,21 @@ impl NdnEngine {
     /// to the app is told to the membership watchers as `adopted`
     /// ([`watch_memberships`](Self::watch_memberships)), as every adoption
     /// is — a launch restoring the persisted contexts included.
+    ///
+    /// At launch, pass back the record the host persisted
+    /// ([`NdnContext`](crate::types::NdnContext)): `context_data`,
+    /// `expected_fingerprint` and `earlier`. `earlier` is empty except for a
+    /// self-certifying namespace (`/user/<hash>`), which is taken only from
+    /// its genesis: its versions from version 1 on, oldest first, are
+    /// adopted first, each by continuity from the one before (the
+    /// fingerprint is not checked for them: the name is). A scanned
+    /// envelope passes none.
     pub fn adopt_context(
         &self,
         context_data: Vec<u8>,
         namespace: String,
         fingerprint: Vec<u8>,
+        earlier: Vec<Vec<u8>>,
     ) -> Result<NdnContext, NdnError> {
         #[cfg(feature = "identity")]
         {
@@ -1069,21 +1079,26 @@ impl NdnEngine {
                     context_data,
                     namespace,
                     fingerprint,
+                    earlier,
                 );
             }
         }
         self.identity_core
-            .adopt_context(context_data, namespace, fingerprint)
+            .adopt_context(context_data, namespace, fingerprint, earlier)
     }
 
     /// Adopt the namespace a scanned `ndn-trust://anchor` link names —
     /// including a link that carries only the namespace and the expected
     /// fingerprint: the context is then fetched by name through this engine
     /// (it needs a link and a route toward a node serving the context), checked against the expected
-    /// fingerprint and the link's version, and adopted. The engine holds it
-    /// in memory only: persist the returned `context_data` and
-    /// `expected_fingerprint` and pass them to [`adopt_context`](Self::adopt_context)
-    /// at every launch. Blocking. Requires the `identity` feature (on by default).
+    /// fingerprint and the link's version, and adopted. A self-certifying
+    /// namespace (`/user/<hash>`) needs no fingerprint: its link may carry
+    /// its name alone; its version 1 is fetched and checked against the
+    /// name, and the newest reached from it by continuity. The engine holds
+    /// it in memory only: persist the returned `context_data`,
+    /// `expected_fingerprint` and `earlier` and pass them to
+    /// [`adopt_context`](Self::adopt_context) at every launch. Blocking.
+    /// Requires the `identity` feature (on by default).
     pub fn adopt_context_link(&self, link_uri: String) -> Result<NdnContext, NdnError> {
         #[cfg(feature = "identity")]
         {
@@ -3427,7 +3442,8 @@ mod context_tests {
         engine.adopt_context(
             context_data.expect("inline context"),
             namespace,
-            fingerprint,
+            fingerprint.expect("pinned fingerprint"),
+            Vec::new(),
         )
     }
 
@@ -3476,7 +3492,7 @@ mod context_tests {
         let engine = NdnEngine::new(cfg()).unwrap();
         let NdnTrustEnvelope::Anchor {
             namespace,
-            fingerprint,
+            fingerprint: Some(fingerprint),
             context_data: Some(context_data),
             ..
         } = crate::NdnTrust::parse(namespace_envelope(&SecurityManager::new(), "/home/bob", 1))
@@ -3487,7 +3503,12 @@ mod context_tests {
 
         // Wrong fingerprint (another root's pin).
         assert!(matches!(
-            engine.adopt_context(context_data.clone(), namespace.clone(), vec![0u8; 32]),
+            engine.adopt_context(
+                context_data.clone(),
+                namespace.clone(),
+                vec![0u8; 32],
+                Vec::new()
+            ),
             Err(NdnError::Identity { .. })
         ));
         // Wrong namespace.
@@ -3495,7 +3516,8 @@ mod context_tests {
             engine.adopt_context(
                 context_data.clone(),
                 "/home/eve".into(),
-                fingerprint.clone()
+                fingerprint.clone(),
+                Vec::new()
             ),
             Err(NdnError::Identity { .. })
         ));
@@ -3509,13 +3531,18 @@ mod context_tests {
             unreachable!()
         };
         assert!(matches!(
-            engine.adopt_context(forged, namespace.clone(), fingerprint.clone()),
+            engine.adopt_context(forged, namespace.clone(), fingerprint.clone(), Vec::new()),
             Err(NdnError::Identity { .. })
         ));
         // Truncated pin.
         assert!(
             engine
-                .adopt_context(context_data.clone(), namespace.clone(), vec![1, 2, 3])
+                .adopt_context(
+                    context_data.clone(),
+                    namespace.clone(),
+                    vec![1, 2, 3],
+                    Vec::new()
+                )
                 .is_err()
         );
         assert!(engine.list_contexts().is_empty(), "nothing adopted");
@@ -3534,7 +3561,7 @@ mod context_tests {
 
         // The genuine triple is adopted.
         engine
-            .adopt_context(context_data, namespace, fingerprint)
+            .adopt_context(context_data, namespace, fingerprint, Vec::new())
             .unwrap();
         assert_eq!(engine.list_contexts().len(), 1);
         engine.shutdown();
@@ -3563,6 +3590,7 @@ mod context_tests {
                     adopted.context_data.expect("signed context returned"),
                     adopted.namespace,
                     adopted.expected_fingerprint.expect("fingerprint returned"),
+                    adopted.earlier,
                 )
                 .unwrap();
             assert_eq!((again.namespace.as_str(), again.version), ("/home/bob", 3));
@@ -3591,7 +3619,7 @@ mod context_tests {
             panic!("expected an anchor envelope");
         };
         assert_eq!(namespace, "/home/bob");
-        assert_eq!(fingerprint, vec![7u8; 32]);
+        assert_eq!(fingerprint, Some(vec![7u8; 32]));
         assert!(context_data.is_none());
     }
 
@@ -3710,10 +3738,218 @@ mod context_tests {
                 persisted.context_data.unwrap(),
                 persisted.namespace,
                 persisted.expected_fingerprint.unwrap(),
+                persisted.earlier,
             )
             .unwrap();
         assert_eq!(again.version, 2);
         next_launch.shutdown();
+    }
+
+    /// A person's self-certifying namespace `/user/<hash>`: their Ed25519
+    /// root key `K` (from `seed`) in `mgr`, the name it makes, and its anchor.
+    fn person(
+        mgr: &SecurityManager,
+        seed: u8,
+    ) -> (
+        ndn_packet::Name,
+        ndn_packet::Name,
+        ndn_security::Certificate,
+    ) {
+        let seed = [seed; 32];
+        let pk = ndn_security::Ed25519Signer::from_seed(&seed, ndn_packet::Name::root())
+            .public_key_bytes();
+        let ns = ndn_security::self_certifying::self_certifying_name(&pk);
+        let key = ns.clone().append("KEY").append("root");
+        mgr.generate_ed25519_from_seed(key.clone(), &seed).unwrap();
+        let anchor = mgr
+            .issue_self_signed(&key, Bytes::copy_from_slice(&pk), u64::MAX)
+            .unwrap();
+        (ns, key, anchor)
+    }
+
+    /// An Ed25519 key `key` in `mgr` and its self-signed anchor.
+    fn root_of(mgr: &SecurityManager, key: &ndn_packet::Name) -> ndn_security::Certificate {
+        mgr.generate_ed25519(key.clone()).unwrap();
+        let pk = mgr.get_signer_sync(key).unwrap().public_key().unwrap();
+        mgr.issue_self_signed(key, pk, u64::MAX).unwrap()
+    }
+
+    /// Version `version` of `ns` listing `anchors`, signed by `signer` in `mgr`.
+    fn version_of(
+        mgr: &SecurityManager,
+        ns: &ndn_packet::Name,
+        version: u64,
+        anchors: &[&ndn_security::Certificate],
+        signer: &ndn_packet::Name,
+    ) -> ndn_packet::Data {
+        let ctx = SignedTrustContext::hierarchical(ns.clone()).with_version(version);
+        for a in anchors {
+            ctx.add_anchor((*a).clone());
+        }
+        ctx.sign_into_data(mgr.get_signer_sync(signer).unwrap().as_ref())
+            .unwrap()
+    }
+
+    /// Serve `versions` of `ns` on `engine`, as a forwarder holding it does:
+    /// each by its versioned name, and the RDR metadata naming the last.
+    /// The producer is registered before this returns.
+    fn serve_versions(engine: &NdnEngine, ns: &ndn_packet::Name, versions: &[ndn_packet::Data]) {
+        use ndn_packet::encode::DataBuilder;
+        let newest = (*versions.last().unwrap().name).clone();
+        let meta_name = ndn_cert::rdr_metadata_name(ns);
+        let meta = DataBuilder::new(
+            meta_name
+                .clone()
+                .append_version(newest.components().last().unwrap().as_version().unwrap())
+                .append_segment(0),
+            &newest.encode_to_tlv(),
+        )
+        .build();
+        let mut answers = vec![(meta_name.to_string(), meta)];
+        for v in versions {
+            answers.push((v.name.to_string(), v.raw().clone()));
+        }
+        let producer = engine.register_producer_internal(ns.clone()).unwrap();
+        engine.rt.spawn(async move {
+            let _ = producer
+                .serve(move |interest, responder| {
+                    let name = interest.name.to_string();
+                    let wire = answers
+                        .iter()
+                        .find(|(n, _)| *n == name)
+                        .map(|(_, w)| w.clone());
+                    async move {
+                        if let Some(wire) = wire {
+                            responder.respond_bytes(wire).await.ok();
+                        }
+                    }
+                })
+                .await;
+        });
+    }
+
+    /// The name-only anchor link of `ns` (`ndn-fwd init --self-certifying`
+    /// prints it as `anchor_uri_name`).
+    fn name_link(ns: &ndn_packet::Name) -> String {
+        TrustEnvelope::Anchor {
+            namespace: Some(ns.to_string()),
+            fingerprint: None,
+            version: None,
+            context_data: None,
+            context_content: None,
+        }
+        .to_uri()
+    }
+
+    /// A phone adopts a self-certifying `/user/<hash>` namespace from its
+    /// name alone — no fingerprint: the scanned link parses, version 1 is
+    /// fetched and checked against the name, and the newest is reached from
+    /// it across a change of root. The next launch takes it again from what
+    /// the host persisted.
+    #[test]
+    fn a_self_certifying_name_is_adopted_by_name_alone() {
+        let mgr = SecurityManager::new();
+        let (ns, k, k_anchor) = person(&mgr, 1);
+        let r = ns.clone().append("KEY").append("r2");
+        let r_anchor = root_of(&mgr, &r);
+        // v1 the genesis; v2 adds the new root R (signed by K); v3 drops K
+        // (signed by R): v3 follows from v2, not from v1.
+        let versions = [
+            version_of(&mgr, &ns, 1, &[&k_anchor], &k),
+            version_of(&mgr, &ns, 2, &[&k_anchor, &r_anchor], &k),
+            version_of(&mgr, &ns, 3, &[&r_anchor], &r),
+        ];
+        let engine = NdnEngine::new(cfg()).unwrap();
+        serve_versions(&engine, &ns, &versions);
+
+        let link = name_link(&ns);
+        let NdnTrustEnvelope::Anchor {
+            namespace,
+            fingerprint,
+            context_data,
+            ..
+        } = crate::NdnTrust::parse(link.clone()).unwrap()
+        else {
+            panic!("expected an anchor envelope");
+        };
+        assert_eq!(namespace, ns.to_string());
+        assert_eq!((fingerprint, context_data), (None, None));
+        let adopted = engine.adopt_context_link(link).unwrap();
+        assert_eq!(
+            (adopted.namespace.as_str(), adopted.version),
+            (namespace.as_str(), 3)
+        );
+        // The host is handed the genesis and the version walked through.
+        assert_eq!(
+            adopted.earlier,
+            vec![versions[0].raw().to_vec(), versions[1].raw().to_vec()]
+        );
+        engine.shutdown();
+
+        // The next launch takes it again only from its genesis: the newest
+        // alone is refused, the persisted record is taken.
+        let next_launch = NdnEngine::new(cfg()).unwrap();
+        let context_data = adopted.context_data.expect("signed context returned");
+        let fingerprint = adopted.expected_fingerprint.expect("fingerprint returned");
+        let alone = next_launch.adopt_context(
+            context_data.clone(),
+            namespace.clone(),
+            fingerprint.clone(),
+            Vec::new(),
+        );
+        assert!(
+            matches!(&alone, Err(NdnError::Identity { msg }) if msg.contains("version 1")),
+            "{alone:?}"
+        );
+        let again = next_launch
+            .adopt_context(
+                context_data,
+                namespace,
+                fingerprint,
+                adopted.earlier.clone(),
+            )
+            .unwrap();
+        assert_eq!(again.version, 3);
+        assert_eq!(again.earlier, adopted.earlier);
+        next_launch.shutdown();
+    }
+
+    /// A genesis not signed by the key the name hashes — here the victim's
+    /// anchor listed beside the forger's, who signs — is refused, by name
+    /// and as a persisted record, and nothing is adopted.
+    #[test]
+    fn a_forged_genesis_of_a_self_certifying_name_is_refused() {
+        let victim = SecurityManager::new();
+        let (ns, _, k_anchor) = person(&victim, 1);
+        let forger = SecurityManager::new();
+        let evil = ns.clone().append("KEY").append("evil");
+        let evil_anchor = root_of(&forger, &evil);
+        let forged = version_of(&forger, &ns, 1, &[&k_anchor, &evil_anchor], &evil);
+        let forged_v2 = version_of(&forger, &ns, 2, &[&evil_anchor], &evil);
+        let engine = NdnEngine::new(cfg()).unwrap();
+        serve_versions(&engine, &ns, &[forged]);
+
+        let by_name = engine.adopt_context_link(name_link(&ns));
+        assert!(
+            matches!(&by_name, Err(NdnError::Identity { msg }) if msg.contains("genesis")),
+            "{by_name:?}"
+        );
+        let stored = engine.adopt_context(
+            forged_v2.raw().to_vec(),
+            ns.to_string(),
+            ndn_cert::anchor_fingerprint(&evil_anchor).to_vec(),
+            vec![
+                version_of(&forger, &ns, 1, &[&k_anchor, &evil_anchor], &evil)
+                    .raw()
+                    .to_vec(),
+            ],
+        );
+        assert!(
+            matches!(&stored, Err(NdnError::Identity { msg }) if msg.contains("genesis")),
+            "{stored:?}"
+        );
+        assert!(engine.list_contexts().is_empty(), "nothing adopted");
+        engine.shutdown();
     }
 }
 
@@ -3795,6 +4031,7 @@ mod enclave_identity_tests {
                     self.context.raw().to_vec(),
                     "/lab".into(),
                     ndn_cert::anchor_fingerprint(&self.anchor).to_vec(),
+                    Vec::new(),
                 )
                 .unwrap();
         }

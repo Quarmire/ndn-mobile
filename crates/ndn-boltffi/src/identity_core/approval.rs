@@ -31,9 +31,7 @@ use ndn_security::safebag::SafeBag;
 use tokio_util::sync::CancellationToken;
 
 use super::IdentityCore;
-use super::host::{
-    AppContexts, AppParticipant, AppVault, app_detail, app_text, request_store, unseal,
-};
+use super::host::{AppParticipant, AppVault, app_detail, app_text, request_store, unseal};
 use crate::types::{
     NdnApprovalOutcome, NdnEnrolledIdentity, NdnEnrollmentRequest, NdnError, NdnPendingApproval,
 };
@@ -111,7 +109,7 @@ impl IdentityCore {
         let identity = device_identity(&namespace, role, &device)
             .map_err(|e| refused(format!("enrollment refused: {e}")))?;
 
-        let contexts = Arc::new(AppContexts::default());
+        let contexts = self.app_contexts();
         let participant = self.participant(engine, &contexts);
         let vault = AppVault::new(self, storage_dir, persist_password);
         let failed = |msg: String| NdnError::EnrollmentFailed {
@@ -219,7 +217,7 @@ impl IdentityCore {
     ) -> Result<NdnApprovalOutcome, NdnError> {
         let deadline = Instant::now() + Duration::from_secs(wait_secs.into());
         let vault = AppVault::new(self, storage_dir.clone(), persist_password.clone());
-        let contexts = Arc::new(AppContexts::default());
+        let contexts = self.app_contexts();
         let participant = self.participant(engine, &contexts);
         let outgoing = ndn_namespace::enroll::enroll_status(&participant, &vault)
             .map_err(|e| refused(app_text(&e)))?
@@ -355,7 +353,7 @@ impl IdentityCore {
         engine: &ndn_app::ForwarderEngine,
         storage_dir: String,
     ) -> Result<Vec<NdnEnrollmentRequest>, NdnError> {
-        let contexts = Arc::new(AppContexts::default());
+        let contexts = self.app_contexts();
         let participant = self.participant(engine, &contexts);
         let vault = AppVault::new(self, storage_dir, Vec::new());
         ndn_namespace::enroll::enroll_status(&participant, &vault)
@@ -382,7 +380,7 @@ impl IdentityCore {
             ));
         }
         let vault = AppVault::with_issuers(self, issuers);
-        let contexts = Arc::new(AppContexts::default());
+        let contexts = self.app_contexts();
         let participant = self.participant(engine, &contexts);
         let creds =
             admin_credentials(&participant, &vault, &[]).map_err(|e| refused(app_text(&e)))?;

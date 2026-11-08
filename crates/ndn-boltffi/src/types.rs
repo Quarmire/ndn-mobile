@@ -284,10 +284,12 @@ pub struct NdnRecoveredIdentity {
 /// is how many trust anchors it carries.
 ///
 /// Right after an adoption (`adopt_context`, `adopt_context_link`, an
-/// enrollment that adopted) `context_data` and `expected_fingerprint` are
-/// set: the engine keeps the context in memory only, so the host persists
-/// them and calls `adopt_context(context_data, namespace,
-/// expected_fingerprint)` at every launch. `list_contexts` leaves them `None`.
+/// enrollment that adopted, a refresh that updated) `context_data` and
+/// `expected_fingerprint` are set: the engine keeps the context in memory
+/// only, so the host persists the record (in place of the one stored for
+/// the namespace) and calls `adopt_context(context_data, namespace,
+/// expected_fingerprint, earlier)` at every launch. `list_contexts` leaves
+/// them `None` and `earlier` empty.
 #[data]
 #[derive(Debug, Clone)]
 pub struct NdnContext {
@@ -299,6 +301,13 @@ pub struct NdnContext {
     pub context_data: Option<Vec<u8>>,
     /// SHA-256 of the root anchor's public key it was checked against.
     pub expected_fingerprint: Option<Vec<u8>>,
+    /// For a self-certifying namespace (`/user/<hash>`): its version 1 (the
+    /// genesis, signed by the key the name hashes) and every version after
+    /// it before `context_data`, oldest first (signed Data wires). Such a
+    /// namespace is taken again only from its genesis, then by continuity,
+    /// so a launch needs them all. Empty for any other namespace, which is
+    /// taken again from its newest version alone.
+    pub earlier: Vec<Vec<u8>>,
 }
 
 impl NdnContext {
@@ -310,19 +319,23 @@ impl NdnContext {
             enforces_hierarchy: c.enforces_hierarchy(),
             context_data: None,
             expected_fingerprint: None,
+            earlier: Vec::new(),
         }
     }
 
-    /// A context just adopted from `data`, checked against `fingerprint`:
-    /// carries what the host persists to adopt it again at launch.
+    /// A context just adopted from `data`, checked against `fingerprint`,
+    /// after the `earlier` versions a launch needs first: carries what the
+    /// host persists to adopt it again at launch.
     pub(crate) fn adopted(
         c: &ndn_security::SignedTrustContext,
         data: &ndn_packet::Data,
         fingerprint: &[u8; 32],
+        earlier: Vec<Vec<u8>>,
     ) -> Self {
         Self {
             context_data: Some(data.raw().to_vec()),
             expected_fingerprint: Some(fingerprint.to_vec()),
+            earlier,
             ..Self::from_ctx(c)
         }
     }
@@ -338,9 +351,11 @@ impl NdnContext {
 /// `failed` (`detail` says why; the held version stays in force) — the
 /// `ndn-fwd` daemon's states.
 ///
-/// For `updated`, `context` carries the new signed context and the
-/// fingerprint of the root that signed it: persist both in place of the
-/// stored ones, and pass them to `adopt_context` at every launch.
+/// For `updated`, `context` carries the new signed context, the
+/// fingerprint of the root that signed it and, for a self-certifying
+/// namespace, the versions from its genesis before it: persist the record
+/// in place of the stored one, and pass it to `adopt_context` at every
+/// launch.
 #[data]
 #[derive(Debug, Clone)]
 pub struct NdnContextRefresh {
@@ -517,16 +532,21 @@ pub struct NdnDelegationScope {
 #[derive(Debug, Clone)]
 pub enum NdnTrustEnvelope {
     /// Adopt a namespace's trust context. With `context_data` (root-signed
-    /// Data inline) feed it to `adopt_context(context_data, namespace,
-    /// fingerprint)`, which verifies the signature against the pinned anchor
-    /// (TOFU) before adopting. Without it (a fingerprint-only link) pass the
-    /// scanned URI to `adopt_context_link`, which fetches the context by name.
+    /// Data inline) and a `fingerprint`, feed them to
+    /// `adopt_context(context_data, namespace, fingerprint, [])`, which
+    /// verifies the signature against the pinned anchor (TOFU) before
+    /// adopting. Otherwise pass the scanned URI to `adopt_context_link`: it
+    /// fetches a context not inline by name, and checks a self-certifying
+    /// namespace against its name.
     Anchor {
         /// The context namespace the envelope pins (NDN URI).
         namespace: String,
         /// SHA-256 of the root anchor's public key (32 bytes) — the TOFU pin;
-        /// show it for out-of-band confirmation.
-        fingerprint: Vec<u8>,
+        /// show it for out-of-band confirmation. `None` only for a
+        /// self-certifying namespace (`/user/<hash>`), whose name is the
+        /// hash of the key that signs its version 1: its name alone adopts
+        /// it (`adopt_context_link`).
+        fingerprint: Option<Vec<u8>>,
         /// The context version, when the envelope states it (informational;
         /// the signed Data's name is authoritative).
         version: Option<u64>,

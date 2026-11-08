@@ -38,7 +38,7 @@ use ndn_packet::{Data, Name};
 use ndn_security::safebag::SafeBag;
 use ndn_security::{Certificate, EcdsaP256Signer, SignedTrustContext, Signer};
 
-use super::{IdentityCore, identity_of_key};
+use super::{Chains, IdentityCore, identity_of_key};
 use crate::types::{NdnContext, NdnEnrolledIdentity, NdnError, NdnMembership};
 
 /// Where the outgoing requests live under the app's storage directory, as
@@ -46,9 +46,11 @@ use crate::types::{NdnContext, NdnEnrolledIdentity, NdnError, NdnMembership};
 const REQUESTS_DIR: &str = "requests";
 
 /// The trust-context versions an operation kept, for its result.
-#[derive(Default)]
 pub(crate) struct AppContexts {
     kept: Mutex<Vec<Bytes>>,
+    /// The app's: every version of a self-certifying namespace kept is
+    /// recorded there, for the results of this and later operations.
+    chains: Arc<Chains>,
 }
 
 impl ContextStore for AppContexts {
@@ -56,8 +58,9 @@ impl ContextStore for AppContexts {
         "the app's storage (the host persists each version it is handed)".into()
     }
 
-    fn persist(&self, _ctx: &SignedTrustContext, data: &Data) -> Result<String, String> {
+    fn persist(&self, ctx: &SignedTrustContext, data: &Data) -> Result<String, String> {
         self.kept.lock().push(data.raw().clone());
+        self.chains.keep(ctx, data);
         Ok("with the host (persist the context the result carries)".into())
     }
 
@@ -87,20 +90,36 @@ impl ContextStore for AppContexts {
 
 impl AppContexts {
     /// The newest version of `namespace` kept, with the fingerprint of the
-    /// anchor that signed it: what the host persists and adopts again at
+    /// anchor that signed it and, for a self-certifying namespace, the
+    /// versions held before it: what the host persists and adopts again at
     /// launch (`adopt_context`).
     pub(crate) fn newest(&self, namespace: &Name) -> Option<NdnContext> {
-        self.kept
+        let (ctx, data, signer) = self
+            .kept
             .lock()
             .iter()
             .filter_map(|wire| {
                 let data = Data::decode(wire.clone()).ok()?;
                 let (ctx, signer) = ndn_cert::open_signed_context(&data).ok()?;
-                (ctx.namespace() == namespace).then(|| {
-                    NdnContext::adopted(&ctx, &data, &ndn_cert::anchor_fingerprint(&signer))
-                })
+                (ctx.namespace() == namespace).then_some((ctx, data, signer))
             })
-            .max_by_key(|c| c.version)
+            .max_by_key(|(ctx, _, _)| ctx.version())?;
+        Some(NdnContext::adopted(
+            &ctx,
+            &data,
+            &ndn_cert::anchor_fingerprint(&signer),
+            self.chains.before(namespace, ctx.version()),
+        ))
+    }
+}
+
+impl IdentityCore {
+    /// The store of one operation's kept versions.
+    pub(crate) fn app_contexts(&self) -> Arc<AppContexts> {
+        Arc::new(AppContexts {
+            kept: Mutex::default(),
+            chains: Arc::clone(&self.chains),
+        })
     }
 }
 
@@ -558,7 +577,7 @@ impl IdentityCore {
     /// prefix ([`ndn_namespace::membership::memberships`] over the
     /// identities the app holds).
     pub(crate) fn memberships(&self, engine: &ndn_app::ForwarderEngine) -> Vec<NdnMembership> {
-        let contexts = Arc::new(AppContexts::default());
+        let contexts = self.app_contexts();
         let participant = self.participant(engine, &contexts);
         let vault = AppVault::new(self, String::new(), Vec::new());
         ndn_namespace::membership::memberships(&participant, &vault)

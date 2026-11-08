@@ -32,6 +32,13 @@
 //! Generate bindings with `boltffi generate <lang>`; package with
 //! `boltffi pack android|apple`.
 
+#![allow(
+    clippy::result_large_err,
+    clippy::large_enum_variant,
+    reason = "the FFI's errors and records (NdnError, NdnContext and what carries it) cross the \
+              boundary by value, as the app gets them"
+)]
+
 #[cfg(unix)]
 pub mod client;
 pub mod codec;

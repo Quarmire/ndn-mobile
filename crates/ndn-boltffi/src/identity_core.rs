@@ -91,11 +91,67 @@ pub(crate) struct IdentityCore {
     /// operator/context root). Combined with the own self-cert when building the
     /// validator for [`Self::fetch_object_verified`].
     pinned_anchors: Mutex<Vec<ndn_security::Certificate>>,
+    /// The versions of each self-certifying namespace held, from its
+    /// genesis: what the host is handed to take it again at launch.
+    chains: Arc<Chains>,
 }
 
 /// How many trust events a slow watcher may fall behind by before it misses
 /// some (it is told, and reads `memberships` for the current state).
 const TRUST_EVENTS: usize = 64;
+
+/// The versions of each self-certifying namespace (`/user/<hash>`) the app
+/// holds, from its genesis on, oldest first (signed Data wires). Such a
+/// namespace is taken only from its genesis and then by continuity, so a
+/// launch needs every one of them ([`NdnContext::earlier`]); the engine
+/// keeps them in memory only, as it keeps the contexts.
+#[derive(Default)]
+pub(crate) struct Chains(parking_lot::Mutex<HashMap<Name, Vec<(u64, Bytes)>>>);
+
+impl Chains {
+    /// Record `data`, version `ctx` of its namespace, just adopted.
+    /// Nothing for a namespace that is not self-certifying.
+    pub(crate) fn keep(&self, ctx: &ndn_security::SignedTrustContext, data: &ndn_packet::Data) {
+        if !matches!(
+            ndn_security::self_certifying::self_certifying_digest(ctx.namespace()),
+            Ok(Some(_))
+        ) {
+            return;
+        }
+        let mut chains = self.0.lock();
+        let chain = chains.entry(ctx.namespace().clone()).or_default();
+        chain.retain(|(version, _)| *version != ctx.version());
+        chain.push((ctx.version(), data.raw().clone()));
+        chain.sort_by_key(|(version, _)| *version);
+    }
+
+    /// The versions of `namespace` held before `version`, oldest first.
+    pub(crate) fn before(&self, namespace: &Name, version: u64) -> Vec<Vec<u8>> {
+        self.0.lock().get(namespace).map_or_else(Vec::new, |chain| {
+            chain
+                .iter()
+                .filter(|(v, _)| *v < version)
+                .map(|(_, wire)| wire.to_vec())
+                .collect()
+        })
+    }
+
+    fn forget(&self, namespace: &Name) {
+        self.0.lock().remove(namespace);
+    }
+}
+
+/// A context adopted by [`IdentityCore::adopt_tofu`].
+struct Tofu {
+    context: Arc<ndn_security::SignedTrustContext>,
+    /// Its signed Data, as received.
+    data: ndn_packet::Data,
+    /// The fingerprint it was checked against.
+    fingerprint: [u8; 32],
+    /// The versions of a self-certifying namespace adopted before it,
+    /// oldest first, with their signed Data.
+    earlier: Vec<(Arc<ndn_security::SignedTrustContext>, ndn_packet::Data)>,
+}
 
 impl IdentityCore {
     /// Build a core over `conn` (the forwarder seam) sharing runtime `rt`,
@@ -130,6 +186,7 @@ impl IdentityCore {
             sign_policy: Mutex::new(ndn_security::custodian::ScopedSigningPolicy::new()),
             keyring,
             pinned_anchors: Mutex::new(Vec::new()),
+            chains: Arc::default(),
         }
     }
 
@@ -193,6 +250,8 @@ impl IdentityCore {
     /// signature verifies under the anchor `fingerprint` pins and it roots
     /// `namespace` (TOFU; `ndn_cert::adopt_with_tofu`). A mismatched pin, a
     /// tampered context, or an older version than the one held is an error.
+    /// A self-certifying namespace's `earlier` versions, from its genesis,
+    /// are adopted first (see [`Self::adopt_tofu`]).
     /// Nothing is told: a client without an engine has no watchers
     /// ([`Self::adopt_context_on`] tells them).
     pub(crate) fn adopt_context(
@@ -200,9 +259,14 @@ impl IdentityCore {
         context_data: Vec<u8>,
         namespace: String,
         fingerprint: Vec<u8>,
+        earlier: Vec<Vec<u8>>,
     ) -> Result<NdnContext, NdnError> {
-        let (ctx, data, fingerprint) = self.adopt_tofu(context_data, namespace, fingerprint)?;
-        Ok(NdnContext::adopted(&ctx, &data, &fingerprint))
+        let adopted = self.adopt_tofu(context_data, namespace, fingerprint, earlier)?;
+        for (ctx, data) in &adopted.earlier {
+            self.chains.keep(ctx, data);
+        }
+        self.chains.keep(&adopted.context, &adopted.data);
+        Ok(self.adopted_context(&adopted.context, &adopted.data, &adopted.fingerprint))
     }
 
     /// [`Self::adopt_context`] on the engine's side: the version is kept as
@@ -217,40 +281,86 @@ impl IdentityCore {
         context_data: Vec<u8>,
         namespace: String,
         fingerprint: Vec<u8>,
+        earlier: Vec<Vec<u8>>,
     ) -> Result<NdnContext, NdnError> {
-        let contexts = Arc::new(host::AppContexts::default());
+        let contexts = self.app_contexts();
         // Made before the adoption: it judges what changed against what the
         // app held until now.
         let participant = self.participant(engine, &contexts);
-        let (ctx, data, fingerprint) = self.adopt_tofu(context_data, namespace, fingerprint)?;
+        let Tofu {
+            context,
+            data,
+            fingerprint,
+            earlier,
+        } = self.adopt_tofu(context_data, namespace, fingerprint, earlier)?;
+        let mut steps = Vec::with_capacity(earlier.len());
+        for (context, data) in earlier {
+            let (_, signer) =
+                ndn_cert::open_signed_context(&data).map_err(|e| NdnError::Identity {
+                    msg: format!("trust context refused: {e}"),
+                })?;
+            steps.push(ndn_cert::ContextStep {
+                context,
+                data,
+                signer,
+            });
+        }
+        // Kept through the call's store, which records the versions of a
+        // self-certifying namespace ([`Chains`]).
         let adopted = ndn_cert::LinkAdoption {
-            context: Arc::clone(&ctx),
+            context,
             data,
             fetched: false,
+            earlier: steps,
         };
         ndn_namespace::keep::keep_adopted(&participant, &adopted, &fingerprint).map_err(|e| {
             NdnError::Identity {
                 msg: format!("trust context refused: {}", host::app_text(&e)),
             }
         })?;
-        Ok(NdnContext::adopted(&ctx, &adopted.data, &fingerprint))
+        Ok(self.adopted_context(&adopted.context, &adopted.data, &fingerprint))
     }
 
-    /// Adopt `context_data` into the keyring (see [`Self::adopt_context`]):
-    /// the context, its signed Data and the expected fingerprint.
+    /// What the host persists of `ctx`, just adopted from `data`: the
+    /// context, its signed Data, the fingerprint it was checked against and,
+    /// for a self-certifying namespace, the versions held before it.
+    fn adopted_context(
+        &self,
+        ctx: &ndn_security::SignedTrustContext,
+        data: &ndn_packet::Data,
+        fingerprint: &[u8; 32],
+    ) -> NdnContext {
+        NdnContext::adopted(
+            ctx,
+            data,
+            fingerprint,
+            self.chains.before(ctx.namespace(), ctx.version()),
+        )
+    }
+
+    /// Adopt `context_data` into the keyring (see [`Self::adopt_context`]),
+    /// after the `earlier` versions of a self-certifying namespace, oldest
+    /// first: such a namespace is taken only from its genesis (version 1,
+    /// checked against the name) and then by continuity, each version
+    /// judged against the one before it; the fingerprint, which such a
+    /// namespace does not need, is not checked for them. A version the
+    /// keyring holds already, or an older one, is passed over. `earlier` is
+    /// refused for any other namespace: it is taken from its newest version
+    /// alone.
     fn adopt_tofu(
         &self,
         context_data: Vec<u8>,
         namespace: String,
         fingerprint: Vec<u8>,
-    ) -> Result<
-        (
-            Arc<ndn_security::SignedTrustContext>,
-            ndn_packet::Data,
-            [u8; 32],
-        ),
-        NdnError,
-    > {
+        earlier: Vec<Vec<u8>>,
+    ) -> Result<Tofu, NdnError> {
+        let refused = |e: ndn_cert::AdoptError| NdnError::Identity {
+            msg: format!("trust context refused: {e}"),
+        };
+        let decode = |wire: Vec<u8>| {
+            ndn_packet::Data::decode(Bytes::from(wire))
+                .map_err(|e| NdnError::engine(format!("malformed trust-context Data: {e}")))
+        };
         let ns: Name = namespace
             .parse()
             .map_err(|_| NdnError::invalid_name(&namespace))?;
@@ -258,15 +368,41 @@ impl IdentityCore {
             .as_slice()
             .try_into()
             .map_err(|_| NdnError::engine("anchor fingerprint must be 32 bytes (SHA-256)"))?;
-        let data = ndn_packet::Data::decode(Bytes::from(context_data))
-            .map_err(|e| NdnError::engine(format!("malformed trust-context Data: {e}")))?;
-        let ctx =
-            ndn_cert::adopt_with_tofu(&self.keyring, &data, &ns, &fingerprint).map_err(|e| {
-                NdnError::Identity {
-                    msg: format!("trust context refused: {e}"),
-                }
-            })?;
-        Ok((ctx, data, fingerprint))
+        let self_certifying = ndn_security::self_certifying::self_certifying_digest(&ns)
+            .map_err(|e| refused(e.into()))?
+            .is_some();
+        if !earlier.is_empty() && !self_certifying {
+            return Err(NdnError::engine(format!(
+                "{ns} is not self-certifying: it is taken again from its newest version alone, \
+                 so pass no earlier versions (they are kept only for a /user/<hash> namespace)"
+            )));
+        }
+        let mut adopted_earlier = Vec::with_capacity(earlier.len());
+        for wire in earlier {
+            let data = decode(wire)?;
+            let version = data
+                .name
+                .components()
+                .last()
+                .and_then(ndn_packet::NameComponent::as_version);
+            if let (Some(version), Some(held)) = (version, self.keyring.version_of(&ns))
+                && held >= version
+            {
+                continue;
+            }
+            let ctx = ndn_cert::adopt_with_tofu(&self.keyring, &data, &ns, &fingerprint)
+                .map_err(refused)?;
+            adopted_earlier.push((ctx, data));
+        }
+        let data = decode(context_data)?;
+        let context =
+            ndn_cert::adopt_with_tofu(&self.keyring, &data, &ns, &fingerprint).map_err(refused)?;
+        Ok(Tofu {
+            context,
+            data,
+            fingerprint,
+            earlier: adopted_earlier,
+        })
     }
 
     /// Adopt the namespace a scanned `ndn-trust://anchor` link names, as
@@ -287,7 +423,7 @@ impl IdentityCore {
             msg: format!("trust context refused: {reason}"),
         };
         let link = ndn_cert::AnchorLink::from_uri(&link_uri).map_err(|e| refused(e.to_string()))?;
-        let contexts = Arc::new(host::AppContexts::default());
+        let contexts = self.app_contexts();
         let participant = self.participant(engine, &contexts);
         self.rt
             .block_on(ndn_namespace::keep::adopt_link(&participant, &link))
@@ -315,7 +451,7 @@ impl IdentityCore {
         let namespace = namespace
             .map(|ns| ns.parse::<Name>().map_err(|_| NdnError::invalid_name(&ns)))
             .transpose()?;
-        let contexts = Arc::new(host::AppContexts::default());
+        let contexts = self.app_contexts();
         let participant = self.participant(engine, &contexts);
         let results = self
             .rt
@@ -390,7 +526,7 @@ impl IdentityCore {
         let namespace = invite.namespace.clone();
         let role = invite.role;
         let link = EnrollLink::Invite(invite);
-        let contexts = Arc::new(host::AppContexts::default());
+        let contexts = self.app_contexts();
         let participant = self.participant(engine, &contexts);
         let vault = host::AppVault::new(self, String::new(), persist_password);
         let failed = |reason: String| NdnError::EnrollmentFailed {
@@ -496,7 +632,7 @@ impl IdentityCore {
             signer: Arc::clone(&signer),
         };
         let vault = host::AppVault::holding(self, held, issuers, password);
-        let contexts = Arc::new(host::AppContexts::default());
+        let contexts = self.app_contexts();
         let participant = self.participant(engine, &contexts);
         let renewed = match self
             .rt
@@ -615,6 +751,7 @@ impl IdentityCore {
         let ns: Name = namespace
             .parse()
             .map_err(|_| NdnError::invalid_name(&namespace))?;
+        self.chains.forget(&ns);
         Ok(self.keyring.forget(&ns))
     }
 

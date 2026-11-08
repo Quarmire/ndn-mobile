@@ -467,15 +467,17 @@ impl NdnClient {
     // engine. Same names / signatures / feature gates as `NdnEngine`.
 
     /// Adopt a scanned anchor envelope's signed trust context, verified
-    /// against the anchor `fingerprint` it pins (see `NdnEngine::adopt_context`).
+    /// against the anchor `fingerprint` it pins, after a self-certifying
+    /// namespace's `earlier` versions (see `NdnEngine::adopt_context`).
     pub fn adopt_context(
         &self,
         context_data: Vec<u8>,
         namespace: String,
         fingerprint: Vec<u8>,
+        earlier: Vec<Vec<u8>>,
     ) -> Result<NdnContext, NdnError> {
         self.identity_core
-            .adopt_context(context_data, namespace, fingerprint)
+            .adopt_context(context_data, namespace, fingerprint, earlier)
     }
 
     /// List the adopted trust contexts.

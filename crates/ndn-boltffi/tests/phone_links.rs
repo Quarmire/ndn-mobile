@@ -113,6 +113,7 @@ impl Home {
             self.context_data.raw().to_vec(),
             self.ns.clone(),
             ndn_cert::anchor_fingerprint(&self.anchor).to_vec(),
+            Vec::new(),
         )
         .unwrap();
     }
