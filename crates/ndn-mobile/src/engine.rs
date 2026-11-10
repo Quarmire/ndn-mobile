@@ -8,7 +8,7 @@ use ndn_app::{Consumer, Producer};
 use ndn_discovery::{DiscoveryConfig, DiscoveryProfile, NeighborProbeProtocol};
 use ndn_discovery_core::DiscoveryProtocol;
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, RoutingProtocol, ShutdownHandle};
-use ndn_face::local::{InProcFace, InProcHandle, IpcListener};
+use ndn_face::local::{InProcFace, InProcHandle, IpcListener, ProgramPeers};
 use ndn_face::net::{MulticastUdpFace, UdpFace, tcp_face_connect};
 use ndn_face_serial::serial_face_open;
 use ndn_face_websocket::WebSocketFace;
@@ -956,7 +956,11 @@ impl MobileEngineBuilder {
         // Local IPC listener (the cross-process UI / VPN-extension seam). Uses
         // the shutdown token, not network_cancel, so it survives backgrounding.
         if let Some(path) = self.ipc_listen_path {
-            match IpcListener::bind(&path) {
+            // The app's own uid (and root) is a program peer: iOS and Android
+            // apps run as one uid, so their faces stay program faces; a socket
+            // of any other user is validated.
+            match IpcListener::bind(&path).map(|l| l.with_program_peers(ProgramPeers::this_user()))
+            {
                 Ok(listener) => {
                     let engine = engine.clone();
                     let cancel = shutdown.cancel_token().child_token();
