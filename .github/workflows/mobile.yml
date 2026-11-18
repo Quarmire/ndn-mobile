@@ -5,10 +5,10 @@ name: CI — ndn-mobile (cross-compile)
 on:
   push:
     branches: [main]
-    paths: ["crates/**", "examples/**", "Cargo.toml", ".github/workflows/mobile.yml"]
+    paths: ["crates/**", "examples/**", "tools/**", "Cargo.toml", ".github/workflows/mobile.yml"]
   pull_request:
     branches: [main]
-    paths: ["crates/**", "examples/**", "Cargo.toml", ".github/workflows/mobile.yml"]
+    paths: ["crates/**", "examples/**", "tools/**", "Cargo.toml", ".github/workflows/mobile.yml"]
   workflow_dispatch:
 
 env:
@@ -52,3 +52,20 @@ jobs:
       - name: Check ndn-mobile (Android)
         working-directory: ndn-mobile
         run: cargo ndk -t arm64-v8a check -p ndn-mobile
+
+  forbidden-features:
+    name: no test-only feature in the shipped library
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ndn-mobile }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/ndn-rs", ref: 9717d7f7d72c864ebdf0eb7f4fec061396ed10bd, path: ndn-rs } # pinned sibling; bump deliberately
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/ndn-ext", ref: f417cabd7010841b650e3ad6e36f7e069affedfc, path: ndn-ext } # pinned sibling; bump deliberately
+      # ndn-link's fault layer (feature fault-injection) is for tests: it must not
+      # be on in the library the apps ship. The file is the same in ndn-ext,
+      # ndn-fwd and ndn-mobile; it resolves the feature graph and builds nothing.
+      - name: forbidden test-only features
+        working-directory: ndn-mobile
+        run: tools/check-forbidden-features.sh ndn-boltffi ndn-mobile
