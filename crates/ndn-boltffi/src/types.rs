@@ -858,7 +858,8 @@ pub struct NdnFaultReport {
     pub profile: Option<String>,
     /// Packets that arrived on a link and met the profile.
     pub met: u64,
-    /// Of those, packets dropped.
+    /// Packets dropped: by the profile (of those that met it) or by the plan's verdict
+    /// (which never met the profile), so it can exceed `met`.
     pub dropped: u64,
     /// Of those, packets delivered twice.
     pub duplicated: u64,
@@ -866,9 +867,9 @@ pub struct NdnFaultReport {
     pub forged: u64,
     /// Of those, packets held back.
     pub delayed: u64,
-    /// Packets the plan's predicate left alone.
+    /// Packets the plan's verdict let pass.
     pub passed: u64,
-    /// Times the plan's predicate panicked.
+    /// Times the plan's verdict function panicked.
     pub predicate_panics: u64,
 }
 
