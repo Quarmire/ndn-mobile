@@ -120,8 +120,8 @@ pub use trust::NdnTrust;
 pub use types::{
     NdnActionClass, NdnApprovalOutcome, NdnCertValidity, NdnContext, NdnContextRefresh, NdnData,
     NdnDelegationScope, NdnEngineConfig, NdnEnrollConfig, NdnEnrolledIdentity,
-    NdnEnrollmentRequest, NdnError, NdnFaceSpec, NdnIdentity, NdnLinkMode, NdnLinkReport,
-    NdnLinkStatus, NdnLinksConfig, NdnMembership, NdnMembershipEvent, NdnPathStatus,
+    NdnEnrollmentRequest, NdnError, NdnFaceSpec, NdnFaultReport, NdnIdentity, NdnLinkMode,
+    NdnLinkReport, NdnLinkStatus, NdnLinksConfig, NdnMembership, NdnMembershipEvent, NdnPathStatus,
     NdnPendingApproval, NdnRecoveredIdentity, NdnRelay, NdnRelaySource, NdnRelayStatus, NdnRenewal,
     NdnRevocation, NdnSample, NdnSecurityProfile, NdnTrustEnvelope,
 };

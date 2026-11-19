@@ -840,6 +840,36 @@ pub struct NdnLinkReport {
     pub probes_sent: u64,
     pub punches_refused: u64,
     pub links: Vec<NdnLinkStatus>,
+    /// The link library's test-only fault layer: `Some` exactly when this
+    /// build has it. No shipped app does; an app that finds it set is a test
+    /// build running where it should not, and should say so or refuse to
+    /// run.
+    pub fault_injection: Option<NdnFaultReport>,
+}
+
+/// What the test-only fault layer of a build that has it reports
+/// ([`NdnLinkReport::fault_injection`]): the installed profile and what it
+/// did, in total over every link.
+#[data]
+#[derive(Debug, Clone, Default)]
+pub struct NdnFaultReport {
+    /// The installed profile in its text form; `None` while no plan is
+    /// installed (the layer is compiled in and touches nothing).
+    pub profile: Option<String>,
+    /// Packets that arrived on a link and met the profile.
+    pub met: u64,
+    /// Of those, packets dropped.
+    pub dropped: u64,
+    /// Of those, packets delivered twice.
+    pub duplicated: u64,
+    /// Of those, Data packets forged (one signature byte flipped).
+    pub forged: u64,
+    /// Of those, packets held back.
+    pub delayed: u64,
+    /// Packets the plan's predicate left alone.
+    pub passed: u64,
+    /// Times the plan's predicate panicked.
+    pub predicate_panics: u64,
 }
 
 #[data]

@@ -18,9 +18,9 @@ use ndn_face_quic::{
     KeyError, KeyFingerprint, LinkEndpoint, LinkKey, LinkKeySource, LinkTransportConfig,
 };
 use ndn_link::{
-    ConfiguredEndpoints, EngineFaces, HostCandidates, LinkDetail, LinkMode, LinkReport, LinkSetup,
-    LinkTrust, LinkWords, Links, OwnMembership, PeerId, PeerSpec, RelayOptions, RelaySource,
-    RelayUse,
+    ConfiguredEndpoints, EngineFaces, FaultReport, HostCandidates, LinkDetail, LinkMode,
+    LinkReport, LinkSetup, LinkTrust, LinkWords, Links, OwnMembership, PeerId, PeerSpec,
+    RelayOptions, RelaySource, RelayUse,
 };
 use ndn_packet::Name;
 use ndn_security::{Certificate, Keyring};
@@ -28,8 +28,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::identity_core::IdentityCore;
 use crate::types::{
-    NdnError, NdnLinkMode, NdnLinkReport, NdnLinkStatus, NdnLinksConfig, NdnPathStatus, NdnRelay,
-    NdnRelaySource, NdnRelayStatus,
+    NdnError, NdnFaultReport, NdnLinkMode, NdnLinkReport, NdnLinkStatus, NdnLinksConfig,
+    NdnPathStatus, NdnRelay, NdnRelaySource, NdnRelayStatus,
 };
 
 /// The key this device links with: the node identity's, read at each
@@ -411,6 +411,21 @@ fn report(r: &LinkReport, local: Option<SocketAddr>, active: bool) -> NdnLinkRep
                 direct_retry_secs: l.direct.retry_in.map(|d| d.as_secs()),
             })
             .collect(),
+        fault_injection: r.fault_injection.as_ref().map(fault_report),
+    }
+}
+
+/// The fault layer's notice as the app sees it.
+fn fault_report(f: &FaultReport) -> NdnFaultReport {
+    NdnFaultReport {
+        profile: f.profile.clone(),
+        met: f.met,
+        dropped: f.dropped,
+        duplicated: f.duplicated,
+        forged: f.forged,
+        delayed: f.delayed,
+        passed: f.passed,
+        predicate_panics: f.predicate_panics,
     }
 }
 
@@ -442,5 +457,46 @@ async fn relink_on_change(
         }
         let Some(links) = links.upgrade() else { return };
         links.identities_changed();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `NdnLinkReport::fault_injection` says what the library says: nothing
+    /// from a report with no fault layer, the profile and every counter from
+    /// one that has it.
+    #[test]
+    fn the_fault_layer_notice_reaches_the_app() {
+        let none = report(&LinkReport::default(), None, false);
+        assert!(none.fault_injection.is_none());
+        let with = LinkReport {
+            fault_injection: Some(FaultReport {
+                profile: Some("drop=0.2,seed=3".into()),
+                met: 9,
+                dropped: 2,
+                duplicated: 1,
+                forged: 3,
+                delayed: 4,
+                passed: 5,
+                predicate_panics: 6,
+            }),
+            ..LinkReport::default()
+        };
+        let seen = report(&with, None, true).fault_injection.expect("reported");
+        assert_eq!(seen.profile.as_deref(), Some("drop=0.2,seed=3"));
+        assert_eq!(
+            (
+                seen.met,
+                seen.dropped,
+                seen.duplicated,
+                seen.forged,
+                seen.delayed,
+                seen.passed,
+                seen.predicate_panics
+            ),
+            (9, 2, 1, 3, 4, 5, 6)
+        );
     }
 }
