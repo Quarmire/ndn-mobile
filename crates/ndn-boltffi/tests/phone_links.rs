@@ -241,6 +241,7 @@ impl Host {
                 relays: Default::default(),
                 service: Default::default(),
                 direct: Default::default(),
+                reliability: Default::default(),
             };
             setup(&mut s);
             (Links::start(s, cancel.clone()), addr)
