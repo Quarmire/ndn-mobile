@@ -77,8 +77,9 @@ impl ContextStore for AppContexts {
     }
 
     /// The app serves no trust contexts (it keeps none here), so it serves
-    /// no cut manifest packets either; its validator fetches them from the
-    /// network when it needs them.
+    /// no cut manifest packets either (a manifest-form cut has them; a cut
+    /// that names one tip per space has none); its validator fetches them
+    /// from the network when it needs them.
     fn persist_cut_manifest(&self, _namespace: &Name, _wire: &Bytes) -> Result<String, String> {
         Ok("not kept: the app serves no trust contexts".into())
     }
